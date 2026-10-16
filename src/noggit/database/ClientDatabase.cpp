@@ -35,6 +35,43 @@ namespace Noggit
 			return ClientDatabaseTable(tableName);
 		}
 
+	namespace
+	{
+		Database::ClientDatabaseContext currentDefinitionContext()
+		{
+			Database::ClientDatabaseContext context;
+
+			auto const project = Noggit::Project::CurrentProject::get();
+			if (project)
+			{
+				if (!project->DatabaseDefinitionsPath.empty())
+					context.definitions_directory = project->DatabaseDefinitionsPath;
+				context.client_build = project->ClientBuild;
+				context.prefer_db2 = project->PreferDb2Definitions;
+			}
+
+			return context;
+		}
+	}
+
+	BlizzardDatabaseLib::BlizzardDatabaseTable& ClientDatabase::loadClientTable(const std::string& tableName)
+	{
+		return loadClientTable(tableName, readFileAsIMemStream, "[ClientDatabase]");
+	}
+
+	BlizzardDatabaseLib::BlizzardDatabaseTable& ClientDatabase::loadClientTable(
+		const std::string& tableName,
+		Database::ClientDatabaseFileCallback const& fileCallback,
+		const char* logContext)
+	{
+		auto const project = Noggit::Project::CurrentProject::get();
+		if (!project || !project->ClientDatabase)
+			throw std::runtime_error("No active project client database to load " + tableName);
+
+		return Database::loadTableWithDefinitionFallback(*project->ClientDatabase, tableName,
+			currentDefinitionContext(), fileCallback, logContext);
+	}
+
 	bool ClientDatabaseTable::UploadDBCtoDB()
 	{
 
@@ -564,12 +601,23 @@ namespace Noggit
 
 	Structures::BlizzardDatabaseRowDefinition& ClientDatabaseTable::GetRecordDefinition() const
 	{
+		// tables loaded through a substituted definition are not known to the
+		// project's BlizzardDatabase, which cannot resolve their definition either
+		if (auto* substituted = Database::substitutedDefinition(_tableName))
+			return substituted->RowDefinition;
+
 		return Noggit::Project::CurrentProject::get()->ClientDatabase->TableRecordDefinition(_tableName);
 	}
 
 	BlizzardDatabaseLib::BlizzardDatabaseTable& ClientDatabaseTable::getClientTable() const
 	{
-		return Noggit::Project::CurrentProject::get()->ClientDatabase->LoadTable(_tableName, readFileAsIMemStream);
+		// Loading an already loaded table makes the database library print a line
+		// per call, and this is called once per record in some loops.
+		if (_client_table)
+			return *_client_table;
+
+		_client_table = &ClientDatabase::loadClientTable(_tableName);
+		return *_client_table;
 	}
 
 	// get from local dbc data memory stream in BlizzardDatabaseLib::BlizzardDatabase

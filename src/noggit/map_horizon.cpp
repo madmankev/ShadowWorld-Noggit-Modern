@@ -15,7 +15,11 @@
 
 #include <algorithm>
 #include <bitset>
+#include <cctype>
+#include <cstdint>
 #include <exception>
+#include <map>
+#include <set>
 #include <sstream>
 
 struct color
@@ -99,6 +103,34 @@ static inline uint32_t color_for_height (int16_t height)
 namespace Noggit
 {
 
+namespace
+{
+  //! Renders a chunk id as its four character name, or as a hex value when the
+  //! bytes are not printable text.
+  std::string wdl_chunk_name(std::uint32_t fourcc)
+  {
+    char name[5] = {};
+    bool printable = true;
+
+    for (int index = 0; index < 4; ++index)
+    {
+      auto const character = static_cast<char>((fourcc >> (24 - 8 * index)) & 0xFFu);
+      if (std::isprint(static_cast<unsigned char>(character)) == 0)
+        printable = false;
+      name[index] = character;
+    }
+
+    if (!printable)
+    {
+      std::ostringstream hex;
+      hex << "0x" << std::hex << std::uppercase << fourcc;
+      return hex.str();
+    }
+
+    return std::string(name, 4);
+  }
+}
+
 map_horizon::map_horizon(const std::string& basename, World * const world)
 {
   std::stringstream filename;
@@ -118,6 +150,10 @@ map_horizon::map_horizon(const std::string& basename, World * const world)
   uint32_t size;
 
   bool done = false;
+
+  // chunks that are valid, but unused, and chunks that are not valid at all
+  std::map<uint32_t, unsigned int> skipped_chunks;
+  std::set<uint32_t> unknown_chunks;
 
   try
   {
@@ -218,7 +254,43 @@ map_horizon::map_horizon(const std::string& basename, World * const world)
         break;
       }
       default:
-        LogError << "unknown chunk in wdl: code=" << fourcc << std::endl;
+      {
+        // Legion and later WDL files store the world models, doodads, sky scenes
+        // and ocean data in chunks that Noggit does not need for the low detail
+        // map: only the MARE/MAHO height tiles reached through MAOF are used.
+        // Skipping them silently keeps the log readable, they are not errors.
+        switch (fourcc)
+        {
+          case 'MLDD': // M2 placements
+          case 'MLDX': // M2 bounds
+          case 'MLDL': // M2 lod
+          case 'MLDF': // M2 fade ranges
+          case 'MLMD': // WMO placements
+          case 'MLMX': // WMO bounds
+          case 'MLMB': // WMO blend/mask
+          case 'MSSN': // sky scene
+          case 'MSSC': // sky scene condition
+          case 'MSSO': // sky scene object
+          case 'MSSF': // sky scene object fade
+          case 'MSLD': // living world scene definition
+          case 'MSLI': // living world scene index
+          case 'MAID': // file data ids
+          case 'MWAT': // water
+          case 'MAOE': // ocean
+          case 'MAOC': // occlusion
+          case 'MARE': // height tile, read through MAOF
+          case 'MAHO': // holes, read through MAOF
+            ++skipped_chunks[fourcc];
+            break;
+
+          default:
+            if (unknown_chunks.insert(fourcc).second)
+              LogDebug << "unknown chunk in wdl \"" << _filename << "\": "
+                       << wdl_chunk_name(fourcc) << " (code=" << fourcc << "), skipping "
+                       << size << " bytes" << std::endl;
+            break;
+        }
+
         if (wdl_file.getPos() > wdl_file.getSize() || size > wdl_file.getSize() - wdl_file.getPos())
         {
           LogError << "invalid WDL chunk size in \"" << _filename << "\", falling back to tile index minimap" << std::endl;
@@ -229,6 +301,7 @@ map_horizon::map_horizon(const std::string& basename, World * const world)
           wdl_file.seekRelative(size);
         }
         break;
+      }
     }
   } while (!done && !wdl_file.isEof());
   }
@@ -239,6 +312,23 @@ map_horizon::map_horizon(const std::string& basename, World * const world)
   catch (...)
   {
     LogError << "failed reading WDL \"" << _filename << "\": unknown exception" << std::endl;
+  }
+
+  if (!skipped_chunks.empty())
+  {
+    std::ostringstream summary;
+    unsigned int total = 0;
+    bool first = true;
+    for (auto const& [chunk, count] : skipped_chunks)
+    {
+      total += count;
+      summary << (first ? "" : ", ") << wdl_chunk_name(chunk) << " x" << count;
+      first = false;
+    }
+
+    LogDebug << "wdl \"" << _filename << "\": skipped " << total
+             << " unsupported chunk" << (total == 1 ? "" : "s") << " (" << summary.str() << ")"
+             << std::endl;
   }
 
   constexpr bool _load_models = true;

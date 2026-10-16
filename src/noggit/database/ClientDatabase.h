@@ -2,6 +2,7 @@
 #include <blizzard-database-library/include/BlizzardDatabase.h>
 #include <blizzard-database-library/include/structures/FileStructures.h>
 
+#include <noggit/database/Db2DefinitionFallback.hpp>
 #include <noggit/database/SqlDatabaseManager.h>
 
 #include <optional>
@@ -50,6 +51,21 @@ namespace Noggit
     static DatabaseMode databaseMode(); // sql or client storage
 
     static ClientDatabaseTable getTable(const std::string& tableName);
+
+    //! Loads a table from the active project's client database.
+    //!
+    //! When the DBD definitions do not describe the detected client build (which
+    //! happens for retail builds newer than the bundled definitions), the closest
+    //! matching definition is substituted instead of failing. See
+    //! noggit/database/Db2DefinitionFallback.hpp.
+    static BlizzardDatabaseLib::BlizzardDatabaseTable& loadClientTable(const std::string& tableName);
+
+    //! Same, but reading the files through `fileCallback`. Used by the modern
+    //! bridges, which resolve DB2 files against a specific ClientData.
+    static BlizzardDatabaseLib::BlizzardDatabaseTable& loadClientTable(
+      const std::string& tableName,
+      Noggit::Database::ClientDatabaseFileCallback const& fileCallback,
+      const char* logContext);
 
     static void saveTable(const std::string& tableName);
   
@@ -104,6 +120,10 @@ namespace Noggit
     const std::string _tableName;
     const QString _qtTableName;
     const Structures::BlizzardDatabaseRowDefinition _row_definition;
+
+    //! The client storage for _tableName. Owned by the project's BlizzardDatabase
+    //! (or by the definition fallback), which keeps it for the whole session.
+    mutable BlizzardDatabaseLib::BlizzardDatabaseTable* _client_table = nullptr;
 
   public:
     ClientDatabaseTable(std::string tableName);

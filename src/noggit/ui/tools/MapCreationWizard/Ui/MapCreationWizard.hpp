@@ -169,6 +169,7 @@ namespace Noggit
 
       bool _is_new_record = false;
       int _cur_map_id = -1;
+      bool _warned_about_missing_world = false;
 
       QMetaObject::Connection _connection;
 
@@ -181,6 +182,11 @@ namespace Noggit
       void discardChanges();
 
       void removeMap();
+
+      //! A map that could not be opened leaves the wizard without a World, and
+      //! almost every slot dereferences it. Reports the problem once and returns
+      //! false instead of crashing on a null pointer.
+      bool requireWorld(char const* action);
 
       void createMapSettingsTab();
       void createDifficultyTab();

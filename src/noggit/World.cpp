@@ -78,7 +78,17 @@ namespace
   void shadowWorldLogMissingMapDirectoryColumns(BlizzardDatabaseLib::Structures::BlizzardDatabaseRow const& record)
   {
     static std::unordered_set<int> logged_records;
-    if (logged_records.size() >= 8 || !logged_records.insert(record.RecordId).second)
+    static bool reported_cap = false;
+    if (logged_records.size() >= 3)
+    {
+      if (!reported_cap)
+      {
+        reported_cap = true;
+        LogDebug << "Not dumping the Map.db2 fields of every record without a Directory column." << std::endl;
+      }
+      return;
+    }
+    if (!logged_records.insert(record.RecordId).second)
       return;
 
     std::ostringstream columns;
@@ -99,7 +109,18 @@ namespace
     , BlizzardArchive::ClientData* client_data)
   {
     static std::unordered_set<int> logged_records;
-    if (logged_records.size() >= 16 || !logged_records.insert(record.RecordId).second)
+    static bool reported_cap = false;
+    if (logged_records.size() >= 3)
+    {
+      if (!reported_cap)
+      {
+        reported_cap = true;
+        LogDebug << "Not probing every map without a WDT file: these are maps whose data is not"
+                 << " installed in the client." << std::endl;
+      }
+      return;
+    }
+    if (!logged_records.insert(record.RecordId).second)
       return;
 
     auto const wdt_fdid = shadowWorldUIntField(record, "WdtFileDataID");
@@ -192,32 +213,57 @@ bool World::IsEditableWorld(BlizzardDatabaseLib::Structures::BlizzardDatabaseRow
   auto wdt_key = shadowWorldWdtFileKey(record, lMapName, client_data);
   if (!client_data->exists(wdt_key))
   {
-    LogDebug << "World " << record.RecordId << ": " << lMapName << " has no WDT file!" << std::endl;
-    shadowWorldLogMissingWdtDetails(record, lMapName, client_data);
+    // hundreds of maps are listed in Map.db2 without their data being installed;
+    // BuildMapListComponent reports the total, a few examples are enough here
+    static unsigned int reported = 0;
+    if (reported < 5)
+    {
+      ++reported;
+      LogDebug << "World " << record.RecordId << ": " << lMapName << " has no WDT file!" << std::endl;
+      shadowWorldLogMissingWdtDetails(record, lMapName, client_data);
+    }
+    else if (reported == 5)
+    {
+      ++reported;
+      LogDebug << "More maps have no WDT file, they are not listed individually." << std::endl;
+    }
+
     return false;
   }
 
-  BlizzardArchive::ClientFile mf(wdt_key, client_data);
-  if (mf.isEof() || mf.getSize() < WDT_MAIN_TILES_OFFSET + WDT_MAIN_TILES_SIZE)
+  // The WDT is listed in the listfile but the client may not have the data
+  // installed (partial downloads, uninstalled maps, garrisons, ...). Reading it
+  // throws in that case, which is not an error worth an entry per map.
+  try
   {
-    LogDebug << "World " << record.RecordId << ": " << lMapName << " WDT is too small!" << std::endl;
-    return false;
-  }
+    BlizzardArchive::ClientFile mf(wdt_key, client_data);
+    if (mf.isEof() || mf.getSize() < WDT_MAIN_TILES_OFFSET + WDT_MAIN_TILES_SIZE)
+    {
+      LogDebug << "World " << record.RecordId << ": " << lMapName << " WDT is too small!" << std::endl;
+      return false;
+    }
 
-  const char * lPointer = reinterpret_cast<const char*>(mf.getPointer());
-  const int lFlags = *(reinterpret_cast<const int*>(lPointer + WDT_FLAGS_OFFSET));
+    const char * lPointer = reinterpret_cast<const char*>(mf.getPointer());
+    const int lFlags = *(reinterpret_cast<const int*>(lPointer + WDT_FLAGS_OFFSET));
 
-  if (lFlags & FLAG_GLOBAL_OBJECT)
-    return true;
-
-  const int * lData = reinterpret_cast<const int*>(lPointer + WDT_MAIN_TILES_OFFSET);
-  for (int i = 0; i < 8192; i += 2)
-  {
-    if (lData[i] & 1)
+    if (lFlags & FLAG_GLOBAL_OBJECT)
       return true;
-  }
 
-  return true;
+    const int * lData = reinterpret_cast<const int*>(lPointer + WDT_MAIN_TILES_OFFSET);
+    for (int i = 0; i < 8192; i += 2)
+    {
+      if (lData[i] & 1)
+        return true;
+    }
+
+    return true;
+  }
+  catch (std::exception const& e)
+  {
+    LogDebug << "World " << record.RecordId << ": " << lMapName
+             << " WDT could not be read (" << e.what() << ")" << std::endl;
+    return false;
+  }
 }
 
 bool World::IsWMOWorld(BlizzardDatabaseLib::Structures::BlizzardDatabaseRow& record)
@@ -232,16 +278,25 @@ bool World::IsWMOWorld(BlizzardDatabaseLib::Structures::BlizzardDatabaseRow& rec
     if (!client_data->exists(wdt_key))
       return false;
 
-    BlizzardArchive::ClientFile mf(wdt_key, client_data);
-    if (mf.isEof() || mf.getSize() < WDT_FLAGS_OFFSET + sizeof(int))
+    try
+    {
+      BlizzardArchive::ClientFile mf(wdt_key, client_data);
+      if (mf.isEof() || mf.getSize() < WDT_FLAGS_OFFSET + sizeof(int))
+        return false;
+
+      const char* lPointer = reinterpret_cast<const char*>(mf.getPointer());
+      const int lFlags = *(reinterpret_cast<const int*>(lPointer + WDT_FLAGS_OFFSET));
+      if (lFlags & 1)
+          return true;
+
       return false;
-
-    const char* lPointer = reinterpret_cast<const char*>(mf.getPointer());
-    const int lFlags = *(reinterpret_cast<const int*>(lPointer + WDT_FLAGS_OFFSET));
-    if (lFlags & 1)
-        return true;
-
-    return false;
+    }
+    catch (std::exception const& e)
+    {
+      LogDebug << "World " << record.RecordId << ": " << lMapName
+               << " WDT could not be read (" << e.what() << ")" << std::endl;
+      return false;
+    }
 }
 
 World::World(const std::string& name, int map_id, Noggit::NoggitRenderContext context, bool create_empty)

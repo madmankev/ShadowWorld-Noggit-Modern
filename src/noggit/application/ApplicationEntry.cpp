@@ -1,6 +1,7 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 #include <noggit/application/Configuration/NoggitApplicationConfiguration.hpp>
 #include <noggit/application/NoggitApplication.hpp>
+#include <noggit/application/SafeApplication.hpp>
 #include <noggit/errorHandling.h>
 #include <noggit/ui/windows/projectSelection/NoggitProjectSelectionWindow.hpp>
 
@@ -34,7 +35,8 @@ int main(int argc, char *argv[])
   QCoreApplication::setAttribute(Qt::AA_UseDesktopOpenGL);
   QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
   QCoreApplication::setAttribute(Qt::AA_ShareOpenGLContexts);
-  QApplication q_application (argc, argv);
+  // SafeApplication keeps an exception thrown by a slot from killing the editor
+  Noggit::Application::SafeApplication q_application (argc, argv);
   q_application.setApplicationName ("Noggit");
   q_application.setOrganizationName ("Noggit");
 

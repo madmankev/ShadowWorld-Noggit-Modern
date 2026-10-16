@@ -294,6 +294,9 @@ MapCreationWizard::MapCreationWizard(std::shared_ptr<Project::NoggitProject> pro
       ( _minimap_widget,  &Noggit::Ui::minimap_widget::tile_clicked
           , [this] (QPoint tile)
         {
+          if (!requireWorld("editing map tiles"))
+            return;
+
           if (QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier))
           {
             int x = tile.x() - 1;
@@ -526,6 +529,11 @@ void MapCreationWizard::createWmoEntryTab()
             return;
         }
 
+        if (!requireWorld("setting a global WMO"))
+        {
+            return;
+        }
+
         _world->mWmoFilename = text.toStdString();
         WMOInstance wmo{ _world->mWmoFilename, _world->getRenderContext() };
         wmo.wmo->wait_until_loaded();
@@ -606,6 +614,11 @@ void MapCreationWizard::createWmoEntryTab()
 
 void MapCreationWizard::populateWmoEntryTab()
 {
+    if (!requireWorld("reading the global WMO settings"))
+    {
+        return;
+    }
+
     _wmoEntryTab.disableTerrain->setChecked(_world->mapIndex.hasAGlobalWMO());
     if (!_world->mapIndex.hasAGlobalWMO())
     {
@@ -659,7 +672,12 @@ void MapCreationWizard::populateNameSet(WMOInstance& instance)
     {
         if (area_name.empty())
         {
-            auto chunk = _world->getChunkAt(instance.pos);
+            auto chunk = _world ? _world->getChunkAt(instance.pos) : nullptr;
+            if (!chunk)
+            {
+                namesetnames.append(QString());
+                continue;
+            }
             namesetnames.append(gAreaDB.getAreaFullName(chunk->getAreaID()).c_str());
         }
         else
@@ -746,6 +764,9 @@ void MapCreationWizard::selectMap(int map_id)
   {
     // delete _world;
     _world.reset();
+
+    // the minimap must never keep drawing a world that has just been destroyed
+    _minimap_widget->world(nullptr);
   }
 
   // auto noggitWindow = reinterpret_cast<Noggit::Ui::Windows::NoggitWindow*>(parent());
@@ -816,6 +837,8 @@ void MapCreationWizard::selectMap(int map_id)
      }
   }
 
+  _warned_about_missing_world = false;
+
   _minimap_widget->world(_world.get());
 
   _directory->setText(QString::fromStdString(directoryName));
@@ -885,7 +908,20 @@ void MapCreationWizard::selectMap(int map_id)
   }
   catch (std::exception const& e)
   {
-    LogError << "Could not populate map difficulty selector: " << e.what() << std::endl;
+    // one line per session is enough: this runs for every selected map
+    static bool reported = false;
+    if (!reported)
+    {
+      reported = true;
+      LogError << "Could not populate map difficulty selector: " << e.what()
+               << " - the difficulty tab stays empty for this session." << std::endl;
+    }
+    else
+    {
+      LogDebug << "Could not populate map difficulty selector: " << e.what() << std::endl;
+    }
+
+    _difficulty_type->setEnabled(false);
   }
   _difficulty_type->setCurrentIndex(0);
   selectMapDifficulty();
@@ -920,7 +956,16 @@ void MapCreationWizard::selectMapDifficulty()
     }
     catch (std::exception const& e)
     {
-      LogError << "Could not read selected map difficulty: " << e.what() << std::endl;
+      static bool reported = false;
+      if (!reported)
+      {
+        reported = true;
+        LogError << "Could not read selected map difficulty: " << e.what() << std::endl;
+      }
+      else
+      {
+        LogDebug << "Could not read selected map difficulty: " << e.what() << std::endl;
+      }
     }
 }
 
@@ -949,8 +994,31 @@ void MapCreationWizard::wheelEvent(QWheelEvent* event)
 
 }
 
+bool MapCreationWizard::requireWorld(char const* action)
+{
+  if (_world)
+    return true;
+
+  if (!_warned_about_missing_world)
+  {
+    _warned_about_missing_world = true;
+    LogError << "Map creation wizard: " << action
+             << " needs an open map, but the current map could not be loaded."
+             << " Select another map first." << std::endl;
+  }
+
+  return false;
+}
+
 void MapCreationWizard::saveCurrentEntry()
 {
+  if (!requireWorld("saving the map"))
+  {
+    QMessageBox::warning(this, "Save failed",
+                         "No map is loaded in the wizard, there is nothing to save.\n"
+                         "Select a map from the list first.");
+    return;
+  }
 
   if (_is_new_record)
   {
@@ -1136,6 +1204,7 @@ void MapCreationWizard::addNewMap()
   {
     // delete _world;
     _world.reset();
+    _minimap_widget->world(nullptr);
   }
 
   // default to a new internal map name that isn't already used, or default world will load existing files
@@ -1151,10 +1220,32 @@ void MapCreationWizard::addNewMap()
   }
 
   // _world = new World(internal_map_name, _cur_map_id, Noggit::NoggitRenderContext::MAP_VIEW, true);
-  _world = std::make_unique<World>(internal_map_name, _cur_map_id, Noggit::NoggitRenderContext::MAP_VIEW, true);
+  try
+  {
+    _world = std::make_unique<World>(internal_map_name, _cur_map_id, Noggit::NoggitRenderContext::MAP_VIEW, true);
 
-  // hack to reset the minimap if there is an existing WDL with the same path(happens when removing a map from map.dbc but not the files
-  _world->horizon.set_minimap(&_world->mapIndex, true);
+    // hack to reset the minimap if there is an existing WDL with the same path(happens when removing a map from map.dbc but not the files
+    _world->horizon.set_minimap(&_world->mapIndex, true);
+  }
+  catch (std::exception const& e)
+  {
+    _world.reset();
+    LogError << "Could not create the new map \"" << internal_map_name << "\": " << e.what() << std::endl;
+    QMessageBox::warning(this, "New map failed",
+                         QString("Could not create %1:\n%2")
+                           .arg(QString::fromStdString(internal_map_name), QString::fromUtf8(e.what())));
+    return;
+  }
+  catch (...)
+  {
+    _world.reset();
+    LogError << "Could not create the new map \"" << internal_map_name << "\": unknown exception" << std::endl;
+    QMessageBox::warning(this, "New map failed",
+                         QString("Could not create %1.").arg(QString::fromStdString(internal_map_name)));
+    return;
+  }
+
+  _warned_about_missing_world = false;
 
   _minimap_widget->world(_world.get());
 

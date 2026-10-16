@@ -101,6 +101,13 @@ Version-specific readers and writers handle the differences between clients.
 -   Test important saved terrain and object changes in the matching game
     client. The four targets have not been exhaustively regression-tested
     after every change.
+-   When a client build is newer than the bundled DBD definitions, Noggit
+    substitutes the definition block that provably describes the file (matching
+    layout hash, or matching column count) and logs the substitution. Tables with
+    no matching block keep their bridge data empty.
+
+See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for what the messages in
+`log.txt` mean and how to resolve them.
 
 ### Outside the Current Scope
 

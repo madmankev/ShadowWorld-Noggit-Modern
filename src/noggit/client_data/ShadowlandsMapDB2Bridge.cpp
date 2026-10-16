@@ -6,6 +6,7 @@
 #include <noggit/Log.h>
 #include <noggit/application/NoggitApplication.hpp>
 #include <noggit/application/Configuration/NoggitApplicationConfiguration.hpp>
+#include <noggit/database/ClientDatabase.h>
 #include <noggit/project/CurrentProject.hpp>
 
 #include <blizzard-archive-library/include/ClientFile.hpp>
@@ -109,7 +110,7 @@ namespace
     return result;
   }
 
-  Table* load_optional(BlizzardDatabaseLib::BlizzardDatabase& database,
+  Table* load_optional(BlizzardDatabaseLib::BlizzardDatabase& /*database*/,
                        std::shared_ptr<BlizzardArchive::ClientData> const& client_data,
                        std::string const& name)
   {
@@ -119,7 +120,7 @@ namespace
       {
         return open_db2_from_casc(client_data, filename);
       };
-      auto& table = database.LoadTable(name, callback);
+      auto& table = Noggit::ClientDatabase::loadClientTable(name, callback, "[ModernDB2][Map]");
       Log << "[ModernDB2][Map] " << name << ".db2 records=" << table.RecordCount() << std::endl;
       return &table;
     }

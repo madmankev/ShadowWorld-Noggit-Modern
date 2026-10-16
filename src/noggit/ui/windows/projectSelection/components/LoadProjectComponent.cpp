@@ -174,7 +174,9 @@ namespace Noggit::Ui::Component
     if (project)
       Noggit::Application::NoggitApplication::instance()->setClientData(project->ClientData);
     else
-      LogError << "Couldn't set client data : Project loading failed." << std::endl;
+      LogError << "Could not load the project in \"" << project_path.toStdString()
+               << "\", no client data was set. Pick a folder that contains a .noggitproj file."
+               << std::endl;
 
     return project;
   }

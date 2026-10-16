@@ -80,6 +80,15 @@ void DBCFile::save()
 
   std::ofstream stream(filename_proj, std::ios_base::out | std::ios_base::trunc | std::ios_base::binary);
 
+  // A failed save used to be silent: the stream simply stayed closed and the
+  // caller believed the DBC was written. That loses edits without a trace.
+  if (!stream.is_open())
+  {
+    LogError << "Could not open \"" << filename_proj << "\" for writing, \"" << filename
+             << "\" was not saved. Check that the project folder is writable." << std::endl;
+    throw std::runtime_error("Could not open " + filename_proj + " for writing");
+  }
+
   stream << 'W' << 'D' << 'B' << 'C';
 
 
@@ -90,6 +99,17 @@ void DBCFile::save()
 
   stream.write(reinterpret_cast<char*>(data.data()), data.size());
   stream.write(stringTable.data(), stringSize);
+
+  stream.flush();
+  if (!stream)
+  {
+    LogError << "Writing \"" << filename_proj << "\" failed, \"" << filename
+             << "\" may be incomplete. Check the free disk space and the folder permissions."
+             << std::endl;
+    stream.close();
+    throw std::runtime_error("Could not write " + filename_proj);
+  }
+
   stream.close();
 }
 
@@ -122,6 +142,19 @@ DBCFile DBCFile::createNew(std::string filename, std::uint32_t fieldCount, std::
 
 DBCFile::Record DBCFile::getRecord(size_t id)
 {
+  // Callers derive the index from user input (a combo box selection, a record id
+  // lookup, ...). Without this check an out of range index - including a negative
+  // one converted to size_t - reads far outside the record block and takes the
+  // whole editor down instead of reporting a missing row.
+  auto const available = recordSize > 0 ? data.size() / recordSize : 0;
+  if (id >= available)
+  {
+    LogError << "Tried to read record " << id << " of \"" << filename << "\", which holds "
+             << available << " record" << (available == 1 ? "" : "s")
+             << ". The table may not have been loaded from the client." << std::endl;
+    throw NotFound();
+  }
+
   return Record(*this, data.data() + id * recordSize);
 }
 

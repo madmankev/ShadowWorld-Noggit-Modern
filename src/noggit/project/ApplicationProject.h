@@ -112,6 +112,12 @@ namespace Noggit::Project
     std::vector<NoggitProjectBookmarkMap> Bookmarks;
     std::shared_ptr<BlizzardDatabaseLib::BlizzardDatabase> ClientDatabase;
     std::shared_ptr<BlizzardArchive::ClientData> ClientData;
+
+    //! Not serialized: filled in by ApplicationProject::loadProject() so the
+    //! database code can reproduce how ClientDatabase was built.
+    std::string ClientBuild = "3.3.5.12340";
+    std::string DatabaseDefinitionsPath = "definitions";
+    bool PreferDb2Definitions = false;
     std::vector<NoggitProjectObjectPalette> ObjectPalettes;
     std::vector<NoggitProjectTexturePalette> TexturePalettes;
     std::vector<NoggitProjectSelectionGroups> ObjectSelectionGroups;

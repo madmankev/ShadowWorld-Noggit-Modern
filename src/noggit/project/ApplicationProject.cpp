@@ -252,7 +252,8 @@ namespace Noggit::Project
 
     if (!project.has_value())
     {
-      LogError << "loadProject() failed, Project is null" << std::endl;
+      // ApplicationProjectReader already said why
+      LogDebug << "loadProject() failed, Project is null" << std::endl;
       return {};
     }
     else
@@ -269,6 +270,7 @@ namespace Noggit::Project
       dbd_file_directory = "definitions-forever";
 
     BlizzardDatabaseLib::Structures::Build client_build("3.3.5.12340");
+    std::string client_build_string = "3.3.5.12340";
     auto client_archive_version = BlizzardArchive::ClientVersion::WOTLK;
     auto client_archive_locale = BlizzardArchive::Locale::AUTO;
     if (project->projectVersion == ProjectVersion::SL || project->projectVersion == ProjectVersion::RETAIL
@@ -292,6 +294,7 @@ namespace Noggit::Project
       }
 
       client_build = BlizzardDatabaseLib::Structures::Build(detected_build);
+      client_build_string = detected_build;
       try
       {
         std::size_t parsed_length = 0;
@@ -329,6 +332,10 @@ namespace Noggit::Project
 
     project->ClientDatabase = std::make_shared<BlizzardDatabaseLib::BlizzardDatabase>(
       dbd_file_directory, client_build, project->projectVersion == ProjectVersion::FOREVER);
+
+    project->ClientBuild = client_build_string;
+    project->DatabaseDefinitionsPath = dbd_file_directory;
+    project->PreferDb2Definitions = project->projectVersion == ProjectVersion::FOREVER;
 
     Log << "Loading Client Path : " << project->ClientPath << std::endl;
 
@@ -542,7 +549,7 @@ namespace Noggit::Project
 
     unsigned int NoggitProject::buildId()
     {
-      return ClientDatabase->getBuild();
+      return ClientDatabase ? ClientDatabase->getBuild() : 0u;
     }
 
     void NoggitProject::createBookmark(const NoggitProjectBookmarkMap& bookmark)

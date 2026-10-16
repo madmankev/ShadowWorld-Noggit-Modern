@@ -14,7 +14,9 @@ namespace Noggit::Project
   {
     if (!std::filesystem::exists(project_path) || !std::filesystem::is_directory(project_path))
     {
-      LogError << "Failed to read project path : " << project_path << std::endl;
+      // Not an error by itself: the configured project path is simply stale or
+      // has not been set yet. The caller reports the failed load.
+      Log << "Project path \"" << project_path.generic_string() << "\" does not exist." << std::endl;
       return {};
     }
 
@@ -24,7 +26,8 @@ namespace Noggit::Project
         return readProjectFile(entry.path());
     }
 
-    LogError << "Failed to find a .noggitproj file in project path : " << project_path << std::endl;
+    Log << "No .noggitproj file in \"" << project_path.generic_string()
+        << "\", it is not a Noggit project folder." << std::endl;
     return {};
   }
 

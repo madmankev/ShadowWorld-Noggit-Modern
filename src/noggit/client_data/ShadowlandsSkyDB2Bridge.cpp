@@ -4,6 +4,7 @@
 
 #include <noggit/DBC.h>
 #include <noggit/Log.h>
+#include <noggit/database/ClientDatabase.h>
 #include <noggit/project/CurrentProject.hpp>
 
 #include <blizzard-archive-library/include/ClientFile.hpp>
@@ -190,17 +191,15 @@ namespace Noggit::ClientData
       if (!project || !project->ClientDatabase)
         throw std::runtime_error("Modern sky DB2 bridge has no active project client database.");
 
-      auto& database = *project->ClientDatabase;
-
       auto callback = [&client_data](std::string const& filename)
       {
         return open_db2_from_casc(client_data, filename);
       };
 
-      auto& light_table = database.LoadTable("Light", callback);
-      auto& params_table = database.LoadTable("LightParams", callback);
-      auto& data_table = database.LoadTable("LightData", callback);
-      auto& skybox_table = database.LoadTable("LightSkybox", callback);
+      auto& light_table = Noggit::ClientDatabase::loadClientTable("Light", callback, "[ModernDB2][Sky]");
+      auto& params_table = Noggit::ClientDatabase::loadClientTable("LightParams", callback, "[ModernDB2][Sky]");
+      auto& data_table = Noggit::ClientDatabase::loadClientTable("LightData", callback, "[ModernDB2][Sky]");
+      auto& skybox_table = Noggit::ClientDatabase::loadClientTable("LightSkybox", callback, "[ModernDB2][Sky]");
 
       std::map<std::uint32_t, std::pair<std::string, std::uint32_t>> skyboxes;
       for (std::uint32_t i = 0; i < skybox_table.RecordCount(); ++i)

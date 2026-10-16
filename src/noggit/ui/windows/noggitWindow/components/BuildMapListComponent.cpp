@@ -12,6 +12,9 @@
 
 #include <blizzard-database-library/include/BlizzardDatabase.h>
 
+#include <map>
+#include <sstream>
+
 #include <QAction>
 #include <QListWidgetItem>
 #include <QMenu>
@@ -77,6 +80,33 @@ void BuildMapListComponent::buildMapList(Noggit::Ui::Windows::NoggitWindow* pare
   auto iterator = map_table.Records();
   auto pinned_maps = std::vector<Widget::MapListData>();
   auto maps = std::vector<Widget::MapListData>();
+
+  // Maps whose data is not installed cannot be listed. That is normal for a
+  // partial client, so the individual cases are debug output and only the
+  // summary is reported as an error.
+  std::map<std::string, unsigned int> skipped_records;
+  unsigned int skipped_count = 0;
+
+  // The messages carry the map path, so every one of them is unique. Only the
+  // leading sentence is a usable grouping key, otherwise the "summary" below
+  // would be as long as the individual messages it replaces.
+  auto const reasonCategory = [](std::string const& message)
+  {
+    auto category = message.substr(0, message.find_first_of(".{("));
+
+    while (!category.empty() && (category.back() == ' ' || category.back() == ','))
+      category.pop_back();
+
+    return category.empty() ? message : category;
+  };
+
+  auto const recordSkipped = [&](int record_id, std::string const& reason)
+  {
+    ++skipped_count;
+    ++skipped_records[reasonCategory(reason)];
+    LogDebug << "Skipping invalid Map.db2 record " << record_id
+             << " while building map list: " << reason << std::endl;
+  };
   while (iterator.HasRecords())
   {
     BlizzardDatabaseLib::Structures::BlizzardDatabaseRow record;
@@ -86,7 +116,7 @@ void BuildMapListComponent::buildMapList(Noggit::Ui::Windows::NoggitWindow* pare
     }
     catch (std::exception const& e)
     {
-      LogError << "Skipping unreadable Map.db2 record while building map list: " << e.what() << std::endl;
+      recordSkipped(record.RecordId, std::string("unreadable record: ") + e.what());
       continue;
     }
 
@@ -130,9 +160,21 @@ void BuildMapListComponent::buildMapList(Noggit::Ui::Windows::NoggitWindow* pare
     }
     catch (std::exception const& e)
     {
-      LogError << "Skipping invalid Map.db2 record " << record.RecordId << " while building map list: " << e.what() << std::endl;
+      recordSkipped(record.RecordId, e.what());
       continue;
     }
+  }
+
+  if (skipped_count > 0)
+  {
+    std::ostringstream summary;
+    for (auto const& [reason, count] : skipped_records)
+      summary << "\n  " << count << " x " << reason;
+
+    LogError << "Skipped " << skipped_count << " Map.db2 record"
+             << (skipped_count == 1 ? "" : "s") << " while building the map list, their map data is"
+             << " not available in the client:" << summary.str()
+             << "\nThe individual records are in the debug log." << std::endl;
   }
 
   pinned_maps.insert(pinned_maps.end(), maps.begin(), maps.end());

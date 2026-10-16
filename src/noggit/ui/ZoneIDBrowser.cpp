@@ -2,6 +2,7 @@
 
 #include <noggit/application/NoggitApplication.hpp>
 #include <noggit/DBC.h>
+#include <noggit/Log.h>
 #include <noggit/ui/FontAwesome.hpp>
 #include <noggit/ui/tools/MapCreationWizard/Ui/MapCreationWizard.hpp>
 #include <noggit/ui/tools/UiCommon/expanderwidget.h>
@@ -939,17 +940,23 @@ namespace Noggit
                 record.write(AreaDB::Flags, _flags_value_spinbox->value());
 
                 int SoundProviderPreferences_id = 0;
-                if (_sound_provider_preferences_cbbox->currentIndex() != 0)
+                // the combo box stays empty when SoundProviderPreferences could
+                // not be loaded from the client, and currentIndex() is -1 then
+                auto const sound_provider_index = _sound_provider_preferences_cbbox->currentIndex() - 1;
+                if (sound_provider_index >= 0
+                    && static_cast<size_t>(sound_provider_index) < gSoundProviderPreferencesDB.getRecordCount())
                 {
-                    auto rec = gSoundProviderPreferencesDB.getRecord(_sound_provider_preferences_cbbox->currentIndex() - 1);
+                    auto rec = gSoundProviderPreferencesDB.getRecord(sound_provider_index);
                     SoundProviderPreferences_id = rec.getInt(SoundProviderPreferencesDB::ID);
                 }
                 record.write(AreaDB::SoundProviderPreferences, SoundProviderPreferences_id);
                 
                 int underwaterSoundProviderPreferences_id = 0;
-                if (_underwater_sound_provider_preferences_cbbox->currentIndex() != 0)
+                auto const underwater_index = _underwater_sound_provider_preferences_cbbox->currentIndex() - 1;
+                if (underwater_index >= 0
+                    && static_cast<size_t>(underwater_index) < gSoundProviderPreferencesDB.getRecordCount())
                 {
-                    auto rec = gSoundProviderPreferencesDB.getRecord(_underwater_sound_provider_preferences_cbbox->currentIndex() - 1);
+                    auto rec = gSoundProviderPreferencesDB.getRecord(underwater_index);
                     underwaterSoundProviderPreferences_id = rec.getInt(SoundProviderPreferencesDB::ID);
                 }
                 record.write(AreaDB::UnderwaterSoundProviderPreferences, underwaterSoundProviderPreferences_id);
@@ -1024,6 +1031,14 @@ namespace Noggit
             {
 
             } 
+            catch (std::exception const& e)
+            {
+                // anything else used to escape the button handler and terminate
+                // the editor with an unhandled C++ exception
+                LogError << "Could not save the area: " << e.what() << std::endl;
+                QMessageBox::warning(this, "Save failed",
+                                     QString("The area could not be saved:\n%1").arg(QString::fromUtf8(e.what())));
+            }
         }
 
     }

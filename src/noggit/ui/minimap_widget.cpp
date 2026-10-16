@@ -175,6 +175,14 @@ namespace Noggit
     // \todo : massive performance drop after clicking the minimap once until moving cursor out of frame, paintEvent gets called repeatidly
     void minimap_widget::paintEvent (QPaintEvent* paint_event)
     {
+      // Everything below dereferences _world. The wizard clears it when a map
+      // could not be loaded (or is being replaced), and the widget is still
+      // visible and repainting at that point, so bail out instead of crashing.
+      if (!_world)
+      {
+        return;
+      }
+
         /*
         auto rectangle = paint_event->rect();
         auto left = rectangle.left();

@@ -2,6 +2,7 @@
 #include <noggit/Log.h>
 
 #include <csignal>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -34,15 +35,24 @@ namespace Noggit
 
     free (strings);
 #else
-    // the default StackWalker prints to the debugger/console, which is gone by
-    // the time anyone reads a crash report; mirror every line into the log
+    // StackWalker::OnOutput already writes into the log, which is where a crash
+    // report has to end up: the console is gone by the time anybody reads it.
+    // Calling the base implementation as well logged every frame twice, and the
+    // newline the walker appends left a blank line after each one.
     class LogStackWalker : public StackWalker
     {
     protected:
       void OnOutput(LPCSTR szText) override
       {
-        LogError << szText << std::flush;
-        StackWalker::OnOutput(szText);
+        if (!szText)
+          return;
+
+        std::string text(szText);
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+          text.pop_back();
+
+        if (!text.empty())
+          LogError << text << std::endl;
       }
     };
 
@@ -142,7 +152,30 @@ namespace Noggit
       case EXCEPTION_POSSIBLE_DEADLOCK: LogError << "EXCEPTION_POSSIBLE_DEADLOCK" << std::endl; break;
 #endif
       default:
-        LogError << "Exception code=" << code << std::endl;
+      {
+        // Codes the SEH list above does not cover but that Noggit does hit.
+        // 0xE06D7363 is how the MSVC runtime reports a C++ exception that nobody
+        // caught ("msc" in ASCII): the message of that exception is in the log
+        // just above this line, or was swallowed by a Qt event handler.
+        char const* known = nullptr;
+        switch (code)
+        {
+        case 0xE06D7363: known = "UNHANDLED_CXX_EXCEPTION - a C++ exception was not caught"; break;
+        case 0xC0000409: known = "STATUS_STACK_BUFFER_OVERRUN - fast fail, usually a corrupted stack or an invalid parameter"; break;
+        case 0xC0000374: known = "STATUS_HEAP_CORRUPTION"; break;
+        case 0xC00000FD: known = "STATUS_STACK_OVERFLOW"; break;
+        case 0xC0000094: known = "STATUS_INTEGER_DIVIDE_BY_ZERO"; break;
+        default: break;
+        }
+
+        std::ostringstream hex_code;
+        hex_code << "0x" << std::hex << std::uppercase << code;
+
+        if (known)
+          LogError << "Exception " << hex_code.str() << ": " << known << std::endl;
+        else
+          LogError << "Exception code=" << code << " (" << hex_code.str() << ")" << std::endl;
+      }
       }
 
       printStacktrace();

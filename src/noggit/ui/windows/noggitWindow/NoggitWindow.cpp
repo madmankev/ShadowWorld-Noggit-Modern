@@ -339,7 +339,9 @@ namespace Noggit::Ui::Windows
     }
     else
     {
-      LogError << "Map " << map_id << " did not create a World for the minimap." << std::endl;
+      // The map creation wizard already reported why (missing map data in the
+      // client, unreadable WDT, ...): repeating it here only fills the log.
+      LogDebug << "Map " << map_id << " did not create a World for the minimap." << std::endl;
       _minimap->world(nullptr);
     }
 
