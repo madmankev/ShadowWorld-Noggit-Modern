@@ -61,7 +61,19 @@ namespace Noggit::Formats::ADT
 
     // Converts Noggit's canonical legacy serialization back into the modern
     // split layout while retaining chunks that the editor does not own.
+    // Kept as the fallback path; the native writer (ModernAdtWriter) is the
+    // primary ROOT producer. Both paths now refresh the ROOT bookkeeping
+    // (MCIN offsets/sizes, MHDR mcin/mh2o/mfbo) and validate every part
+    // before anything is written to disk.
     static void saveFromLegacy(ShadowlandsADTBackingStore const& backing,
+                               std::vector<std::uint8_t> const& legacy_adt);
+
+    // Saves a ROOT part that ModernAdtWriter assembled natively, converting
+    // TEX0/OBJ0/OBJ1 from the legacy serialization as before. Throws
+    // ModernAdtValidationError when any assembled part fails validation;
+    // nothing is written in that case.
+    static void saveNativeRoot(ShadowlandsADTBackingStore const& backing,
+                               std::vector<std::uint8_t> root,
                                std::vector<std::uint8_t> const& legacy_adt);
   };
 }

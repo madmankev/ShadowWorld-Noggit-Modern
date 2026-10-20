@@ -2,6 +2,8 @@
 
 #include <noggit/formats/adt/ShadowlandsADTCodec.hpp>
 
+#include <noggit/formats/adt/ModernAdtWriter.hpp>
+
 #include <noggit/application/NoggitApplication.hpp>
 #include <noggit/MapHeaders.h>
 #include <noggit/Log.h>
@@ -25,6 +27,7 @@
 #include <stdexcept>
 #include <tuple>
 #include <type_traits>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -968,6 +971,110 @@ namespace Noggit::Formats::ADT
           || !file.commit())
         throw std::runtime_error("Could not atomically save modern ADT part: " + disk_path);
     }
+
+    // Shared save pipeline for both the native and the conversion path:
+    // assemble every part in memory, validate everything, then write.
+    struct ConvertedParts
+    {
+      std::vector<std::uint8_t> root;
+      std::vector<std::uint8_t> tex0;
+      std::vector<std::uint8_t> obj0;
+      std::vector<std::uint8_t> obj1;
+    };
+
+    ConvertedParts assemble_parts(ShadowlandsADTBackingStore const& backing,
+                                  std::vector<std::uint8_t> const& legacy_adt,
+                                  std::optional<std::vector<std::uint8_t>> native_root)
+    {
+      ConvertedParts parts;
+      auto const& profile = adt_profile_v18();
+
+      if (native_root)
+      {
+        parts.root = std::move(*native_root);
+      }
+      else
+      {
+        parts.root = rewrite_mcnks(backing.part(ShadowlandsADTPart::Root).bytes, legacy_adt, true);
+        auto const legacy_chunks = parse_chunks(legacy_adt, "legacy ADT");
+        for (auto const magic : {fourcc('M','H','2','O'), fourcc('M','F','B','O')})
+        {
+          if (auto const* replacement = find_chunk(legacy_chunks, magic))
+            parts.root = replace_top_level_chunk(parts.root, magic, chunk_bytes(legacy_adt, *replacement));
+        }
+        // Chunk replacements shift file positions while rewrite_mcnks keeps the
+        // original MCIN/MHDR, which leaves their offsets stale. Refresh the
+        // bookkeeping against the actual layout before validating.
+        ModernAdtWriter::refreshRootBookkeeping(profile, parts.root);
+      }
+
+      parts.tex0 = rewrite_mcnks(backing.part(ShadowlandsADTPart::Tex0).bytes, legacy_adt, false);
+      auto const texture_paths = legacy_string_table(legacy_adt, fourcc('M','T','E','X'));
+      auto const texture_ids = resolve_file_ids(texture_paths);
+      parts.tex0 = replace_top_level_chunk(
+        parts.tex0, fourcc('M','D','I','D'), make_chunk(fourcc('M','D','I','D'), uint32_payload(texture_ids)));
+
+      auto const original_obj0 = backing.part(ShadowlandsADTPart::Obj0).bytes;
+      auto const mddf = modern_placements<ENTRY_MDDF>(
+        legacy_adt, fourcc('M','D','D','F'), fourcc('M','M','I','D'), fourcc('M','M','D','X'), original_obj0);
+      auto const modf = modern_placements<ENTRY_MODF>(
+        legacy_adt, fourcc('M','O','D','F'), fourcc('M','W','I','D'), fourcc('M','W','M','O'), original_obj0);
+      if (backing.has(ShadowlandsADTPart::Obj1))
+        parts.obj1 = rewrite_obj1(backing.part(ShadowlandsADTPart::Obj1).bytes, mddf, modf);
+      parts.obj0 = original_obj0;
+      parts.obj0 = replace_top_level_chunk(
+        parts.obj0, fourcc('M','D','D','F'), make_chunk(fourcc('M','D','D','F'), mddf));
+      parts.obj0 = replace_top_level_chunk(
+        parts.obj0, fourcc('M','O','D','F'), make_chunk(fourcc('M','O','D','F'), modf));
+      parts.obj0 = rewrite_obj0_refs(parts.obj0, legacy_adt,
+                                     mddf.size() / sizeof(ENTRY_MDDF),
+                                     modf.size() / sizeof(ENTRY_MODF));
+      return parts;
+    }
+
+    void validate_and_save_parts(ShadowlandsADTBackingStore const& backing,
+                                 ConvertedParts const& parts)
+    {
+      auto const& profile = adt_profile_v18();
+
+      // Pre-write validation (issue: native modern ADT writer). A part that
+      // fails here never reaches disk; ModernAdtValidationError tells callers
+      // that falling back to another path would write the same suspect data.
+      ModernAdtWriter::validatePartOrThrow(profile, parts.root, AdtPartExpectation::Root, "ROOT part");
+      ModernAdtWriter::validatePartOrThrow(profile, parts.tex0, AdtPartExpectation::Texture, "TEX0 part");
+      try
+      {
+        validate_tex0_alpha_layout(parts.tex0);
+      }
+      catch (ModernAdtValidationError const&)
+      {
+        throw;
+      }
+      catch (std::exception const& error)
+      {
+        throw ModernAdtValidationError(std::string("TEX0 alpha layout: ") + error.what());
+      }
+      ModernAdtWriter::validatePartOrThrow(profile, parts.obj0, AdtPartExpectation::Object, "OBJ0 part");
+      if (backing.has(ShadowlandsADTPart::Obj1))
+        ModernAdtWriter::validatePartOrThrow(profile, parts.obj1, AdtPartExpectation::Generic, "OBJ1 part");
+      if (backing.has(ShadowlandsADTPart::Lod))
+        ModernAdtWriter::validatePartOrThrow(
+          profile, backing.part(ShadowlandsADTPart::Lod).bytes, AdtPartExpectation::Generic, "LOD part");
+
+      // Build every part before touching disk. QSaveFile then replaces each loose
+      // project override atomically and the original CASC remains read-only.
+      save_part(backing.source.paths[part_index(ShadowlandsADTPart::Root)], parts.root);
+      save_part(backing.source.paths[part_index(ShadowlandsADTPart::Tex0)], parts.tex0);
+      save_part(backing.source.paths[part_index(ShadowlandsADTPart::Obj0)], parts.obj0);
+      if (backing.has(ShadowlandsADTPart::Obj1))
+        save_part(backing.source.paths[part_index(ShadowlandsADTPart::Obj1)], parts.obj1);
+      if (backing.has(ShadowlandsADTPart::Lod))
+        save_part(backing.source.paths[part_index(ShadowlandsADTPart::Lod)],
+                  backing.part(ShadowlandsADTPart::Lod).bytes);
+
+      Log << "[ModernADT][Save] Saved split tile ROOT/TEX0/OBJ0/OBJ1/LOD to the project override: "
+          << backing.source.root_path << std::endl;
+    }
   }
 
   bool ShadowlandsADTBackingStore::has(ShadowlandsADTPart part) const noexcept
@@ -1023,51 +1130,14 @@ namespace Noggit::Formats::ADT
     ShadowlandsADTBackingStore const& backing,
     std::vector<std::uint8_t> const& legacy_adt)
   {
-    auto root = rewrite_mcnks(backing.part(ShadowlandsADTPart::Root).bytes, legacy_adt, true);
-    auto tex0 = rewrite_mcnks(backing.part(ShadowlandsADTPart::Tex0).bytes, legacy_adt, false);
-    auto obj0 = backing.part(ShadowlandsADTPart::Obj0).bytes;
+    validate_and_save_parts(backing, assemble_parts(backing, legacy_adt, std::nullopt));
+  }
 
-    auto const legacy_chunks = parse_chunks(legacy_adt, "legacy ADT");
-    for (auto const magic : {fourcc('M','H','2','O'), fourcc('M','F','B','O')})
-    {
-      if (auto const* replacement = find_chunk(legacy_chunks, magic))
-        root = replace_top_level_chunk(root, magic, chunk_bytes(legacy_adt, *replacement));
-    }
-
-    auto const texture_paths = legacy_string_table(legacy_adt, fourcc('M','T','E','X'));
-    auto const texture_ids = resolve_file_ids(texture_paths);
-    tex0 = replace_top_level_chunk(
-      tex0, fourcc('M','D','I','D'), make_chunk(fourcc('M','D','I','D'), uint32_payload(texture_ids)));
-
-    auto const mddf = modern_placements<ENTRY_MDDF>(
-      legacy_adt, fourcc('M','D','D','F'), fourcc('M','M','I','D'), fourcc('M','M','D','X'), obj0);
-    auto const modf = modern_placements<ENTRY_MODF>(
-      legacy_adt, fourcc('M','O','D','F'), fourcc('M','W','I','D'), fourcc('M','W','M','O'), obj0);
-    std::vector<std::uint8_t> obj1;
-    if (backing.has(ShadowlandsADTPart::Obj1))
-      obj1 = rewrite_obj1(backing.part(ShadowlandsADTPart::Obj1).bytes, mddf, modf);
-    obj0 = replace_top_level_chunk(
-      obj0, fourcc('M','D','D','F'), make_chunk(fourcc('M','D','D','F'), mddf));
-    obj0 = replace_top_level_chunk(
-      obj0, fourcc('M','O','D','F'), make_chunk(fourcc('M','O','D','F'), modf));
-    obj0 = rewrite_obj0_refs(obj0, legacy_adt,
-                             mddf.size() / sizeof(ENTRY_MDDF),
-                             modf.size() / sizeof(ENTRY_MODF));
-
-    validate_tex0_alpha_layout(tex0);
-
-    // Build every part before touching disk. QSaveFile then replaces each loose
-    // project override atomically and the original CASC remains read-only.
-    save_part(backing.source.paths[part_index(ShadowlandsADTPart::Root)], root);
-    save_part(backing.source.paths[part_index(ShadowlandsADTPart::Tex0)], tex0);
-    save_part(backing.source.paths[part_index(ShadowlandsADTPart::Obj0)], obj0);
-    if (backing.has(ShadowlandsADTPart::Obj1))
-      save_part(backing.source.paths[part_index(ShadowlandsADTPart::Obj1)], obj1);
-    if (backing.has(ShadowlandsADTPart::Lod))
-      save_part(backing.source.paths[part_index(ShadowlandsADTPart::Lod)],
-                backing.part(ShadowlandsADTPart::Lod).bytes);
-
-    Log << "[ModernADT][Save] Saved split tile ROOT/TEX0/OBJ0/OBJ1/LOD to the project override: "
-        << backing.source.root_path << std::endl;
+  void ShadowlandsADTCodec::saveNativeRoot(
+    ShadowlandsADTBackingStore const& backing,
+    std::vector<std::uint8_t> root,
+    std::vector<std::uint8_t> const& legacy_adt)
+  {
+    validate_and_save_parts(backing, assemble_parts(backing, legacy_adt, std::move(root)));
   }
 }

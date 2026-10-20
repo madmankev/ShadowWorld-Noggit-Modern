@@ -181,6 +181,37 @@ libraries that write to the console directly (`Table Already Loaded`,
 
 Repeated table loads are cached, which removes most of that output.
 
+## Saving a modern tile: "[ModernADT][Save]" messages
+
+Modern (split-ADT) saves go through the native ROOT writer first
+(`ModernAdtWriter`), then convert TEX0/OBJ0/OBJ1, then **validate every part
+before anything is written**. A healthy save logs:
+
+``` text
+[ModernADT][Save] Saved split tile ROOT/TEX0/OBJ0/OBJ1/LOD to the project override: world/maps/...
+```
+
+What the other messages mean:
+
+* `Native ROOT writer failed for "..."; falling back to the conversion path.`
+  — the native writer hit a structural surprise in this tile's original
+  files. The save still happens through the older conversion path (which now
+  also repairs MCIN/MHDR bookkeeping). Worth reporting with the log attached.
+* `Validation rejected the tile "...": <problems>` — pre-write validation
+  found the assembled files inconsistent (the message lists every problem,
+  e.g. an MCIN entry that does not match its MCNK). **Nothing was written**;
+  your project files are untouched. This protects against corrupt map files:
+  retry once, and if it repeats, report it with the log — the listed problems
+  say exactly which part and chunk disagreed.
+* `Split ADT save failed for "..."` — the fallback path failed too (or the
+  original tile could not be loaded). Again, nothing was written.
+* `Could not load the original split tile before saving` — the tile's
+  original ROOT/TEX0/OBJ0 could not be read from the client; the save is
+  skipped because preservation of unknown data would be impossible.
+
+Details and the design are documented in
+[`MODERN_ADT_WRITER.md`](MODERN_ADT_WRITER.md).
+
 ## Reporting a problem
 
 Include `log.txt`, the project's client version (Shadowlands 9.2.7, Retail,

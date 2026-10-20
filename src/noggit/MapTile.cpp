@@ -5,6 +5,7 @@
 #include <noggit/Log.h>
 #include <noggit/MapChunk.h>
 #include <noggit/MapTile.h>
+#include <noggit/formats/adt/ModernAdtWriter.hpp>
 #include <noggit/formats/adt/ShadowlandsADTCodec.hpp>
 #include <noggit/Misc.h>
 #include <noggit/Model.h>
@@ -997,7 +998,44 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
     {
       auto const legacy_bytes = lADTFile.data_up_to(lCurrentPosition);
       std::vector<std::uint8_t> serialized(legacy_bytes.begin(), legacy_bytes.end());
-      Noggit::Formats::ADT::ShadowlandsADTCodec::saveFromLegacy(*modern_backing, serialized);
+
+      // Native modern ROOT writer first (issue: implement native modern ADT
+      // writer). The ROOT part - MVER/MHDR/MCIN and the 256 MCNKs - is
+      // assembled natively with recomputed bookkeeping; TEX0/OBJ0/OBJ1 still
+      // convert from the canonical serialization until they grow native
+      // writers of their own. Every part is validated before anything is
+      // written.
+      auto const& profile = Noggit::Formats::ADT::adt_profile_v18();
+      bool saved_natively = false;
+      try
+      {
+        auto input = Noggit::Formats::ADT::ModernAdtWriter::rootInputFromLegacy(profile, serialized);
+        auto root = Noggit::Formats::ADT::ModernAdtWriter::writeRoot(
+            profile,
+            modern_backing->part(Noggit::Formats::ADT::ShadowlandsADTPart::Root).bytes,
+            input);
+        Noggit::Formats::ADT::ShadowlandsADTCodec::saveNativeRoot(
+            *modern_backing, std::move(root), serialized);
+        saved_natively = true;
+      }
+      catch (Noggit::Formats::ADT::ModernAdtValidationError const& error)
+      {
+        // Pre-write validation exists so suspect tiles never reach disk. The
+        // fallback path would assemble the same data, so abort instead of
+        // retrying: a corrupt tile is worse than a failed save.
+        LogError << "[ModernADT][Save] Validation rejected the tile \""
+                 << _file_key.stringRepr() << "\": " << error.what() << std::endl;
+        return false;
+      }
+      catch (std::exception const& error)
+      {
+        LogError << "[ModernADT][Save] Native ROOT writer failed for \""
+                 << _file_key.stringRepr() << "\" (" << error.what()
+                 << "); falling back to the conversion path." << std::endl;
+      }
+
+      if (!saved_natively)
+        Noggit::Formats::ADT::ShadowlandsADTCodec::saveFromLegacy(*modern_backing, serialized);
     }
     catch (std::exception const& error)
     {
