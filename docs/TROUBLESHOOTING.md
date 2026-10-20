@@ -263,6 +263,44 @@ patched in place (MPHD flags + MAIN tile flags for the WDT, MARE/MAHO height
 payloads for the WDL), so chunks Noggit does not understand survive saving
 byte for byte. Full details in [MODERN_WDT_WDL.md](MODERN_WDT_WDL.md).
 
+## Loading modern tiles: "[ModernADT]" messages
+
+Every message about Shadowlands/retail ADT loading carries the
+`[ModernADT]` tag (UID fixing uses `[UIDFix]`, object attachment adds
+`[Objects]`, texture decoding adds `[TexDiag]`). Errors mean data was
+lost or a file was rejected; warnings and debug lines are informational.
+The most common ones:
+
+* `Refusing to load '...': its ROOT part is not a usable modern or legacy
+  ADT` - the root ADT is missing, truncated or has no recognisable
+  layout. The messages directly above name the exact chunk problem. The
+  tile is skipped; the rest of the map still loads.
+* `is a legacy single-file ADT ... routing it to the legacy loader` -
+  normal when a WotLK-style ADT lives inside a modern project (for
+  example a tile you converted yourself). Nothing is lost.
+* `the tile will load without terrain textures` / `without model/WMO
+  placements` - the `_tex0` / `_obj0` part is missing or damaged. The
+  terrain itself still loads and stays editable; re-saving the tile
+  rebuilds the missing part from what Noggit has.
+* `N/256 chunk(s) failed to load (first error: ...); flat placeholders
+  were inserted` - individual damaged terrain chunks were replaced by
+  flat placeholders so the rest of the tile stays usable. Re-save the
+  tile to write a clean file, or sculpt the placeholders back.
+* `MHDR flag 0x1 announces MFBO flight bounds but no valid MFBO chunk was
+  found` - the file claims flight bounds but the chunk is missing or
+  malformed; bounds stay empty. Cosmetic unless you rely on camera
+  clipping.
+
+For a deep look at what Noggit sees inside one tile, enable verbose
+per-chunk diagnostics (first 4 chunks of every tile: height tables and
+TEX0 layer dumps) with the setting:
+
+    modern_adt_verbose_diagnostics = true
+
+in `noggit.ini` (or the Qt settings registry), then restart Noggit.
+Full details of the loader, the shared reader module and the failure
+behaviours are in [MODERN_ADT_LOADING.md](MODERN_ADT_LOADING.md).
+
 ## Reporting a problem
 
 Include `log.txt`, the project's client version (Shadowlands 9.2.7, Retail,

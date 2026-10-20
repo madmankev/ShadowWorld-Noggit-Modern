@@ -10,6 +10,7 @@
 #include <noggit/errorHandling.h>
 #include <noggit/Log.h>
 #include <noggit/MapTile.h>
+#include <noggit/formats/adt/ModernAdtReader.hpp>
 #include <noggit/project/CurrentProject.hpp>
 #include <util/exception_to_string.hpp>
 
@@ -21,6 +22,7 @@
 #include <exception>
 #include <list>
 #include <sstream>
+#include <vector>
 
 namespace
 {
@@ -69,196 +71,140 @@ namespace
     return root_path.substr(0, extension) + suffix + ".adt";
   }
 
-  std::string fourcc_name(std::uint32_t value)
+  enum class ModernAdtRoute
   {
-    // WoW stores chunk FourCC bytes reversed on disk (e.g. MCNK appears as KNCM).
-    // Present them in canonical documentation order in diagnostics.
-    std::string result(4, '.');
-    for (std::size_t i = 0; i < 4; ++i)
-    {
-      auto const c = static_cast<unsigned char>((value >> ((3 - i) * 8)) & 0xFFu);
-      result[i] = c >= 32 && c <= 126 ? static_cast<char>(c) : '.';
-    }
-    return result;
-  }
-
-  struct ModernAdtScanResult
-  {
-    bool opened = false;
-    bool structurally_valid = false;
-    std::size_t mcnk_count = 0;
+    refuse,         // ROOT is unusable: do not attempt to load the tile at all.
+    legacy_loader,  // File is a legacy single-file ADT: route to finishLoading().
+    modern_terrain  // Modern split ROOT: route to finishLoadingShadowlandsTerrainOnly().
   };
 
-  void scan_mcnk_payload(char const* payload,
-                         std::size_t payload_size,
-                         bool has_header,
-                         std::size_t chunk_index,
-                         std::string const& label)
+  void log_modern_adt_issues(std::string const& path,
+                             std::vector<Noggit::Formats::ADT::AdtIssue> const& issues)
   {
-    constexpr std::size_t mcnk_header_size = 128;
-    std::size_t pos = has_header ? mcnk_header_size : 0;
-
-    if (pos > payload_size)
+    for (auto const& issue : issues)
     {
-      LogError << "[ModernADT] " << label << " MCNK[" << chunk_index
-               << "] is smaller than its 128-byte header (size=" << payload_size << ")."
-               << std::endl;
-      return;
-    }
-
-    std::ostringstream subchunks;
-    std::size_t subchunk_count = 0;
-
-    while (pos + 8 <= payload_size)
-    {
-      std::uint32_t magic = 0;
-      std::uint32_t declared_size = 0;
-      std::memcpy(&magic, payload + pos, sizeof(magic));
-      std::memcpy(&declared_size, payload + pos + 4, sizeof(declared_size));
-
-      auto const data_pos = pos + 8;
-      auto const remaining = payload_size - data_pos;
-      if (declared_size > remaining)
+      switch (issue.severity)
       {
-        LogError << "[ModernADT] " << label << " MCNK[" << chunk_index << "] subchunk "
-                 << fourcc_name(magic) << " declares " << declared_size
-                 << " bytes with only " << remaining << " remaining (offset=" << pos << ")."
-                 << std::endl;
-        return;
+        case Noggit::Formats::ADT::AdtIssueSeverity::error:
+          LogError << "[ModernADT] '" << path << "': " << issue.message << std::endl;
+          break;
+        case Noggit::Formats::ADT::AdtIssueSeverity::warning:
+          Log << "[ModernADT] '" << path << "': " << issue.message << std::endl;
+          break;
+        case Noggit::Formats::ADT::AdtIssueSeverity::info:
+          LogDebug << "[ModernADT] '" << path << "': " << issue.message << std::endl;
+          break;
       }
-
-      if (subchunk_count != 0)
-        subchunks << ' ';
-      subchunks << fourcc_name(magic) << '(' << declared_size << ')';
-      ++subchunk_count;
-
-      pos = data_pos + declared_size;
     }
-
-    if (pos != payload_size)
-    {
-      LogError << "[ModernADT] " << label << " MCNK[" << chunk_index << "] leaves "
-               << (payload_size - pos) << " trailing byte(s) after subchunk scan."
-               << std::endl;
-    }
-
-    LogDebug << "[ModernADT] " << label << " MCNK[" << chunk_index << "] size="
-             << payload_size << " subchunks=" << subchunk_count << " :: "
-             << subchunks.str() << std::endl;
   }
 
-  ModernAdtScanResult scan_modern_adt_file(std::string const& path,
-                                           std::string const& label,
-                                           bool mcnk_has_header)
+  bool load_modern_adt_bytes(std::string const& path,
+                             std::vector<std::uint8_t>& out,
+                             std::string const& label)
   {
-    ModernAdtScanResult result;
-
-    auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
     try
     {
+      auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
       BlizzardArchive::Listfile::FileKey key(path);
       BlizzardArchive::ClientFile file(key, client_data);
-      result.opened = true;
-
-      auto const* data = file.getBuffer();
-      auto const file_size = file.getSize();
-      std::size_t pos = 0;
-      bool valid = true;
-
-      LogDebug << "[ModernADT] Scanning " << label << " file '" << path
-               << "' size=" << file_size << std::endl;
-
-      while (pos + 8 <= file_size)
-      {
-        std::uint32_t magic = 0;
-        std::uint32_t declared_size = 0;
-        std::memcpy(&magic, data + pos, sizeof(magic));
-        std::memcpy(&declared_size, data + pos + 4, sizeof(declared_size));
-
-        auto const payload_pos = pos + 8;
-        auto const remaining = file_size - payload_pos;
-        if (declared_size > remaining)
-        {
-          LogError << "[ModernADT] " << label << " top-level chunk " << fourcc_name(magic)
-                   << " at offset " << pos << " declares " << declared_size
-                   << " bytes with only " << remaining << " remaining."
-                   << std::endl;
-          valid = false;
-          break;
-        }
-
-        if (magic == 0x4D434E4Bu) // on-disk bytes KNCM == canonical MCNK
-        {
-          scan_mcnk_payload(data + payload_pos,
-                            declared_size,
-                            mcnk_has_header,
-                            result.mcnk_count,
-                            label);
-          ++result.mcnk_count;
-        }
-        else
-        {
-          LogDebug << "[ModernADT] " << label << " chunk " << fourcc_name(magic)
-                   << " offset=" << pos << " size=" << declared_size << std::endl;
-        }
-
-        pos = payload_pos + declared_size;
-      }
-
-      if (pos != file_size)
-      {
-        LogError << "[ModernADT] " << label << " scan stopped at " << pos
-                 << " of " << file_size << " bytes."
-                 << std::endl;
-        valid = false;
-      }
-
-      result.structurally_valid = valid;
-      LogDebug << "[ModernADT] " << label << " summary: MCNK=" << result.mcnk_count
-               << " structurally_valid=" << (result.structurally_valid ? "yes" : "no")
-               << std::endl;
+      out.assign(reinterpret_cast<std::uint8_t const*>(file.getBuffer()),
+                 reinterpret_cast<std::uint8_t const*>(file.getBuffer()) + file.getSize());
+      return true;
     }
     catch (std::exception const& e)
     {
-      LogError << "[ModernADT] Unable to open/scan " << label << " file '" << path
+      LogError << "[ModernADT] Unable to open the " << label << " file '" << path
                << "': " << e.what() << std::endl;
+      return false;
     }
     catch (...)
     {
-      LogError << "[ModernADT] Unable to open/scan " << label << " file '" << path
+      LogError << "[ModernADT] Unable to open the " << label << " file '" << path
                << "': unknown error." << std::endl;
+      return false;
     }
-
-    return result;
   }
 
-  bool run_shadowlands_split_adt_diagnostics(std::string const& root_path)
+  // Decides which loader a root ADT goes to and reports every layout problem
+  // found on the way. Scanning/validation lives in the Formats::ADT reader so
+  // the gate and the terrain loader share one implementation (and one set of
+  // unit tests).
+  //
+  // A tile with a usable ROOT is no longer refused because of TEX0 or OBJ0
+  // problems: it loads degraded (without textures / without object
+  // placements) so terrain work can continue, which is exactly what the
+  // "stabilize ADT loading" baseline asks for.
+  ModernAdtRoute run_shadowlands_split_adt_gate(std::string const& root_path)
   {
-    LogDebug << "[ModernADT] Shadowlands split-ADT diagnostic path engaged for '"
-             << root_path << "'." << std::endl;
+    std::vector<std::uint8_t> root_bytes;
+    if (!load_modern_adt_bytes(root_path, root_bytes, "ROOT"))
+      return ModernAdtRoute::refuse;
 
-    auto const root = scan_modern_adt_file(root_path, "ROOT", true);
-    auto const tex0 = scan_modern_adt_file(split_adt_path(root_path, "_tex0"), "TEX0", false);
-    auto const obj0 = scan_modern_adt_file(split_adt_path(root_path, "_obj0"), "OBJ0", false);
+    auto const root = Noggit::Formats::ADT::scanAdt(
+      root_bytes, Noggit::Formats::ADT::AdtScanOptions{true, true, 8, "ROOT"});
+    log_modern_adt_issues(root_path, root.issues);
+    for (auto const& [chunk, count] : root.unknown_chunks)
+      LogDebug << "[ModernADT] ROOT '" << root_path << "': unknown chunk "
+               << Noggit::Formats::ADT::adtChunkName(chunk) << " x" << count
+               << ", skipping" << std::endl;
 
-    bool const complete = root.opened && tex0.opened && obj0.opened
-      && root.structurally_valid && tex0.structurally_valid && obj0.structurally_valid
-      && root.mcnk_count == 256 && tex0.mcnk_count == 256 && obj0.mcnk_count == 256;
+    auto const layout = Noggit::Formats::ADT::classifyAdtLayout(root);
 
-    LogDebug << "[ModernADT] Tile summary ROOT=" << root.mcnk_count
-             << " TEX0=" << tex0.mcnk_count
-             << " OBJ0=" << obj0.mcnk_count
-             << " verified_256x3=" << (complete ? "yes" : "no")
+    LogDebug << "[ModernADT] ROOT '" << root_path << "': layout="
+             << Noggit::Formats::ADT::adtLayoutName(layout)
+             << " MCNK=" << root.mcnk_offsets.size()
+             << " structurally_valid=" << (root.structurally_valid ? "yes" : "no")
              << std::endl;
 
-    if (!complete)
+    if (layout == Noggit::Formats::ADT::AdtLayout::legacy_single_file)
     {
-      LogError << "[ModernADT] Split ADT diagnostic scan is incomplete. "
-               << "Use the per-file/per-chunk diagnostics above to locate the first layout mismatch."
-               << std::endl;
+      LogDebug << "[ModernADT] '" << root_path
+               << "' is a legacy single-file ADT (MTEX/MMDX/MWMO name lists present);"
+                  " routing it to the legacy loader." << std::endl;
+      return ModernAdtRoute::legacy_loader;
     }
 
-    return complete;
+    if (layout != Noggit::Formats::ADT::AdtLayout::modern_split_root)
+      return ModernAdtRoute::refuse;
+
+    auto const tex0_path = split_adt_path(root_path, "_tex0");
+    std::vector<std::uint8_t> part_bytes;
+    if (load_modern_adt_bytes(tex0_path, part_bytes, "TEX0"))
+    {
+      auto const tex0 = Noggit::Formats::ADT::scanAdt(
+        part_bytes, Noggit::Formats::ADT::AdtScanOptions{false, true, 8, "TEX0"});
+      log_modern_adt_issues(tex0_path, tex0.issues);
+      if (!tex0.structurally_valid || tex0.mcnk_offsets.size() != 256)
+        LogError << "[ModernADT] TEX0 '" << tex0_path << "' is unusable (MCNK="
+                 << tex0.mcnk_offsets.size() << ", valid="
+                 << (tex0.structurally_valid ? "yes" : "no")
+                 << "); the tile will load without terrain textures." << std::endl;
+    }
+    else
+    {
+      LogError << "[ModernADT] The tile '" << root_path
+               << "' will load without terrain textures." << std::endl;
+    }
+
+    auto const obj0_path = split_adt_path(root_path, "_obj0");
+    part_bytes.clear();
+    if (load_modern_adt_bytes(obj0_path, part_bytes, "OBJ0"))
+    {
+      auto const obj0 = Noggit::Formats::ADT::scanAdt(
+        part_bytes, Noggit::Formats::ADT::AdtScanOptions{false, false, 8, "OBJ0"});
+      log_modern_adt_issues(obj0_path, obj0.issues);
+      if (!obj0.structurally_valid)
+        LogError << "[ModernADT] OBJ0 '" << obj0_path
+                 << "' is unusable; the tile will load without model/WMO placements."
+                 << std::endl;
+    }
+    else
+    {
+      LogError << "[ModernADT] The tile '" << root_path
+               << "' will load without model/WMO placements." << std::endl;
+    }
+
+    return ModernAdtRoute::modern_terrain;
   }
 }
 
@@ -330,12 +276,14 @@ void AsyncLoader::process()
 
       if (is_shadowlands_root_adt(object_name))
       {
-        bool const split_verified = run_shadowlands_split_adt_diagnostics(object_name);
-        if (!split_verified)
+        auto const route = run_shadowlands_split_adt_gate(object_name);
+
+        if (route == ModernAdtRoute::refuse)
         {
           std::lock_guard<std::mutex> const lock(_guard);
-          LogError << "[ModernADT] Refusing to pass an unverified Shadowlands ADT to the legacy loader: '"
-                   << object_name << "'." << std::endl;
+          LogError << "[ModernADT] Refusing to load '" << object_name
+                   << "': its ROOT part is not a usable modern or legacy ADT"
+                      " (see the messages above)." << std::endl;
 
           if (object->is_required_when_saving())
             _important_object_failed_loading = true;
@@ -346,34 +294,40 @@ void AsyncLoader::process()
           continue;
         }
 
-        if (auto* tile = dynamic_cast<MapTile*>(object))
+        if (route == ModernAdtRoute::modern_terrain)
         {
-          tile->finishLoadingShadowlandsTerrainOnly();
-
-          if (additional_log)
+          if (auto* tile = dynamic_cast<MapTile*>(object))
           {
-            std::lock_guard<std::mutex> const lock(_guard);
-            LogDebug << "[ModernADT] Loaded terrain-only Shadowlands tile '"
-                     << object_name << "'." << std::endl;
+            tile->finishLoadingShadowlandsTerrainOnly();
+
+            if (additional_log)
+            {
+              std::lock_guard<std::mutex> const lock(_guard);
+              LogDebug << "[ModernADT] Loaded Shadowlands tile '"
+                       << object_name << "'." << std::endl;
+            }
+
+            {
+              std::lock_guard<std::mutex> const lock(_guard);
+              _currently_loading.remove(object);
+              _state_changed.notify_all();
+            }
+            continue;
           }
 
           {
             std::lock_guard<std::mutex> const lock(_guard);
+            LogError << "[ModernADT] Verified Shadowlands root ADT was not a MapTile object: '"
+                     << object_name << "'." << std::endl;
             _currently_loading.remove(object);
+            object->error_on_loading();
             _state_changed.notify_all();
           }
           continue;
         }
 
-        {
-          std::lock_guard<std::mutex> const lock(_guard);
-          LogError << "[ModernADT] Verified Shadowlands root ADT was not a MapTile object: '"
-                   << object_name << "'." << std::endl;
-          _currently_loading.remove(object);
-          object->error_on_loading();
-          _state_changed.notify_all();
-        }
-        continue;
+        // ModernAdtRoute::legacy_loader: a legacy single-file ADT inside a
+        // modern project falls through to the untouched legacy loader below.
       }
 
       object->finishLoading();

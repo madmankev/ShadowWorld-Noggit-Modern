@@ -13,7 +13,9 @@
 #include <noggit/map_index.hpp>
 #include <noggit/uid_storage.hpp>
 #include <noggit/application/NoggitApplication.hpp>
+#include <noggit/formats/adt/ModernAdtReader.hpp>
 #include <ClientFile.hpp>
+#include <Listfile.hpp>
 #include <noggit/database/SqlUIDStorage.h>
 
 #include <QtCore/QSettings>
@@ -25,7 +27,10 @@
 #include <forward_list>
 #include <cstring>
 #include <filesystem>
+#include <map>
+#include <set>
 #include <sstream>
+#include <vector>
 
 MapIndex::TileRange<false> MapIndex::loaded_tiles()
 {
@@ -1006,6 +1011,99 @@ uid_fix_status MapIndex::fixUIDs (World* world, bool cancel_on_model_loading_err
   auto models = std::make_unique<std::forward_list<ModelInstance>>();
   auto wmos = std::make_unique<std::forward_list<WMOInstance>>();
 
+  // Per-tile ADT layout discovered during the read phase: the rewrite phase
+  // must send modern tiles to finishLoadingShadowlandsTerrainOnly() and
+  // legacy tiles to finishLoading(), and skip tiles that could not be read.
+  std::map<std::pair<int, int>, Noggit::Formats::ADT::AdtLayout> tile_layouts;
+
+  auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
+  auto* listfile = client_data ? client_data->listfile() : nullptr;
+
+  auto split_adt_path = [](std::string const& root_path, std::string const& suffix)
+  {
+    return root_path.substr(0, root_path.size() - 4) + suffix + ".adt";
+  };
+
+  // Shared MDDF filter: tile-extents check + duplicate elimination.
+  // Identical logic for legacy (in-file entries) and modern (OBJ0 entries).
+  auto collect_mddf = [](ENTRY_MDDF const* entries, std::size_t count,
+                         std::array<glm::vec3, 2> const& tileExtents,
+                         std::forward_list<ENTRY_MDDF>& modelEntries)
+  {
+    for (std::size_t i = 0; i < count; ++i)
+    {
+      bool add = true;
+      ENTRY_MDDF const& mddf = entries[i];
+
+      if (!misc::pointInside({ mddf.pos[0], 0, mddf.pos[2] }, tileExtents))
+      {
+        continue;
+      }
+
+      // check for duplicates
+      for (ENTRY_MDDF& entry : modelEntries)
+      {
+        if ( mddf.nameID == entry.nameID
+          && misc::float_equals(mddf.pos[0], entry.pos[0])
+          && misc::float_equals(mddf.pos[1], entry.pos[1])
+          && misc::float_equals(mddf.pos[2], entry.pos[2])
+          && misc::float_equals(mddf.rot[0], entry.rot[0])
+          && misc::float_equals(mddf.rot[1], entry.rot[1])
+          && misc::float_equals(mddf.rot[2], entry.rot[2])
+          && mddf.scale == entry.scale
+          )
+        {
+          add = false;
+          break;
+        }
+      }
+
+      if (add)
+      {
+        modelEntries.emplace_front(mddf);
+      }
+    }
+  };
+
+  // Shared MODF filter (same as collect_mddf but for WMO entries).
+  auto collect_modf = [](ENTRY_MODF const* entries, std::size_t count,
+                         std::array<glm::vec3, 2> const& tileExtents,
+                         std::forward_list<ENTRY_MODF>& wmoEntries)
+  {
+    for (std::size_t i = 0; i < count; ++i)
+    {
+      bool add = true;
+      ENTRY_MODF modf = entries[i];
+
+      if (!misc::pointInside({ modf.pos[0], 0, modf.pos[2] }, tileExtents))
+      {
+        continue;
+      }
+
+      // check for duplicates
+      for (ENTRY_MODF& entry : wmoEntries)
+      {
+        if (modf.nameID == entry.nameID
+          && misc::float_equals(modf.pos[0], entry.pos[0])
+          && misc::float_equals(modf.pos[1], entry.pos[1])
+          && misc::float_equals(modf.pos[2], entry.pos[2])
+          && misc::float_equals(modf.rot[0], entry.rot[0])
+          && misc::float_equals(modf.rot[1], entry.rot[1])
+          && misc::float_equals(modf.rot[2], entry.rot[2])
+          )
+        {
+          add = false;
+          break;
+        }
+      }
+
+      if (add)
+      {
+        wmoEntries.emplace_front(modf);
+      }
+    }
+  };
+
   for (int z = 0; z < 64; ++z)
   {
     for (int x = 0; x < 64; ++x)
@@ -1017,10 +1115,31 @@ uid_fix_status MapIndex::fixUIDs (World* world, bool cancel_on_model_loading_err
 
       std::stringstream filename;
       filename << "World\\Maps\\" << basename << "\\" << basename << "_" << x << "_" << z << ".adt";
-      BlizzardArchive::ClientFile file(filename.str(), Noggit::Application::NoggitApplication::instance()->clientData());
 
-      if (file.isEof())
+      std::vector<std::uint8_t> root_bytes;
+      try
       {
+        BlizzardArchive::ClientFile root_file(filename.str(), client_data);
+        root_bytes.assign(reinterpret_cast<std::uint8_t const*>(root_file.getBuffer()),
+                          reinterpret_cast<std::uint8_t const*>(root_file.getBuffer()) + root_file.getSize());
+      }
+      catch (std::exception const& e)
+      {
+        LogError << "[UIDFix] Could not open \"" << filename.str() << "\": " << e.what()
+                 << "; tile (" << x << "," << z << ") skipped." << std::endl;
+        continue;
+      }
+
+      auto const scan = Noggit::Formats::ADT::scanAdt(
+        root_bytes, Noggit::Formats::ADT::AdtScanOptions{true, false, 0, "ROOT"});
+      auto const layout = Noggit::Formats::ADT::classifyAdtLayout(scan);
+      tile_layouts[{z, x}] = layout;
+
+      if (layout == Noggit::Formats::ADT::AdtLayout::unusable)
+      {
+        LogError << "[UIDFix] \"" << filename.str() << "\" is not a usable ADT"
+                    " (neither legacy nor modern layout); tile (" << x << "," << z
+                 << ") skipped." << std::endl;
         continue;
       }
 
@@ -1033,151 +1152,210 @@ uid_fix_status MapIndex::fixUIDs (World* world, bool cancel_on_model_loading_err
       std::forward_list<ENTRY_MODF> wmoEntries;
       std::vector<std::string> modelFilenames;
       std::vector<std::string> wmoFilenames;
+      bool const modern_tile = layout == Noggit::Formats::ADT::AdtLayout::modern_split_root;
 
-      uint32_t fourcc;
-      uint32_t size;
-
-      MHDR Header;
-
-      // - MVER ----------------------------------------------
-      uint32_t version;
-      file.read(&fourcc, 4);
-      file.seekRelative(4);
-      file.read(&version, 4);
-      assert(fourcc == 'MVER' && version == 18);
-
-      // - MHDR ----------------------------------------------
-      file.read(&fourcc, 4);
-      file.seekRelative(4);
-      assert(fourcc == 'MHDR');
-      file.read(&Header, sizeof(MHDR));
-
-      // - MDDF ----------------------------------------------
-      file.seek(Header.mddf + 0x14);
-      file.read(&fourcc, 4);
-      file.read(&size, 4);
-      assert(fourcc == 'MDDF');
-
-      ENTRY_MDDF const* mddf_ptr = reinterpret_cast<ENTRY_MDDF const*>(file.getPointer());
-
-      for (unsigned int i = 0; i < size / sizeof(ENTRY_MDDF); ++i)
+      if (modern_tile)
       {
-        bool add = true;
-        ENTRY_MDDF const& mddf = mddf_ptr[i];
+        // Modern split ADT: placements live in the _obj0 part and reference
+        // assets by FileDataID (no MMDX/MWMO name lists exist).
+        std::vector<std::uint8_t> obj0_bytes;
+        auto const obj0_path = split_adt_path(filename.str(), "_obj0");
+        try
+        {
+          BlizzardArchive::ClientFile obj0_file(obj0_path, client_data);
+          obj0_bytes.assign(reinterpret_cast<std::uint8_t const*>(obj0_file.getBuffer()),
+                            reinterpret_cast<std::uint8_t const*>(obj0_file.getBuffer()) + obj0_file.getSize());
+        }
+        catch (std::exception const& e)
+        {
+          LogError << "[UIDFix] Could not open OBJ0 \"" << obj0_path << "\": " << e.what()
+                   << "; tile (" << x << "," << z << ") contributes no objects." << std::endl;
+        }
 
-        if (!misc::pointInside({ mddf.pos[0], 0, mddf.pos[2] }, tileExtents))
+        if (!obj0_bytes.empty())
+        {
+          auto const parsed = Noggit::Formats::ADT::parseObj0(obj0_bytes);
+          for (auto const& issue : parsed.issues)
+          {
+            switch (issue.severity)
+            {
+              case Noggit::Formats::ADT::AdtIssueSeverity::error:
+                LogError << "[UIDFix] OBJ0 '" << obj0_path << "': " << issue.message << std::endl;
+                break;
+              case Noggit::Formats::ADT::AdtIssueSeverity::warning:
+                Log << "[UIDFix] OBJ0 '" << obj0_path << "': " << issue.message << std::endl;
+                break;
+              case Noggit::Formats::ADT::AdtIssueSeverity::info:
+                LogDebug << "[UIDFix] OBJ0 '" << obj0_path << "': " << issue.message << std::endl;
+                break;
+            }
+          }
+
+          if (parsed.ok)
+          {
+            collect_mddf(parsed.m2_placements.data(), parsed.m2_placements.size(), tileExtents, modelEntries);
+            collect_modf(parsed.wmo_placements.data(), parsed.wmo_placements.size(), tileExtents, wmoEntries);
+
+            // Mirror the runtime attachment flow: a MODF scale of 0 means 1.0.
+            for (ENTRY_MODF& entry : wmoEntries)
+            {
+              if (entry.scale == 0)
+                entry.scale = 1024;
+            }
+          }
+        }
+      }
+      else
+      {
+        // Legacy single-file ADT: read placements through the MHDR-relative
+        // offsets, exactly as before.
+        BlizzardArchive::ClientFile file(filename.str(), client_data);
+
+        if (file.isEof())
         {
           continue;
         }
 
-        // check for duplicates
+        uint32_t fourcc;
+        uint32_t size;
+
+        MHDR Header;
+
+        // - MVER ----------------------------------------------
+        uint32_t version;
+        file.read(&fourcc, 4);
+        file.seekRelative(4);
+        file.read(&version, 4);
+        assert(fourcc == 'MVER' && version == 18);
+
+        // - MHDR ----------------------------------------------
+        file.read(&fourcc, 4);
+        file.seekRelative(4);
+        assert(fourcc == 'MHDR');
+        file.read(&Header, sizeof(MHDR));
+
+        // - MDDF ----------------------------------------------
+        file.seek(Header.mddf + 0x14);
+        file.read(&fourcc, 4);
+        file.read(&size, 4);
+        assert(fourcc == 'MDDF');
+
+        ENTRY_MDDF const* mddf_ptr = reinterpret_cast<ENTRY_MDDF const*>(file.getPointer());
+
+        collect_mddf(mddf_ptr, size / sizeof(ENTRY_MDDF), tileExtents, modelEntries);
+
+        // - MODF ----------------------------------------------
+        file.seek(Header.modf + 0x14);
+        file.read(&fourcc, 4);
+        file.read(&size, 4);
+        assert(fourcc == 'MODF');
+
+        ENTRY_MODF const* modf_ptr = reinterpret_cast<ENTRY_MODF const*>(file.getPointer());
+
+        collect_modf(modf_ptr, size / sizeof(ENTRY_MODF), tileExtents, wmoEntries);
+
+        // - MMDX ----------------------------------------------
+        file.seek(Header.mmdx + 0x14);
+        file.read(&fourcc, 4);
+        file.read(&size, 4);
+        assert(fourcc == 'MMDX');
+
+        {
+          char const* lCurPos = reinterpret_cast<char const*>(file.getPointer());
+          char const* lEnd = lCurPos + size;
+
+          while (lCurPos < lEnd)
+          {
+            modelFilenames.push_back(std::string(lCurPos));
+            lCurPos += strlen(lCurPos) + 1;
+          }
+        }
+
+        // - MWMO ----------------------------------------------
+        file.seek(Header.mwmo + 0x14);
+        file.read(&fourcc, 4);
+        file.read(&size, 4);
+        assert(fourcc == 'MWMO');
+
+        {
+          char const* lCurPos = reinterpret_cast<char const*>(file.getPointer());
+          char const* lEnd = lCurPos + size;
+
+          while (lCurPos < lEnd)
+          {
+            wmoFilenames.push_back(std::string(lCurPos));
+            lCurPos += strlen(lCurPos) + 1;
+          }
+        }
+
+        file.close();
+      }
+
+      if (modern_tile)
+      {
+        std::set<std::uint32_t> unresolved_m2;
+        std::set<std::uint32_t> unresolved_wmo;
+
         for (ENTRY_MDDF& entry : modelEntries)
         {
-          if ( mddf.nameID == entry.nameID
-            && misc::float_equals(mddf.pos[0], entry.pos[0])
-            && misc::float_equals(mddf.pos[1], entry.pos[1])
-            && misc::float_equals(mddf.pos[2], entry.pos[2])
-            && misc::float_equals(mddf.rot[0], entry.rot[0])
-            && misc::float_equals(mddf.rot[1], entry.rot[1])
-            && misc::float_equals(mddf.rot[2], entry.rot[2])
-            && mddf.scale == entry.scale
-            )
+          std::string path;
+          if (listfile && entry.nameID)
+            path = listfile->getPath(entry.nameID);
+
+          if (path.empty())
           {
-            add = false;
-            break;
+            unresolved_m2.insert(entry.nameID);
+            continue;
           }
+
+          models->emplace_front(BlizzardArchive::Listfile::FileKey(path, entry.nameID), &entry, _context);
         }
-
-        if (add)
-        {
-          modelEntries.emplace_front(mddf);
-        }
-      }
-
-      // - MODF ----------------------------------------------
-      file.seek(Header.modf + 0x14);
-      file.read(&fourcc, 4);
-      file.read(&size, 4);
-      assert(fourcc == 'MODF');
-
-      ENTRY_MODF const* modf_ptr = reinterpret_cast<ENTRY_MODF const*>(file.getPointer());
-
-      for (unsigned int i = 0; i < size / sizeof(ENTRY_MODF); ++i)
-      {
-        bool add = true;
-        ENTRY_MODF const& modf = modf_ptr[i];
-
-        if (!misc::pointInside({ modf.pos[0], 0, modf.pos[2] }, tileExtents))
-        {
-          continue;
-        }
-
-        // check for duplicates
         for (ENTRY_MODF& entry : wmoEntries)
         {
-          if (modf.nameID == entry.nameID
-            && misc::float_equals(modf.pos[0], entry.pos[0])
-            && misc::float_equals(modf.pos[1], entry.pos[1])
-            && misc::float_equals(modf.pos[2], entry.pos[2])
-            && misc::float_equals(modf.rot[0], entry.rot[0])
-            && misc::float_equals(modf.rot[1], entry.rot[1])
-            && misc::float_equals(modf.rot[2], entry.rot[2])
-            )
+          std::string path;
+          if (listfile && entry.nameID)
+            path = listfile->getPath(entry.nameID);
+
+          if (path.empty())
           {
-            add = false;
-            break;
+            unresolved_wmo.insert(entry.nameID);
+            continue;
           }
+
+          wmos->emplace_front(BlizzardArchive::Listfile::FileKey(path, entry.nameID), &entry, _context);
         }
 
-        if (add)
+        for (std::uint32_t id : unresolved_m2)
+          LogError << "[UIDFix] Unable to resolve MDDF FileDataID " << id << " in tile ("
+                   << x << "," << z << ") through the listfile; entry skipped." << std::endl;
+        for (std::uint32_t id : unresolved_wmo)
+          LogError << "[UIDFix] Unable to resolve MODF FileDataID " << id << " in tile ("
+                   << x << "," << z << ") through the listfile; entry skipped." << std::endl;
+      }
+      else
+      {
+        for (ENTRY_MDDF& entry : modelEntries)
         {
-          wmoEntries.emplace_front(modf);
+          if (entry.nameID >= modelFilenames.size())
+          {
+            LogError << "[UIDFix] MDDF nameID " << entry.nameID << " is outside the MMDX list ("
+                     << modelFilenames.size() << " entries) in tile (" << x << "," << z
+                     << "); entry skipped." << std::endl;
+            continue;
+          }
+          models->emplace_front(modelFilenames[entry.nameID], &entry, _context);
         }
-      }
-
-      // - MMDX ----------------------------------------------
-      file.seek(Header.mmdx + 0x14);
-      file.read(&fourcc, 4);
-      file.read(&size, 4);
-      assert(fourcc == 'MMDX');
-
-      {
-        char const* lCurPos = reinterpret_cast<char const*>(file.getPointer());
-        char const* lEnd = lCurPos + size;
-
-        while (lCurPos < lEnd)
+        for (ENTRY_MODF& entry : wmoEntries)
         {
-          modelFilenames.push_back(std::string(lCurPos));
-          lCurPos += strlen(lCurPos) + 1;
+          if (entry.nameID >= wmoFilenames.size())
+          {
+            LogError << "[UIDFix] MODF nameID " << entry.nameID << " is outside the MWMO list ("
+                     << wmoFilenames.size() << " entries) in tile (" << x << "," << z
+                     << "); entry skipped." << std::endl;
+            continue;
+          }
+          wmos->emplace_front(wmoFilenames[entry.nameID], &entry, _context);
         }
-      }
-
-      // - MWMO ----------------------------------------------
-      file.seek(Header.mwmo + 0x14);
-      file.read(&fourcc, 4);
-      file.read(&size, 4);
-      assert(fourcc == 'MWMO');
-
-      {
-        char const* lCurPos = reinterpret_cast<char const*>(file.getPointer());
-        char const* lEnd = lCurPos + size;
-
-        while (lCurPos < lEnd)
-        {
-          wmoFilenames.push_back(std::string(lCurPos));
-          lCurPos += strlen(lCurPos) + 1;
-        }
-      }
-
-      file.close();
-
-      for (ENTRY_MDDF& entry : modelEntries)
-      {
-        models->emplace_front(modelFilenames[entry.nameID], &entry, _context);
-      }
-      for (ENTRY_MODF& entry : wmoEntries)
-      {
-        wmos->emplace_front(wmoFilenames[entry.nameID], &entry, _context);
       }
     }
   }
@@ -1248,6 +1426,7 @@ uid_fix_status MapIndex::fixUIDs (World* world, bool cancel_on_model_loading_err
 
   if (cancel_on_model_loading_error && loading_error)
   {
+    _uid_fix_all_in_progress = false;
     return uid_fix_status::failed;
   }
 
@@ -1262,15 +1441,39 @@ uid_fix_status MapIndex::fixUIDs (World* world, bool cancel_on_model_loading_err
         continue;
       }
 
+      auto const cached_layout = tile_layouts.find({z, x});
+      if (cached_layout == tile_layouts.end()
+          || cached_layout->second == Noggit::Formats::ADT::AdtLayout::unusable)
+      {
+        LogError << "[UIDFix] Tile (" << x << "," << z
+                 << ") could not be read during the UID scan; it will not be"
+                    " rewritten and its ADT stays untouched." << std::endl;
+        continue;
+      }
+
       // load even the tiles without models in case there are old ones
       // that shouldn't be there to avoid creating new duplicates
 
       std::stringstream filename;
       filename << "World\\Maps\\" << basename << "\\" << basename << "_" << x << "_" << z << ".adt";
 
-      // load the tile without the models
+      // load the tile without the models: modern split ADTs need the
+      // Shadowlands terrain loader, legacy single-file ADTs keep the
+      // classic loader.
       MapTile tile(x, z, filename.str(), mBigAlpha, false, use_mclq_green_lava(), false, world, _context, tile_mode::uid_fix_all);
-      tile.finishLoading();
+      try
+      {
+        if (cached_layout->second == Noggit::Formats::ADT::AdtLayout::modern_split_root)
+          tile.finishLoadingShadowlandsTerrainOnly();
+        else
+          tile.finishLoading();
+      }
+      catch (std::exception const& e)
+      {
+        LogError << "[UIDFix] Could not load tile (" << x << "," << z << ") for rewriting: "
+                 << e.what() << "; tile skipped." << std::endl;
+        continue;
+      }
 
       // add the uids to the tile to be able to save the models
       // which have been loaded in world earlier
@@ -1279,7 +1482,9 @@ uid_fix_status MapIndex::fixUIDs (World* world, bool cancel_on_model_loading_err
         tile.add_model(uid);
       }
 
-      tile.saveTile(world);
+      if (!tile.saveTile(world))
+        LogError << "[UIDFix] Saving tile (" << x << "," << z
+                 << ") failed; see the messages above." << std::endl;
     }
   }
 

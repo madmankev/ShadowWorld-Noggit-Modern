@@ -8,6 +8,7 @@
 #include <noggit/WMOInstance.h>
 #include <noggit/World.h>
 #include <noggit/application/NoggitApplication.hpp>
+#include <noggit/formats/adt/ModernAdtReader.hpp>
 
 #include <ClientFile.hpp>
 #include <Listfile.hpp>
@@ -97,43 +98,39 @@ namespace
         return;
       }
 
-      auto const* data = obj0_file.getBuffer();
-      auto const file_size = obj0_file.getSize();
-      std::vector<ENTRY_MDDF> m2_placements;
-      std::vector<ENTRY_MODF> wmo_placements;
+      std::vector<std::uint8_t> obj0_bytes(
+        reinterpret_cast<std::uint8_t const*>(obj0_file.getBuffer()),
+        reinterpret_cast<std::uint8_t const*>(obj0_file.getBuffer()) + obj0_file.getSize());
 
-      std::size_t pos = 0;
-      while (pos + 8 <= file_size)
+      auto const parsed = Noggit::Formats::ADT::parseObj0(obj0_bytes);
+      for (auto const& issue : parsed.issues)
       {
-        std::uint32_t magic = 0;
-        std::uint32_t size = 0;
-        std::memcpy(&magic, data + pos, sizeof(magic));
-        std::memcpy(&size, data + pos + 4, sizeof(size));
-        auto const payload = pos + 8;
-        if (size > file_size - payload)
-          throw std::runtime_error("Shadowlands OBJ0 contains a truncated top-level chunk.");
-
-        if (magic == on_disk_fourcc('M', 'D', 'D', 'F'))
+        switch (issue.severity)
         {
-          if (size % sizeof(ENTRY_MDDF) != 0)
-            throw std::runtime_error("Shadowlands OBJ0 MDDF size is not aligned to ENTRY_MDDF.");
-          auto const count = size / sizeof(ENTRY_MDDF);
-          m2_placements.resize(count);
-          if (size)
-            std::memcpy(m2_placements.data(), data + payload, size);
+          case Noggit::Formats::ADT::AdtIssueSeverity::error:
+            LogError << "[ModernADT][Objects] '" << obj0_path << "': " << issue.message << std::endl;
+            break;
+          case Noggit::Formats::ADT::AdtIssueSeverity::warning:
+            Log << "[ModernADT][Objects] '" << obj0_path << "': " << issue.message << std::endl;
+            break;
+          case Noggit::Formats::ADT::AdtIssueSeverity::info:
+            LogDebug << "[ModernADT][Objects] '" << obj0_path << "': " << issue.message << std::endl;
+            break;
         }
-        else if (magic == on_disk_fourcc('M', 'O', 'D', 'F'))
-        {
-          if (size % sizeof(ENTRY_MODF) != 0)
-            throw std::runtime_error("Shadowlands OBJ0 MODF size is not aligned to ENTRY_MODF.");
-          auto const count = size / sizeof(ENTRY_MODF);
-          wmo_placements.resize(count);
-          if (size)
-            std::memcpy(wmo_placements.data(), data + payload, size);
-        }
-
-        pos = payload + size;
       }
+
+      if (!parsed.ok)
+      {
+        // Degrade instead of failing the attachment state machine: the
+        // tile's terrain keeps loading, just without M2/WMO placements.
+        LogError << "[ModernADT][Objects] OBJ0 for '" << root_path
+                 << "' is unusable; tile loads without model/WMO placements." << std::endl;
+        finish_state();
+        return;
+      }
+
+      auto const& m2_placements = parsed.m2_placements;
+      auto const& wmo_placements = parsed.wmo_placements;
 
       std::size_t loaded_m2 = 0;
       std::size_t loaded_wmo = 0;
