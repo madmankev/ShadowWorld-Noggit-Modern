@@ -27,7 +27,7 @@ namespace Noggit::Formats::ADT
     constexpr std::uint32_t FOURCC_MTEX = fourccOf('M', 'T', 'E', 'X');
     constexpr std::uint32_t FOURCC_MMDX = fourccOf('M', 'M', 'D', 'X');
     constexpr std::uint32_t FOURCC_MMID = fourccOf('M', 'M', 'I', 'D');
-    constexpr std::uint32_t FOURCC_MWMO = fourccOf('M', 'W', 'W', 'O');
+    constexpr std::uint32_t FOURCC_MWMO = fourccOf('M', 'W', 'M', 'O');
     constexpr std::uint32_t FOURCC_MWID = fourccOf('M', 'W', 'I', 'D');
     constexpr std::uint32_t FOURCC_MDDF = fourccOf('M', 'D', 'D', 'F');
     constexpr std::uint32_t FOURCC_MODF = fourccOf('M', 'O', 'D', 'F');

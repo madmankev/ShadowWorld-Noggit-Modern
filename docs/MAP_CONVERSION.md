@@ -1,0 +1,196 @@
+# Two-way WotLK / modern map conversion
+
+Status: **in development** (see "Implementation plan" at the bottom for what is
+already in place).
+
+This document describes the explicit, user-driven conversion between the two
+map file families Noggit supports:
+
+| Family | Client | ADT layout | WDT | WDL | Objects | Liquids | Textures |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **WotLK** | 3.3.5 | one monolithic `.adt` per tile (`MVER/MHDR/MCIN/MTEX/MMDX/MMID/MWMO/MWID/MDDF/MODF/MFBO/MCNK...`) | `MPHD` (8 bytes of flags, rest unused) + `MAIN` | `MWMO/MWID/MODF` placements | referenced by **file name** | per-chunk `MCLQ` | `MCLY.textureID` = byte offset into `MTEX` |
+| **Modern** | Shadowlands 9.2.7 (the fork's "modern" family) | split parts per tile: `.adt` (ROOT), `_tex0.adt`, `_obj0.adt`, `_obj1.adt`, `_lod.adt` | `MPHD` with `0x200` (MAID) + fdid columns, `MAIN`, `MAID` | `MLMD/MLMX` (+ `MLDD/MLDX`) | referenced by **FileDataID** | top-level `MH2O` (in ROOT) | `MDID` fdid table; `MCLY.textureID` = index into `MDID` |
+
+Per the README roadmap this is an **explicit** operation: saving a project
+never converts it, and opening a map never converts it. Conversion runs
+file-to-file, so it also works for maps that cannot be fully loaded in the
+editor (missing/partially installed assets), and it needs no GL context.
+
+## Shape of the feature
+
+```
+source files (MPQ/CASC via ClientData, or a loose folder)
+        │
+        ▼
+Noggit::Formats::Conversion::convertMap(options, source)   ← Qt-free core
+        │
+        ├─ ConversionReport.files            → converted bytes, written by the caller
+        ├─ ConversionReport.fdid_assignments → manifest: every FileDataID the
+        │                                       target client must know (listfile /
+        │                                       server-side registration)
+        ├─ ConversionReport.suggested_registration_fields
+        │                                    → Map.db2 row for the converted map,
+        │                                       mergeable into the project's
+        │                                       extraData/modernMapRegistrations.json
+        └─ warnings / errors / stats         → shown to the user, saved next to output
+```
+
+The core library (`src/noggit/formats/conversion/`) contains **no Qt and no
+logging**; every decision that needs the application (reading files, resolving
+FileDataIDs through the listfile) is injected through
+`ConversionFileSource` callbacks. That keeps the whole converter unit-testable
+with the standalone g++ harness, like the other format modules.
+
+A thin Qt dialog ("Tools → Convert map…", added later in the implementation
+plan) collects: source (current project's ClientData or an explicit folder),
+map picker, target format, output directory; runs the conversion on a worker
+thread; writes the files + `conversion_manifest.json`; and offers to merge the
+Map.db2 registration into the project.
+
+## Direction 1: WotLK → modern (Shadowlands 9.2.7)
+
+Per tile (`<map>_<x>_<y>.adt` monolith → `ROOT` + `_tex0` + `_obj0`):
+
+* **ROOT**: `MVER(18)` + `MHDR` (only `mcin`/`mh2o`/`mfbo` offsets used, the
+  name-table fields zeroed) + recomputed `MCIN` + 256 `MCNK`. The 128-byte
+  chunk header is copied through (WotLK and 9.2.7 share the v18 header, both
+  use `holesHighRes`); fields owned by other parts are adjusted:
+  `nLayers` kept, `ofsLayer/ofsAlpha/sizeAlpha/ofsRefs` zeroed (the modern
+  client reads layers/alpha from TEX0 and placements from OBJ0),
+  `ofsLiquid/sizeLiquid` zeroed (liquids live in the top-level `MH2O`).
+  Sub-chunks `MCVT/MCNR/MCSH/MCSE` are **byte-identical between the two
+  formats** and are copied verbatim (this is the same fact the native modern
+  writer builds on). `MCCV` does not exist in 3.3.5; nothing to carry.
+  `MFBO` passes through when present.
+* **TEX0**: `MVER` + `MDID` (deduplicated fdid list built from the tile's
+  `MTEX` strings via the listfile; unresolvable custom textures get assigned
+  ids) + 256 `MCNK{MCLY, MCAL}`. Per-chunk `MCLY` entries keep
+  flags/effectID; `textureID` is rewritten from the MTEX byte offset to the
+  MDID index. Alpha maps are decoded from the WotLK encoding (uncompressed
+  4096, TBC-era packed low-nibble when the WDT says small alpha, or WotLK RLE
+  `fill/copy` entries) and re-emitted as modern `MCAL`: RLE when it shrinks
+  the payload (`FLAG_ALPHA_COMPRESSED` kept), otherwise raw 4096.
+* **OBJ0**: `MVER` + top-level `MDDF` + `MODF` (the verified 9.2.7 layout the
+  fork's `parseObj0` consumes). `nameID` becomes the FileDataID of the
+  referenced `MMDX`/`MWMO` file; `MODF.flags |= 0x8`
+  (name-is-fdid). All other fields copy through. Per-chunk `MCRD/MCRW`
+  reference lists are dropped — 9.2.7 OBJ0 does not carry them, and doodads
+  attach per tile, exactly like the modern loading path already does.
+* **Liquids**: per-chunk `MCLQ` blocks → one top-level `MH2O` chunk (256
+  `MH2O_Header` records + information/mask/height payloads) using the same
+  layout Noggit's own MH2O writer emits: tight bounding box per layer,
+  8-byte presence mask only when the layer does not fill its box,
+  heights/uv/depth planes per `LiquidVertexFormat`. Type mapping follows the
+  editor's established table: mclq ocean(1) → `LIQUID_OCEAN`, slime(3) →
+  `LIQUID_SLIME`, river(4) → `LIQUID_WATER`, magma(6) → `LIQUID_MAGMA`
+  (or `LIQUID_Green_Lava` with the project option); vertex formats
+  water/ocean → `LVF_HEIGHT_DEPTH` (ocean at height 0 → `LVF_DEPTH`),
+  magma/slime → `LVF_HEIGHT_UV`. `fishable`/`fatigue` tile bits move into the
+  16-byte `MH2O_Attributes`. Legacy downports that already contain `MH2O`
+  pass through unchanged.
+* **MTXP/MHID**: WotLK has no height texturing → omitted (both are optional
+  in TEX0).
+
+Map level:
+
+* **WDT**: legacy `MVER/MPHD/MAIN` (+ `MWMO/MWID/MODF` for WMO-only worlds)
+  → modern `MVER/MPHD/MAIN/MAID`. `MPHD.flags |= 0x200`; the fdid columns
+  (lgt/occ/fogs/mpv/tex/wdl/pd4) stay 0 unless the caller resolves them —
+  converted custom maps render fine without them (verified by the fork's WDT
+  work). `MAIN` flags/async ids pass through. For WMO-only worlds the global
+  `MODF` is re-emitted with fdid name ids and `flags |= 0x8`, and
+  `MWMO/MWID` are dropped (the modern layout). **MAID**: every tile part the
+  converter writes gets an assigned FileDataID (root/tex0/obj0; obj1/lod/
+  minimap = 0), recorded in the manifest — the server/listfile side must
+  register exactly these ids for the client to find the files.
+* **WDL**: `MVER/MAOF/MARE/MAHO` pass through (identical in both families);
+  legacy `MWMO/MWID/MODF` → `MLMD` (40-byte records: MODF without extents,
+  nameID = fdid) + `MLMX` (28-byte `min/max/radius` bounds from the MODF
+  extents). `MSSN` and friends are not synthesized.
+* **Manifest**: JSON next to the output — every fdid assignment (path, role,
+  whether it existed in the client listfile or was newly allocated), the
+  suggested Map.db2 registration row (mirroring
+  `extraData/modernMapRegistrations.json` field names), and the full
+  warning/error list. Newly allocated ids come from a configurable base
+  (default 900 000 000) so they stay clear of retail ids.
+
+## Direction 2: modern → WotLK
+
+Per tile (ROOT + TEX0 + OBJ0 → monolith):
+
+* `MDID` fdids → `MTEX` path strings via the listfile. **Unresolvable
+  FileDataIDs are the one hard loss**: the converter emits a placeholder path
+  (`missing\fdid_<id>.blp`) and a warning — the user must rename/convert
+  those assets or fix the listfile. `MMDX/MMID/MWMO/MWID` likewise.
+* Per-chunk TEX0 `MCLY/MCAL` → per-chunk `MCLY` sub-chunk + alpha decoded
+  with the verified `decodeModernAlpha` (RLE / raw / packed fallbacks) and
+  re-emitted uncompressed (4096, or 2048 packed low-nibble when the target
+  WDT says small alpha) — universally readable by 3.3.5 and by Noggit's
+  legacy path. `textureID` rewritten to the MTEX byte offset.
+* `MHID/MTXP` (height texturing) have no WotLK equivalent → dropped with a
+  per-tile warning (documented loss).
+* OBJ0 `MDDF/MODF` (fdid) → global `MDDF/MODF` (name offsets) + name tables;
+  `MODF.flags &= ~0x8`. Per-chunk `nDoodadRefs/nMapObjRefs/ofsRefs` are set
+  to 0 and no `MCRD/MCRW` are emitted — the same shape Noggit's legacy
+  serializer has written for WotLK projects for years (instances attach per
+  tile).
+* `MH2O` → per-chunk `MCLQ` (inverse of the mapping above; modern vertex
+  metadata formats are decoded with the fork's inference rules first).
+  `_obj1`/`_lod` parts and minimap textures have no WotLK equivalent and are
+  dropped (warning); `_tex1`/`_tex2` layers beyond what MCLY supports are
+  clamped with a warning.
+* `MCCV`-bearing modern tiles: vertex shading has no 3.3.5 equivalent →
+  dropped with a warning.
+
+Map level:
+
+* **WDT**: `MAID` dropped; `MPHD.flags &= ~0x200` (fdid columns zeroed);
+  `MAIN` passes through (bit 0 = has ADT in both). Global-WMO maps get
+  `MWMO/MWID/MODF` back from the fdid MODF.
+* **WDL**: `MLMD/MLMX` → `MWMO/MWID/MODF` (extents from MLMX, `radius`
+  dropped); `MLDD/MLDX` (horizon M2s) have no legacy WDL slot → dropped with
+  a warning; `MAOF/MARE/MAHO` pass through.
+* Output paths use the WotLK conventions (`World\Maps\<name>\<name>_x_y.adt`,
+  `MPHD` 8-byte flags); the map is directly usable by a 3.3.5 server/client
+  once the missing-asset warnings are addressed.
+
+## Known fidelity limits (both directions)
+
+* FileDataIDs that the source listfile cannot resolve become manifest
+  entries (legacy→modern) or placeholder paths (modern→legacy). This is
+  inherent: the information does not exist in the files.
+* WotLK has no height texturing, no vertex shading (MCCV), no per-tile LOD
+  object part, no minimap texture set; modern has no small (TBC-era) alpha,
+  no `MWMO/MWID` name tables inside ADTs. Conversions drop what the target
+  cannot represent and say so in the report.
+* Liquid conversion covers the four basic types (water/ocean/magma/slime,
+  incl. green lava and the WMO variants by basic type). Exotic LiquidType
+  rows keep their id modern-side; legacy-side they fall back to the basic
+  type mapping above.
+* The modern ROOT chunk-header fields owned by other parts
+  (`ofsLayer/ofsAlpha/ofsRefs/...`) are zeroed rather than pointed across
+  files — matching how the fork's modern reader (and the client's TEX0/OBJ0
+  loading) actually finds the data. In-game validation on Epsilon is the
+  final check for these; the formats are otherwise built from the same
+  verified readers/writers the editor uses.
+
+## Implementation plan
+
+1. **Core library** `src/noggit/formats/conversion/` (Qt-free):
+   `MapConversion.hpp/.cpp` (API, orchestrator, WDT/WDL conversion, fdid
+   allocation, manifest/report) and `AdtConversion.cpp` (legacy ADT parse
+   model, modern part assembly, modern tile parse model, legacy assembly,
+   alpha codecs, MCLQ↔MH2O). Reuses the verified format knowledge from
+   `ModernAdtReader/Writer`, `ShadowlandsADTCodec`, `WdtReader`,
+   `WdlObjects` and `ChunkWater/liquid_layer` (layouts re-implemented
+   Qt-free on raw bytes).
+2. **Harness tests** (g++, no CMake): synthetic legacy ADT → modern parts →
+   re-parsed with `ModernAdtReader`; synthetic modern parts (task #9
+   builders) → legacy ADT → re-parsed with the legacy walk; WDT/WDL
+   round-trips; MCLQ↔MH2O round-trips; alpha codec round-trips.
+3. **Qt UI**: "Tools → Convert map…" dialog (source picker, map list from
+   the WDT scan or folder contents, target format, output directory,
+   progress + report view, manifest write, optional registration merge into
+   `extraData/modernMapRegistrations.json`).
+4. **Docs/README**: this file linked from README; conversion moved out of
+   "Outside the Current Scope".
