@@ -2864,6 +2864,10 @@ void MapView::paintGL()
 
   static bool lock = false;
 
+  try
+  {
+  _paint_phase = "startup checks";
+
   if (lock)
     return;
 
@@ -2872,6 +2876,7 @@ void MapView::paintGL()
   else
     _needs_redraw = false;
 
+  _paint_phase = "initializeGL retry";
   if (!_gl_initialized)
   {
     initializeGL();
@@ -2883,10 +2888,12 @@ void MapView::paintGL()
     return;
   }
 
+  _paint_phase = "frame timing";
   const qreal now(_startup_time.elapsed() / 1000.0);
 
   _last_frame_durations.emplace_back (now - _last_update);
 
+  _paint_phase = "tool preRender";
   lock = true;
   if (!activeTool()->preRender())
   {
@@ -2895,21 +2902,26 @@ void MapView::paintGL()
   }
   lock = false;
 
+  _paint_phase = "GL context activation";
   OpenGL::context::scoped_setter const _(::gl, context());
   makeCurrent();
 
+  _paint_phase = "clear";
   gl.clear (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
   {
     lock = true;
     draw_map();
+    _paint_phase = "tool postRender";
     activeTool()->postRender();
     lock = false;
+    _paint_phase = "tick";
     tick (now - _last_update);
   }
 
   _last_update = now;
 
+  _paint_phase = "gizmo/ImGui";
   if (_gizmo_on.get() && _world->has_selection())
   {
     ImGui::SetCurrentContext(_imgui_context);
@@ -2993,6 +3005,7 @@ void MapView::paintGL()
 
   }
 
+  _paint_phase = "uid warning / frame end";
   if (_world->uid_duplicates_found() && !_uid_duplicate_warning_shown)
   {
     _uid_duplicate_warning_shown = true;
@@ -3006,6 +3019,25 @@ void MapView::paintGL()
   }
 
   FrameMark
+  }
+  catch (std::exception const& e)
+  {
+    // Reset the re-entrancy lock: without this an exception escaping
+    // paintGL leaves the lock set and every later frame returns early -
+    // a frozen viewport with no further log output.
+    lock = false;
+    LogError << "MapView::paintGL: exception during '" << _paint_phase
+             << "': " << e.what() << std::endl;
+    throw;
+  }
+  catch (...)
+  {
+    lock = false;
+    LogError << "MapView::paintGL: unknown exception during '" << _paint_phase
+             << "'. The frame was aborted; the editor keeps running."
+             << std::endl;
+    throw;
+  }
 }
 
 void MapView::resizeGL (int width, int height)
@@ -3649,6 +3681,7 @@ glm::mat4x4 MapView::projection() const
 void MapView::draw_map()
 {
   ZoneScoped;
+  _paint_phase = "draw_map: tool parameters";
   //! \ todo: make the current tool return the radius
   float radius = 0.0f, inner_radius = 0.0f, angle = 0.0f, orientation = 0.0f;
   glm::vec3 ref_pos;
@@ -3684,12 +3717,14 @@ void MapView::draw_map()
   _projection = projection();
 
   //! \note Select terrain below mouse, if no item selected or the item is map.
+  _paint_phase = "draw_map: selection";
   if (!(_world->has_selection()
     || _locked_cursor_mode.get()))
   {
     doSelection(true);
   }
 
+  _paint_phase = "draw_map: minimap";
   if (_camera_moved_since_last_draw)
   {
       _minimap->update();
@@ -3739,6 +3774,7 @@ void MapView::draw_map()
   renderParams.render_select_wmo_aabb = _render_wmo_aabb;
   renderParams.render_select_wmo_groups_bounds = _render_wmo_groups_bounds;
 
+  _paint_phase = "draw_map: world render";
   _world->renderer()->draw (
                   _model_view
                 , _projection

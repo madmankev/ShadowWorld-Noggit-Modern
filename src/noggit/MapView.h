@@ -388,6 +388,11 @@ private:
   void updateGizmoOverlay(ImGuizmo::OPERATION operation);
 
   bool _gl_initialized = false;
+
+  // Phase tracker for paintGL: when an exception escapes a paint, the
+  // catch handlers below report which phase of the frame was running (the
+  // outer SafeApplication handler alone can only say "Paint event").
+  char const* _paint_phase = "outside paint";
   bool _destroying = false;
   bool _needs_redraw = false;
   bool _unload_tiles = true;

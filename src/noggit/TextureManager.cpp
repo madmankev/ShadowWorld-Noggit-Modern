@@ -293,7 +293,16 @@ void blp_texture::unload()
   _compressed_data.clear();
 
   // load data back from file. pretty sad. maybe keep it after loading?
-  finishLoading();
+  // A texture whose source file never loaded (absent from this client's
+  // CASC - e.g. WMOs referencing content the installation does not have)
+  // has nothing to reload from: retrying the read here only re-throws the
+  // same "File read failed" on every context release, which spams one
+  // error line per missing texture per release (observed: 162 lines for
+  // 54 missing textures during one shutdown).
+  if (!loading_failed())
+  {
+    finishLoading();
+  }
 }
 
 bool blp_texture::is_uploaded() const
