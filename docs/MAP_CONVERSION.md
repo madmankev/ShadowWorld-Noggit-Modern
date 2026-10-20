@@ -104,6 +104,8 @@ Map level:
   converter writes gets an assigned FileDataID (root/tex0/obj0; obj1/lod/
   minimap = 0), recorded in the manifest — the server/listfile side must
   register exactly these ids for the client to find the files.
+  Magma/slime blocks map to `LVF_HEIGHT_UV` (the block's uv words pass
+  through as the MH2O uv plane), flat zero-height ocean to `LVF_DEPTH`.
 * **WDL**: `MVER/MAOF/MARE/MAHO` pass through (identical in both families);
   legacy `MWMO/MWID/MODF` → `MLMD` (40-byte records: MODF without extents,
   nameID = fdid) + `MLMX` (28-byte `min/max/radius` bounds from the MODF

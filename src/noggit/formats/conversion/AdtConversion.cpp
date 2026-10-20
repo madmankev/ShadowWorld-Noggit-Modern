@@ -41,7 +41,9 @@
 
 namespace Noggit::Formats::Conversion
 {
-  namespace
+  //! Named (not anonymous) so unity builds cannot merge these helpers
+  //! with the identically shaped ones in MapConversion.cpp.
+  namespace adt_detail
   {
     constexpr std::uint32_t FC_MVER = (std::uint32_t('M') << 24) | (std::uint32_t('V') << 16) | (std::uint32_t('E') << 8) | std::uint32_t('R');
     constexpr std::uint32_t FC_MHDR = (std::uint32_t('M') << 24) | (std::uint32_t('H') << 16) | (std::uint32_t('D') << 8) | std::uint32_t('R');
@@ -1679,6 +1681,8 @@ namespace Noggit::Formats::Conversion
       return out.bytes;
     }
   }
+
+  using namespace adt_detail; // helpers shared with the public entry points below
 
   // --------------------------------------------------------------------
   // Public entry points

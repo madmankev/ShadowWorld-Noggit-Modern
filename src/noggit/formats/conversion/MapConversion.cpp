@@ -20,7 +20,9 @@ namespace Noggit::Formats::Conversion
   using Noggit::Formats::WDT::MaidEntry;
   using Noggit::Formats::WDT::ParsedWdt;
 
-  namespace
+  //! Named (not anonymous) so unity builds cannot merge these helpers
+  //! with the identically shaped ones in AdtConversion.cpp.
+  namespace map_wdt_wdl_detail
   {
     constexpr std::uint32_t FC_MVER = (std::uint32_t('M') << 24) | (std::uint32_t('V') << 16) | (std::uint32_t('E') << 8) | std::uint32_t('R');
     constexpr std::uint32_t FC_MPHD = (std::uint32_t('M') << 24) | (std::uint32_t('P') << 16) | (std::uint32_t('H') << 8) | std::uint32_t('D');
@@ -328,6 +330,8 @@ namespace Noggit::Formats::Conversion
       return out;
     }
   }
+
+  using namespace map_wdt_wdl_detail; // helpers shared with the public functions below
 
   // --------------------------------------------------------------------
   // FdidAllocator / normalize_path
