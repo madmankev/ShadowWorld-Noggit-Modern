@@ -893,14 +893,44 @@ uint32_t MapIndex::getHighestGUIDFromFile(const std::string& pFilename) const
     const std::filesystem::path root_path(pFilename);
     const auto obj0_path = root_path.parent_path() /
       (root_path.stem().string() + "_obj0" + root_path.extension().string());
-    const auto scan_path = client_data->exists(obj0_path.string()) ? obj0_path.string() : pFilename;
 
-    BlizzardArchive::ClientFile file(scan_path, client_data);
-    if (file.isEof() || file.getSize() < 8)
+    // exists() consults listfile/CASC metadata, which can advertise files
+    // whose content the CASC installation cannot actually deliver (partial
+    // installs, stale listfiles). This function runs while the map view
+    // initialises its GL context, so a throw here would abort the init and
+    // be retried on every repaint: read the file inside a guard and treat
+    // any failure as "no GUID information in this tile".
+    std::string scan_path;
+    std::vector<std::uint8_t> file_bytes;
+    try
+    {
+      scan_path = client_data->exists(obj0_path.string()) ? obj0_path.string() : pFilename;
+
+      BlizzardArchive::ClientFile file(scan_path, client_data);
+      if (file.isEof() || file.getSize() < 8)
+        return highGUID;
+
+      file_bytes.assign(reinterpret_cast<std::uint8_t const*>(file.getBuffer()),
+                        reinterpret_cast<std::uint8_t const*>(file.getBuffer()) + file.getSize());
+    }
+    catch (std::exception const& e)
+    {
+      LogError << "getHighestGUIDFromFile(): could not read the object data for \""
+               << pFilename << "\": " << e.what()
+               << " Skipping this tile; GUIDs already stored inside it are ignored."
+               << std::endl;
       return highGUID;
+    }
+    catch (...)
+    {
+      LogError << "getHighestGUIDFromFile(): could not read the object data for \""
+               << pFilename << "\" (unknown error). Skipping this tile; GUIDs already"
+                 " stored inside it are ignored." << std::endl;
+      return highGUID;
+    }
 
-    auto const* data = file.getBuffer();
-    auto const file_size = file.getSize();
+    auto const* data = reinterpret_cast<char const*>(file_bytes.data());
+    auto const file_size = file_bytes.size();
     std::size_t pos = 0;
 
     while (pos + 8 <= file_size)

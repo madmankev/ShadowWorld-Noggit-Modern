@@ -52,6 +52,7 @@
 #include <external/glm/gtc/type_ptr.hpp>
 #include <external/qtimgui/QtImGui.h>
 #include <opengl/types.hpp>
+#include <exception>
 #include <limits>
 #include <variant>
 #include <noggit/Selection.h>
@@ -2778,25 +2779,45 @@ void MapView::initializeGL()
 
   gl.clearColor (0.0f, 0.0f, 0.0f, 1.0f);
 
-  if (_uid_fix == uid_fix_mode::max_uid)
+  // The UID phase must never be able to abort GL initialisation: if it
+  // throws, paintGL would retry initializeGL on every frame and flood the
+  // log (and the user) with the same failure forever. Degrade instead:
+  // open the map and report the problem once.
+  try
   {
-    _world->mapIndex.searchMaxUID();
-  }
-  else if (_uid_fix == uid_fix_mode::fix_all_fail_on_model_loading_error)
-  {
-    auto result = _world->mapIndex.fixUIDs (_world.get(), true);
-
-    if (result == uid_fix_status::failed)
+    if (_uid_fix == uid_fix_mode::max_uid)
     {
-      on_uid_fix_fail();
-      return;
+      _world->mapIndex.searchMaxUID();
+    }
+    else if (_uid_fix == uid_fix_mode::fix_all_fail_on_model_loading_error)
+    {
+      auto result = _world->mapIndex.fixUIDs (_world.get(), true);
+
+      if (result == uid_fix_status::failed)
+      {
+        on_uid_fix_fail();
+        return;
+      }
+    }
+    else if (_uid_fix == uid_fix_mode::fix_all_fuckporting_edition)
+    {
+      auto result = _world->mapIndex.fixUIDs (_world.get(), false);
+
+      uid_warning = result == uid_fix_status::done_with_errors;
     }
   }
-  else if (_uid_fix == uid_fix_mode::fix_all_fuckporting_edition)
+  catch (std::exception const& e)
   {
-    auto result = _world->mapIndex.fixUIDs (_world.get(), false);
-
-    uid_warning = result == uid_fix_status::done_with_errors;
+    LogError << "UID processing failed while opening the map: " << e.what()
+             << " The map is opened anyway; new objects may reuse existing"
+                " UIDs until this is resolved (see the messages above)."
+             << std::endl;
+  }
+  catch (...)
+  {
+    LogError << "UID processing failed while opening the map (unknown exception)."
+                " The map is opened anyway; new objects may reuse existing"
+                " UIDs until this is resolved." << std::endl;
   }
 
   _uid_fix = uid_fix_mode::none;

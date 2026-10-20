@@ -301,6 +301,39 @@ in `noggit.ini` (or the Qt settings registry), then restart Noggit.
 Full details of the loader, the shared reader module and the failure
 behaviours are in [MODERN_ADT_LOADING.md](MODERN_ADT_LOADING.md).
 
+## A map won't open: wall of "Uncaught exception ... Paint event" errors
+
+Symptom: after picking a map, the view stays empty/frozen and `log.txt`
+fills with thousands of lines like:
+
+    [Error] Uncaught exception while handling a Paint event for MapView:
+    File read failed. requested={path=world/maps/<map>/<map>_X_Y_obj0.adt, ...}
+
+or `... Paint event for MapView: unknown exception`, repeating every
+frame.
+
+Cause: while the map view initialises, Noggit scans every tile's object
+data (the `_obj0` part on modern maps) to find the highest stored GUID.
+`exists()` asks the listfile/CASC metadata, which can advertise a file
+whose *content* the CASC installation cannot deliver - typical for
+partially downloaded clients ("metadata-less CASC fallback" near the top
+of the log) or custom maps whose injection is incomplete or whose
+listfile is stale. The failed read used to escape as an exception,
+aborting GL initialisation; every repaint retried it, producing the
+storm.
+
+This is fixed in Noggit (the scan skips unreadable files with one
+`getHighestGUIDFromFile(): could not read ...` error each, and the whole
+UID phase can no longer abort the map view - the map opens anyway). If
+you still see many missing files, the underlying data problem remains:
+
+* `File world/wmo/... .wmo could not be loaded`, `... .m2`, `... .blp` -
+  those assets are absent from your CASC installation; the objects are
+  skipped and the rest of the map works. Repair/re-download the client
+  (Battle.net -> Scan and Repair) to get the content back.
+* For custom maps: verify the injected files (root/`_tex0`/`_obj0`) are
+  really present under the FileDataIDs your listfile claims.
+
 ## Reporting a problem
 
 Include `log.txt`, the project's client version (Shadowlands 9.2.7, Retail,
