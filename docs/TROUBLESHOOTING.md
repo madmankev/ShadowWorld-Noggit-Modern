@@ -90,6 +90,35 @@ This is not a problem with the project. Those maps cannot be opened because the
 client does not contain them. To get them, install the missing content in the
 Battle.net client (or point the project at a complete client copy).
 
+## A map I created is gone after a restart (modern projects)
+
+On modern projects the map table is rebuilt from the client's `Map.db2` on
+every load, so the legacy `DBFilesClient/Map.dbc` write is not enough. New maps
+are therefore also persisted as a project registration in
+`extraData/modernMapRegistrations.json`, which the DB2 bridge merges back in at
+startup. When it works you will see:
+
+``` text
+[MapWizard] Registered map id=2100 in extraData/modernMapRegistrations.json (target build 9.2.7.45745)
+[ModernDB2][Map] Map registrations merged=1 skipped=0
+```
+
+If the map is still missing after a restart, look for one of:
+
+* `[MapWizard] ... was not registered for the modern pipeline: <reason>` —
+  validation rejected the entry (e.g. empty `Directory`, characters outside
+  `A-Z a-z 0-9 _`, `InstanceType` above 4). Fix the value and save again.
+* `[ModernDB2][Map] Skipping invalid registered map id=...` — the stored
+  registration is malformed (usually a hand-edited JSON file); the reason
+  follows the message.
+* `[ModernDB2][Map] Registered map id=... is already provided by the client`
+  (Debug level) — the id collides with a real client map; pick another id.
+* `[MapRegistration] Could not parse ...` — the JSON file is corrupt; restore
+  it or delete it and re-save the map from the wizard.
+
+Full design, the 9.2.7 field list, and the validation rules are documented in
+[`MODERN_MAP_REGISTRATION.md`](MODERN_MAP_REGISTRATION.md).
+
 ## "wdl ... skipped N unsupported chunks"
 
 Modern `.wdl` files (the low-detail height map Noggit uses for the minimap)

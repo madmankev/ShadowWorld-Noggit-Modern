@@ -8,6 +8,7 @@
 #include <noggit/application/Configuration/NoggitApplicationConfiguration.hpp>
 #include <noggit/database/ClientDatabase.h>
 #include <noggit/project/CurrentProject.hpp>
+#include <noggit/project/ModernMapRegistrations.h>
 
 #include <blizzard-archive-library/include/ClientFile.hpp>
 #include <blizzard-database-library/include/BlizzardDatabase.h>
@@ -204,6 +205,10 @@ namespace
     gAreaTriggerDB.overwriteWith(out);
   }
 
+  // Applies the project's modern map registrations to the bridged legacy
+  // table (defined below bridge_map).
+  void merge_registered_maps(DBCFile& out);
+
   void bridge_map(Table& table)
   {
     auto out = DBCFile::createNew("DBFilesClient\\Map.dbc", 66, 66 * sizeof(std::uint32_t));
@@ -230,7 +235,62 @@ namespace
       rec.write(MapDB::RaidOffset, u32(row, "RaidOffset"));
       rec.write(MapDB::NumberOfPlayers, u32(row, "MaxPlayers"));
     }
+
+    // Merge maps registered by the map wizard (issue: Map.db2 registration for
+    // new maps). CASC rows win on id conflicts. Registrations carry modern
+    // column values plus the build they were authored for, so maps registered
+    // on an older layout still merge: columns the loaded build (or the
+    // registration) does not carry fall back to the same converter defaults
+    // used above.
+    merge_registered_maps(out);
+
     gMapDB.overwriteWith(out);
+  }
+
+  // Applies the project's modernMapRegistrations.json to the bridged legacy
+  // table. Never throws out: a broken registration file must not take the
+  // whole bootstrap down.
+  void merge_registered_maps(DBCFile& out)
+  {
+    try
+    {
+      auto const project = Noggit::Project::CurrentProject::get();
+      if (!project)
+        return;
+
+      auto registrations = Noggit::Project::ModernMapRegistrations::load(
+          std::filesystem::path(project->ProjectPath.c_str()));
+      if (registrations.empty())
+        return;
+
+      std::size_t merged = 0;
+      std::size_t skipped = 0;
+      for (auto const& registration : registrations)
+      {
+        std::string const problem = Noggit::Project::ModernMapRegistrations::validate(registration);
+        if (!problem.empty())
+        {
+          LogError << "[ModernDB2][Map] Skipping invalid registered map id=" << registration.id
+                   << ": " << problem << std::endl;
+          ++skipped;
+          continue;
+        }
+        if (Noggit::Project::ModernMapRegistrations::apply_to_map_dbc(out, registration))
+          ++merged;
+        else
+        {
+          LogDebug << "[ModernDB2][Map] Registered map id=" << registration.id
+                   << " is already provided by the client; registration ignored." << std::endl;
+          ++skipped;
+        }
+      }
+      Log << "[ModernDB2][Map] Map registrations merged=" << merged
+          << " skipped=" << skipped << std::endl;
+    }
+    catch (std::exception const& e)
+    {
+      LogError << "[ModernDB2][Map] Map registration merge failed: " << e.what() << std::endl;
+    }
   }
 
   void bridge_loading_screens(Table& table)

@@ -109,6 +109,13 @@ namespace Noggit
       void map_dbc_updated(int new_map = 0);
 
     private:
+      // Persist new maps for modern (DB2-based) projects so the DB2 bridge can
+      // merge them back in on the next load. On legacy projects this is a
+      // no-op: DBFilesClient/Map.dbc remains the registration there.
+      // See noggit/project/ModernMapRegistrations.h.
+      void registerMapForModernPipeline();
+      void unregisterMapFromModernPipeline(int map_id);
+
       struct WmoEntryTab
       {
           QCheckBox* disableTerrain = nullptr;

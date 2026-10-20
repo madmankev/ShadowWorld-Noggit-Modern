@@ -7,6 +7,7 @@
 #include <noggit/Log.h>
 #include <noggit/MapChunk.h>
 #include <noggit/project/CurrentProject.hpp>
+#include <noggit/project/ModernMapRegistrations.h>
 #include <noggit/ui/FontAwesome.hpp>
 #include <noggit/ui/minimap_widget.hpp>
 #include <noggit/ui/widgets/Vector3Widget.hpp>
@@ -1151,6 +1152,11 @@ void MapCreationWizard::saveCurrentEntry()
 
     gMapDB.save();
 
+    // Modern projects rebuild the map table from Map.db2 on every load, which
+    // drops the legacy project DBC written above. Persist the new map as a
+    // project registration so the bridge merges it back in after a restart.
+    registerMapForModernPipeline();
+
     // reloads map list, and selects the new map
     emit map_dbc_updated(_cur_map_id);
 
@@ -1193,6 +1199,106 @@ MapCreationWizard::~MapCreationWizard()
 {
   // delete _world;
   disconnect(_connection);
+}
+
+void MapCreationWizard::registerMapForModernPipeline()
+{
+  try
+  {
+    auto const project = Noggit::Project::CurrentProject::get();
+    if (!project)
+      return;
+    // Legacy projects keep DBFilesClient/Map.dbc as their registration store;
+    // only modern (DB2-based) projects need the extraData registration.
+    if (project->projectVersion < Noggit::Project::ProjectVersion::SL)
+      return;
+
+    // The build string the project was created against; the bridge merges
+    // regardless of build, but storing it keeps registrations traceable and
+    // lets future client generations re-derive their own layouts.
+    std::string const target_build = project->ClientBuild;
+
+    Noggit::Project::ModernMapRegistration registration;
+    registration.id = _cur_map_id;
+    registration.target_build = target_build;
+    // Modern Map.db2 column names, matching what the DB2 bridge reads.
+    registration.fields["Directory"] = _directory->text().toStdString();
+    registration.fields["InstanceType"] = std::to_string(_instance_type->itemData(_instance_type->currentIndex()).toInt());
+    registration.fields["Flags"] = std::to_string(_sort_by_size_cat->isChecked() ? 16 : 0);
+    registration.fields["MapName_lang"] = _map_name->getValue(0);
+    registration.fields["AreaTableID"] = std::to_string(_area_table_id->value());
+    registration.fields["MapDescription1_lang"] = _map_desc_alliance->getValue(0);
+    registration.fields["MapDescription0_lang"] = _map_desc_horde->getValue(0);
+    registration.fields["LoadingScreenID"] = std::to_string(_loading_screen->value());
+    registration.fields["MinimapIconScale"] = std::to_string(static_cast<float>(_minimap_icon_scale->value()));
+    registration.fields["CorpseMapID"] = std::to_string(_corpse_map_id->itemData(_corpse_map_id->currentIndex()).toInt());
+    registration.array_fields["Corpse"] = {std::to_string(static_cast<float>(_corpse_x->value())),
+                                           std::to_string(static_cast<float>(_corpse_y->value()))};
+    registration.fields["TimeOfDayOverride"] = std::to_string(_time_of_day_override->value());
+    registration.fields["ExpansionID"] = std::to_string(_expansion_id->itemData(_expansion_id->currentIndex()).toInt());
+    registration.fields["RaidOffset"] = std::to_string(_raid_offset->value());
+    registration.fields["MaxPlayers"] = std::to_string(_max_players->value());
+
+    std::string problem = Noggit::Project::ModernMapRegistrations::validate(registration);
+    if (problem.empty())
+    {
+      // Metadata validation beyond the stored fields: the Directory becomes
+      // the map's file path, so it must not belong to another map already.
+      int const directory_owner = gMapDB.findMapName(registration.fields.at("Directory"));
+      if (directory_owner >= 0 && directory_owner != _cur_map_id)
+        problem = "Directory \"" + registration.fields.at("Directory")
+                + "\" is already used by map " + std::to_string(directory_owner);
+    }
+    if (!problem.empty())
+    {
+      LogError << "[MapWizard] Map " << _cur_map_id
+               << " was not registered for the modern pipeline: " << problem << std::endl;
+      QMessageBox::warning(this, "Map registration failed",
+                           QString("The map was created for this session, but could not be registered permanently:\n%1")
+                             .arg(QString::fromStdString(problem)));
+      return;
+    }
+
+    auto const project_path = std::filesystem::path(project->ProjectPath.c_str());
+    auto registrations = Noggit::Project::ModernMapRegistrations::load(project_path);
+    Noggit::Project::ModernMapRegistrations::upsert(registrations, registration);
+    if (Noggit::Project::ModernMapRegistrations::save(project_path, registrations))
+      Log << "[MapWizard] Registered map id=" << _cur_map_id
+          << " in extraData/modernMapRegistrations.json"
+          << (target_build.empty() ? std::string() : " (target build " + target_build + ")")
+          << std::endl;
+    else
+      LogError << "[MapWizard] Could not persist the registration for map " << _cur_map_id
+               << "; it will be missing after a reload." << std::endl;
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "[MapWizard] Modern map registration failed: " << e.what() << std::endl;
+  }
+}
+
+void MapCreationWizard::unregisterMapFromModernPipeline(int map_id)
+{
+  try
+  {
+    auto const project = Noggit::Project::CurrentProject::get();
+    if (!project || project->projectVersion < Noggit::Project::ProjectVersion::SL)
+      return;
+
+    auto const project_path = std::filesystem::path(project->ProjectPath.c_str());
+    auto registrations = Noggit::Project::ModernMapRegistrations::load(project_path);
+    if (!Noggit::Project::ModernMapRegistrations::remove(registrations, map_id))
+      return;
+    if (Noggit::Project::ModernMapRegistrations::save(project_path, registrations))
+      Log << "[MapWizard] Removed the modern registration for map id=" << map_id << std::endl;
+    else
+      LogError << "[MapWizard] Could not persist removal of the registration for map "
+               << map_id << std::endl;
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "[MapWizard] Could not remove the modern map registration: " << e.what() << std::endl;
+  }
 }
 
 void MapCreationWizard::addNewMap()
@@ -1303,6 +1409,7 @@ void MapCreationWizard::removeMap()
   {
     gMapDB.removeRecord(_cur_map_id);
     gMapDB.save();
+    unregisterMapFromModernPipeline(_cur_map_id);
   }
 
   emit map_dbc_updated();
