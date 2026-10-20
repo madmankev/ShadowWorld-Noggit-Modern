@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <unordered_set>
 #include <iomanip>
 #include <map>
 #include <sstream>
@@ -125,6 +126,23 @@ void WMO::finishLoading ()
 
   f.seekRelative (2);
 
+  // Legion and later root files carry explicit FileDataIDs for their group
+  // files (GFID), one block of nGroups ids per LOD; the base LOD block is the
+  // first one. Older files keep the "<root>_<NNN>.wmo" naming convention.
+  if (auto const* gfid = find_root_chunk('GFID'); gfid)
+  {
+    auto const entry_count = gfid->size / sizeof(std::uint32_t);
+    auto const usable = std::min<std::size_t>(entry_count, nGroups);
+    _group_file_ids.resize(usable);
+    if (usable)
+      std::memcpy(_group_file_ids.data(), f.getBuffer() + gfid->payload_offset,
+                  usable * sizeof(std::uint32_t));
+    if (entry_count < nGroups)
+      LogError << "[ModernWMO] GFID in \"" << _file_key.stringRepr() << "\" holds "
+               << entry_count << " entries for " << nGroups
+               << " groups; the remaining groups fall back to name-based lookup." << std::endl;
+  }
+
   ambient_light_color.x = static_cast<float>(ambient_color.r) / 255.f;
   ambient_light_color.y = static_cast<float>(ambient_color.g) / 255.f;
   ambient_light_color.z = static_cast<float>(ambient_color.b) / 255.f;
@@ -176,9 +194,14 @@ void WMO::finishLoading ()
                 texture_ref);
 
             if (resolved.empty())
-              LogError << "Unresolved WMO texture FileDataID " << texture_ref
-                       << " in \"" << _file_key.stringRepr()
-                       << "\"; loading directly by ID." << std::endl;
+            {
+              // every material of every copy of this WMO would repeat this
+              static std::unordered_set<std::uint32_t> reported_texture_ids;
+              if (reported_texture_ids.insert(texture_ref).second)
+                LogError << "Unresolved WMO texture FileDataID " << texture_ref
+                         << " in \"" << _file_key.stringRepr()
+                         << "\"; loading directly by ID." << std::endl;
+            }
           }
         }
         else if (texture_ref < texbuf.size() && texbuf[texture_ref])
@@ -233,6 +256,34 @@ void WMO::finishLoading ()
     for (unsigned int i = 0; i < nGroups; ++i)
       groups.emplace_back(this, &f, i, groupnames);
 
+    bool skybox_resolved = false;
+
+    // BfA and later roots may reference the skybox model by FileDataID (MOSI)
+    // instead of by filename (MOSB); the client accepts either.
+    if (auto const* mosi = find_root_chunk('MOSI'); mosi && mosi->size >= 4)
+    {
+      std::uint32_t skybox_fdid = 0;
+      std::memcpy(&skybox_fdid, f.getBuffer() + mosi->payload_offset, sizeof(skybox_fdid));
+      if (skybox_fdid)
+      {
+        auto const resolved = client_data->listfile()->getPath(skybox_fdid);
+        if (!resolved.empty() && client_data->exists(resolved))
+        {
+          skybox = scoped_model_reference(
+            BlizzardArchive::Listfile::FileKey(resolved, skybox_fdid), _context);
+          skybox_resolved = true;
+        }
+        else
+        {
+          static std::unordered_set<std::uint32_t> reported_skybox_ids;
+          if (reported_skybox_ids.insert(skybox_fdid).second)
+            LogError << "[ModernWMO] Unable to resolve skybox FileDataID " << skybox_fdid
+                     << " in \"" << _file_key.stringRepr() << "\"." << std::endl;
+        }
+      }
+    }
+
+    if (!skybox_resolved)
     if (auto const* mosb = find_root_chunk('MOSB'); mosb && mosb->size > 4)
     {
       auto const* skybox_name = reinterpret_cast<char const*>(f.getBuffer() + mosb->payload_offset);
@@ -297,6 +348,14 @@ void WMO::finishLoading ()
         ? modern_doodad_file_ids[entry_header.name_offset]
         : 0;
       auto const path = client_data->listfile()->getPath(file_data_id);
+      if (path.empty())
+      {
+        static std::unordered_set<std::uint32_t> reported_doodad_ids;
+        if (reported_doodad_ids.insert(file_data_id).second)
+          LogError << "[ModernWMO] Unable to resolve doodad FileDataID " << file_data_id
+                   << " (MODI index " << entry_header.name_offset << ") in \""
+                   << _file_key.stringRepr() << "\"; the instance will not render." << std::endl;
+      }
       BlizzardArchive::Listfile::FileKey doodad_key(
         path.empty() ? "unknown/" + std::to_string(file_data_id) + ".m2" : path,
         file_data_id);
@@ -801,16 +860,55 @@ namespace
 
 void WMOGroup::load()
 {
-  // open group file
-  std::stringstream curNum;
-  curNum << "_" << std::setw (3) << std::setfill ('0') << num;
+  auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
 
-  std::string fname = wmo->file_key().filepath();
-  fname.insert (fname.find (".wmo"), curNum.str ());
+  // open group file: modern roots say which FileDataID each group lives under
+  // (GFID); everything else keeps the "<root>_<NNN>.wmo" naming convention.
+  std::string fname;
+  BlizzardArchive::Listfile::FileKey group_key("invalid.wmo");
 
-  BlizzardArchive::ClientFile f(fname, Noggit::Application::NoggitApplication::instance()->clientData());
+  auto const group_file_id = wmo->group_file_data_id(static_cast<std::size_t>(num));
+  if (group_file_id)
+  {
+    auto const resolved = client_data->listfile()->getPath(group_file_id);
+    if (!resolved.empty() && client_data->exists(resolved))
+    {
+      group_key = BlizzardArchive::Listfile::FileKey(resolved, group_file_id);
+      fname = resolved;
+    }
+    else
+    {
+      static std::unordered_set<std::uint32_t> reported_group_ids;
+      if (reported_group_ids.insert(group_file_id).second)
+        LogError << "[ModernWMOGroup] GFID " << group_file_id << " of group " << num
+                 << " in \"" << wmo->file_key().stringRepr()
+                 << "\" is not present in the client; trying the name-based fallback."
+                 << std::endl;
+    }
+  }
+
+  if (fname.empty())
+  {
+    std::stringstream curNum;
+    curNum << "_" << std::setw (3) << std::setfill ('0') << num;
+
+    fname = wmo->file_key().filepath();
+    auto const extension = fname.find (".wmo");
+    if (extension == std::string::npos)
+    {
+      LogError << "[ModernWMOGroup] Cannot derive a group file name from \""
+               << fname << "\"." << std::endl;
+      return;
+    }
+    fname.insert (extension, curNum.str ());
+    group_key = BlizzardArchive::Listfile::FileKey(fname);
+  }
+
+  BlizzardArchive::ClientFile f(group_key, client_data);
   if (f.isEof()) {
-    LogError << "Error loading WMO \"" << fname << "\"." << std::endl;
+    static std::unordered_set<std::string> reported_group_files;
+    if (reported_group_files.insert(fname).second)
+      LogError << "Error loading WMO \"" << fname << "\"." << std::endl;
     return;
   }
 
@@ -839,15 +937,23 @@ void WMOGroup::load()
 
   unsigned fog_index = header.fogs[0];
 
-  // downport hack
-  if (fog_index >= wmo->fogs.size())
+  // A WMO without any MFOG entry used to read fogs[0] out of bounds here.
+  if (wmo->fogs.empty())
   {
-      fog_index = 0;
+    fog = -1;
   }
-  WMOFog &wf = wmo->fogs[fog_index];
+  else
+  {
+    // downport hack
+    if (fog_index >= wmo->fogs.size())
+    {
+        fog_index = 0;
+    }
+    WMOFog &wf = wmo->fogs[fog_index];
 
-  if (wf.r2 <= 0) fog = -1; // default outdoor fog..?
-  else fog = header.fogs[0];
+    if (wf.r2 <= 0) fog = -1; // default outdoor fog..?
+    else fog = header.fogs[0];
+  }
 
   BoundingBoxMin = ::glm::vec3 (header.box1[0], header.box1[2], -header.box1[1]);
   BoundingBoxMax = ::glm::vec3 (header.box2[0], header.box2[2], -header.box2[1]);

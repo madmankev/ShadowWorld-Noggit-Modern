@@ -358,9 +358,17 @@ public:
   [[nodiscard]]
   bool uses_file_data_ids() const { return _uses_file_data_ids; }
 
+  //! FileDataID of a group file from the GFID chunk (Legion+), 0 when the root
+  //! does not carry one and the "<root>_<NNN>.wmo" naming has to be used.
+  std::uint32_t group_file_data_id(std::size_t group_index) const
+  {
+    return group_index < _group_file_ids.size() ? _group_file_ids[group_index] : 0u;
+  }
+
 private:
   bool _hidden = false;
   bool _uses_file_data_ids = false;
+  std::vector<std::uint32_t> _group_file_ids;
 
   Noggit::Rendering::WMORender _renderer;
 };
