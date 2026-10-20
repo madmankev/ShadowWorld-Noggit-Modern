@@ -466,7 +466,13 @@ void Model::initCommon(const BlizzardArchive::ClientFile& f, ModelHeader& header
     {
       if (texdef[i].nameLen == 0)
       {
-        LogDebug << "Texture " << i << " has a lenght of 0 for '" << _file_key.stringRepr() << std::endl;
+        // Normal for modern clients: TXID-backed textures carry no inline
+        // filename. The caller resolves them from the TXID table right after
+        // initCommon (one summary line per model; unresolved ids get an
+        // "unknown/<fdid>.blp" placeholder that fails visibly when the
+        // texture is loaded). Per-texture logging here flooded logs with
+        // thousands of misleading "has a lenght of 0" lines on Shadowlands
+        // maps, so this branch stays quiet.
         continue;
       }
 

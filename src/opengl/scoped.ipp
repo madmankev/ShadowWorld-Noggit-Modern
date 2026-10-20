@@ -102,10 +102,10 @@ namespace OpenGL
       gl.depthMask (_was_enabled);
     }
 
-    inline vao_binder::vao_binder(GLuint vao)
+    inline vao_binder::vao_binder(GLuint vao, std::source_location const& caller)
     {
       gl.getIntegerv(GL_VERTEX_ARRAY_BINDING, &_old);
-      gl.bindVertexArray(vao);
+      gl.bindVertexArray(vao, caller);
     }
     inline vao_binder::~vao_binder()
     {
@@ -113,7 +113,7 @@ namespace OpenGL
     }
 
     template<GLenum type>
-    buffer_binder<type>::buffer_binder (GLuint buffer)
+    buffer_binder<type>::buffer_binder (GLuint buffer, std::source_location const& caller)
     {
       //! \todo commented out targets not supported on macOS due to
       //! old OpenGL. If we ever need them, find workaround.
@@ -133,7 +133,7 @@ namespace OpenGL
                      : throw std::logic_error ("bad bind target")
                      , reinterpret_cast<GLint*> (&_old)
                      );
-      gl.bindBuffer (type, buffer);
+      gl.bindBuffer (type, buffer, caller);
     }
     template<GLenum type>
     buffer_binder<type>::~buffer_binder()

@@ -334,6 +334,29 @@ you still see many missing files, the underlying data problem remains:
 * For custom maps: verify the injected files (root/`_tex0`/`_obj0`) are
   really present under the FileDataIDs your listfile claims.
 
+## Walls of `context.inl` GL errors (e.g. `bindBuffer ... GL_INVALID_OPERATION`)
+
+A single stale or never-created GPU object (typically a buffer whose name
+became invalid after a graphics-context change) makes the same OpenGL call
+fail on **every frame**, so one broken object used to produce tens of
+thousands of identical `[Error]` lines (observed: 46k+ `bindBuffer
+GL_INVALID_OPERATION` entries in one session). The log is now aggregated:
+
+- The **first** occurrence of each distinct GL error is logged in full.
+- While the same error keeps repeating, at most one summary line per five
+  seconds is written: `... (+ N identical repeats since the last report ...)`.
+- The wrappers that failed in practice (`bindBuffer`, `bindVertexArray`,
+  `drawElements`, `drawElementsInstanced`, `texParameteri`, `bufferData`,
+  `bufferSubData`, and the scoped `vao_binder` / `buffer_binder` helpers) now
+  record the calling site, so reports end with
+  `| called from <file>:<line> in <function>`.
+
+If you see such a wall, look at the **first** error line and its
+`called from` location - that names the code path drawing with the broken
+object - and report it together with what you did right before the errors
+started (opening a map, switching maps, docking/undocking panels, changing
+monitors or resolution). Context switches are the usual trigger.
+
 ## Reporting a problem
 
 Include `log.txt`, the project's client version (Shadowlands 9.2.7, Retail,

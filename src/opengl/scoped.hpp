@@ -40,7 +40,7 @@ namespace OpenGL
     class vao_binder
     {
     public:
-      vao_binder(GLuint vao);
+      vao_binder(GLuint vao, std::source_location const& caller = std::source_location::current());
       ~vao_binder();
       vao_binder (vao_binder const&) = delete;
       vao_binder (vao_binder&&) = delete;
@@ -55,7 +55,7 @@ namespace OpenGL
       class buffer_binder
     {
     public:
-      buffer_binder (GLuint buffer);
+      buffer_binder (GLuint buffer, std::source_location const& caller = std::source_location::current());
       ~buffer_binder();
       buffer_binder (buffer_binder const&) = delete;
       buffer_binder (buffer_binder&&) = delete;
@@ -101,7 +101,11 @@ namespace OpenGL
 
     private:
       bool _buffer_generated = false;
-      GLuint _buffers[count];
+      // Zero-init: before upload() (or after a skipped release) these must
+      // read as name 0 (a legal "no object" bind), never as uninitialized
+      // garbage that could alias a live GL object or spam
+      // GL_INVALID_OPERATION on every bind.
+      GLuint _buffers[count]{};
     };
 
     template<std::size_t count>
@@ -139,7 +143,7 @@ namespace OpenGL
 
     private:
       bool _buffer_generated = false;
-      GLuint _vertex_arrays[count];
+      GLuint _vertex_arrays[count]{}; // see deferred_upload_buffers: no garbage names
     };
 
     template<std::size_t count>
@@ -160,7 +164,7 @@ namespace OpenGL
 
     private:
       bool _texture_generated = false;
-      GLuint _textures[count];
+      GLuint _textures[count]{}; // see deferred_upload_buffers: no garbage names
     };
 
     template<std::size_t count>

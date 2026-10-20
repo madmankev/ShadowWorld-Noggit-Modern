@@ -225,7 +225,11 @@ public:
 
 private:
 	void ensureModernWdtInProject();
-	uint32_t getHighestGUIDFromFile(const std::string& pFilename) const;
+	// When read_failures is provided, per-tile read failures are collected
+	// there instead of being logged one line per tile (a partially installed
+	// map can have hundreds of unreadable object files; callers report a
+	// single aggregated summary).
+	uint32_t getHighestGUIDFromFile(const std::string& pFilename, std::vector<std::string>* read_failures = nullptr) const;
 
   bool _uid_fix_all_in_progress = false;
 

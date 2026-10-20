@@ -11,7 +11,10 @@
 #include <util/sExtendableArray.hpp>
 
 #include <algorithm>
+#include <mutex>
+#include <set>
 #include <string>
+#include <utility>
 
 namespace
 {
@@ -130,10 +133,27 @@ liquid_layer::liquid_layer(ChunkWater* chunk
 
   if (modern_vertex_metadata)
   {
-    LogDebug << "[ModernADT][WaterAdapter] liquidId=" << _liquid_id
-             << " metadata=0x" << std::hex << info.liquid_vertex_format << std::dec
-             << " inferredVertexFormat=" << _liquid_vertex_format
-             << " min=" << _minimum << " max=" << _maximum << std::endl;
+    // One line per distinct (liquidId, vertex format) combination instead of
+    // one per water layer: an all-water modern map constructs tens of
+    // thousands of layers and the per-layer repetition buried the log
+    // (observed: 22k identical [WaterAdapter] lines for one session).
+    static std::mutex water_adapter_log_mutex;
+    static std::set<std::pair<int, int>> logged_water_adapter_combinations;
+    bool const log_this_combination = [&]
+    {
+      std::lock_guard<std::mutex> const lock(water_adapter_log_mutex);
+      return logged_water_adapter_combinations.emplace(_liquid_id, _liquid_vertex_format).second;
+    }();
+
+    if (log_this_combination)
+    {
+      LogDebug << "[ModernADT][WaterAdapter] liquidId=" << _liquid_id
+               << " metadata=0x" << std::hex << info.liquid_vertex_format << std::dec
+               << " inferredVertexFormat=" << _liquid_vertex_format
+               << " min=" << _minimum << " max=" << _maximum
+               << " (further layers with this liquidId/format combination are not"
+                  " logged individually)" << std::endl;
+    }
   }
 
   int offset = 0;

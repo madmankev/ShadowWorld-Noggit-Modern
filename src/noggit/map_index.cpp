@@ -883,7 +883,7 @@ void MapIndex::set_sort_models_by_size_class(bool state)
 }
 
 
-uint32_t MapIndex::getHighestGUIDFromFile(const std::string& pFilename) const
+uint32_t MapIndex::getHighestGUIDFromFile(const std::string& pFilename, std::vector<std::string>* read_failures) const
 {
     uint32_t highGUID = 0;
     auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
@@ -915,17 +915,31 @@ uint32_t MapIndex::getHighestGUIDFromFile(const std::string& pFilename) const
     }
     catch (std::exception const& e)
     {
-      LogError << "getHighestGUIDFromFile(): could not read the object data for \""
-               << pFilename << "\": " << e.what()
-               << " Skipping this tile; GUIDs already stored inside it are ignored."
-               << std::endl;
+      if (read_failures)
+      {
+        read_failures->push_back(pFilename + ": " + e.what());
+      }
+      else
+      {
+        LogError << "getHighestGUIDFromFile(): could not read the object data for \""
+                 << pFilename << "\": " << e.what()
+                 << " Skipping this tile; GUIDs already stored inside it are ignored."
+                 << std::endl;
+      }
       return highGUID;
     }
     catch (...)
     {
-      LogError << "getHighestGUIDFromFile(): could not read the object data for \""
-               << pFilename << "\" (unknown error). Skipping this tile; GUIDs already"
-                 " stored inside it are ignored." << std::endl;
+      if (read_failures)
+      {
+        read_failures->push_back(pFilename + ": unknown error");
+      }
+      else
+      {
+        LogError << "getHighestGUIDFromFile(): could not read the object data for \""
+                 << pFilename << "\" (unknown error). Skipping this tile; GUIDs already"
+                   " stored inside it are ignored." << std::endl;
+      }
       return highGUID;
     }
 
@@ -1531,6 +1545,11 @@ uid_fix_status MapIndex::fixUIDs (World* world, bool cancel_on_model_loading_err
 
 void MapIndex::searchMaxUID()
 {
+  // Partially installed clients can have hundreds of advertised-but-unreadable
+  // object files on one map. Collect the failures and report a single summary
+  // instead of one error line per tile (observed: 387 lines for one map).
+  std::vector<std::string> read_failures;
+
   for (int z = 0; z < 64; ++z)
   {
     for (int x = 0; x < 64; ++x)
@@ -1549,8 +1568,17 @@ void MapIndex::searchMaxUID()
         continue;
       }
 
-      highestGUID = std::max(highestGUID, getHighestGUIDFromFile(filename.str()));
+      highestGUID = std::max(highestGUID, getHighestGUIDFromFile(filename.str(), &read_failures));
     }
+  }
+
+  if (!read_failures.empty())
+  {
+    LogError << "searchMaxUID(): could not read the object data of " << read_failures.size()
+             << " tile(s) of \"" << basename << "\" (e.g. \"" << read_failures.front()
+             << "\"). Skipping those tiles; GUIDs already stored inside them are"
+                " ignored, so new placements on them may reuse existing GUIDs."
+             << std::endl;
   }
 
   saveMaxUID();

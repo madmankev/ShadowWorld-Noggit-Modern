@@ -290,9 +290,32 @@ void Noggit::DetailDoodads::generate(MapChunk* chunk, int density, NoggitRenderC
 
     DBCFile::Record record = gGroundEffectDoodadDB.getByID(id);
 
+    // The Shadowlands GroundEffectDoodad bridge (ShadowlandsMapDB2Bridge)
+    // stores "filedataid:<N>" as the legacy Filename token, because 9.2.7
+    // rows reference detail doodads by ModelFileID and carry no path. Hand
+    // that real id to the archive via the FileKey so CASC can resolve the
+    // model; without it the synthetic "world/nodxt/detail/filedataid:<N>"
+    // path is unresolvable and every ground-effect doodad fails to load
+    // ("File read failed. requested={path=..., fdid=<none>}").
+    std::string const filename = record.getString(GroundEffectDoodadDB::Filename);
+    std::uint32_t model_fdid = 0;
+    static constexpr char const fdid_prefix[] = "filedataid:";
+    if (filename.rfind(fdid_prefix, 0) == 0)
+    {
+      try
+      {
+        unsigned long long const parsed = std::stoull(filename.substr(sizeof(fdid_prefix) - 1));
+        model_fdid = static_cast<std::uint32_t>(parsed);
+      }
+      catch (std::exception const&)
+      {
+        model_fdid = 0;
+      }
+    }
+
     std::string path = "world/nodxt/detail/";
-    path += record.getString(GroundEffectDoodadDB::Filename);
-    if (path.size() > 4)
+    path += filename;
+    if (model_fdid == 0 && path.size() > 4)
     {
       std::string ext = path.substr(path.size() - 4);
       std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
@@ -304,7 +327,14 @@ void Noggit::DetailDoodads::generate(MapChunk* chunk, int density, NoggitRenderC
 
     dm.align = record.getUInt(GroundEffectDoodadDB::Flags) & 1;
     dm.index = static_cast<int>(out.models.size());
-    out.models.emplace_back(path, context);
+    if (model_fdid != 0)
+    {
+      out.models.emplace_back(BlizzardArchive::Listfile::FileKey(path, model_fdid), context);
+    }
+    else
+    {
+      out.models.emplace_back(path, context);
+    }
     return dm;
   };
 

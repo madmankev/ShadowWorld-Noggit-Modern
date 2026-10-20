@@ -17,6 +17,9 @@
 
 #include <external/tracy/Tracy.hpp>
 
+#include <mutex>
+#include <set>
+
 
 using namespace Noggit::Rendering;
 
@@ -411,7 +414,22 @@ void ModelRender::fixShaderIdBlendOverride()
     {
       if (isShadowlandsProject())
       {
-        LogDebug << "modern M2: using shader UV semantics for " << _model->_file_key.stringRepr() << std::endl;
+        // Logged once per model: this fires for every render pass of every
+        // modern M2 and repeated lines flooded the log (observed: 11k+ lines
+        // in one session) without adding information after the first hit.
+        static std::mutex uv_semantics_log_mutex;
+        static std::set<std::string> logged_uv_semantics_models;
+        bool const log_this_model = [&]
+        {
+          std::lock_guard<std::mutex> const lock(uv_semantics_log_mutex);
+          return logged_uv_semantics_models.emplace(_model->_file_key.stringRepr()).second;
+        }();
+        if (log_this_model)
+        {
+          LogDebug << "modern M2: using shader UV semantics for " << _model->_file_key.stringRepr()
+                   << " (further passes of this model are not logged individually)" << std::endl;
+        }
+
         if (pass.texture_count == 0)
           pass.texture_count = 1;
         if (pass.texture_count > 2)
@@ -1131,7 +1149,20 @@ void ModelRenderPass::initUVTypes(Model* m)
   {
     if (isShadowlandsProject())
     {
-      LogDebug << "modern M2: texture_coord_combo_index resolved from shader " << m->file_key().stringRepr() << std::endl;
+      // Logged once per model (see setupVAO): per-pass repetition produced
+      // 12k+ identical debug lines in one session.
+      static std::mutex combo_index_log_mutex;
+      static std::set<std::string> logged_combo_index_models;
+      bool const log_this_model = [&]
+      {
+        std::lock_guard<std::mutex> const lock(combo_index_log_mutex);
+        return logged_combo_index_models.emplace(m->file_key().stringRepr()).second;
+      }();
+      if (log_this_model)
+      {
+        LogDebug << "modern M2: texture_coord_combo_index resolved from shader " << m->file_key().stringRepr()
+                 << " (further passes of this model are not logged individually)" << std::endl;
+      }
 
       if (texture_count == 0)
         texture_count = 1;

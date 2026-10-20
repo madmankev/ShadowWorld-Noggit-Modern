@@ -10,6 +10,81 @@
 #include <QtGui/QOpenGLFunctions>
 #include <util/CurrentFunction.hpp>
 #include <memory>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <source_location>
+#include <string>
+
+namespace OpenGL
+{
+  // A single broken GL object (for example a buffer whose name went stale
+  // after a context change) can make the same wrapper fail on every frame,
+  // and every draw call within it. Unthrottled, that floods the log with
+  // tens of thousands of identical lines (observed: 46k+ repeated
+  // bindBuffer GL_INVALID_OPERATION entries in one session), which buries
+  // every other diagnostic and makes the log file itself a performance
+  // problem.
+  //
+  // This reporter logs the first occurrence of each distinct message
+  // immediately, then aggregates repeats and emits at most one summary per
+  // five seconds while the error keeps happening. When a caller location
+  // is available (wrappers instrumented with std::source_location), the
+  // message names the exact call site that issued the failing GL command,
+  // which is what is needed to find the object that went stale.
+  inline void report_gl_error_throttled (char const* function, std::string const& errors, std::source_location const* caller)
+  {
+    std::string message (function);
+    message += errors;
+    if (caller)
+    {
+      message += " | called from ";
+      message += caller->file_name();
+      message += ":";
+      message += std::to_string (caller->line());
+      message += " in ";
+      message += caller->function_name();
+    }
+
+    struct throttle_state
+    {
+      unsigned suppressed = 0;
+      std::chrono::steady_clock::time_point last_report{};
+    };
+
+    // Function-local statics of an inline function are shared across all
+    // translation units, so context.inl being included in many TUs still
+    // yields one throttle table per message for the whole process.
+    static std::mutex mutex;
+    static std::map<std::string, throttle_state> states;
+
+    auto const now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> const lock (mutex);
+
+    throttle_state& state = states[message];
+    bool const report_now = state.last_report == std::chrono::steady_clock::time_point{}
+                            || now - state.last_report >= std::chrono::seconds (5);
+    if (!report_now)
+    {
+      ++state.suppressed;
+      return;
+    }
+
+    if (state.suppressed)
+    {
+      LogError << message << " (+ " << state.suppressed
+               << " identical repeats since the last report; repeats are aggregated"
+                  " to keep the log readable - fix the first occurrence above)"
+               << std::endl;
+      state.suppressed = 0;
+    }
+    else
+    {
+      LogError << message << std::endl;
+    }
+    state.last_report = now;
+  }
+}
 
 
 namespace
@@ -47,6 +122,16 @@ namespace
       : verify_context_and_check_for_gl_errors (current_context, function, &verify_context_and_check_for_gl_errors::no_extra_info)
     {}
 
+    // Instrumented wrappers pass the std::source_location of the call site
+    // that issued the GL command; the error report then names that site
+    // instead of only the wrapper. (Non-template overload: wins against the
+    // ExtraInfo template constructor for pointer arguments.)
+    verify_context_and_check_for_gl_errors (QOpenGLContext* current_context, char const* function, std::source_location const* caller)
+      : verify_context_and_check_for_gl_errors (current_context, function, &verify_context_and_check_for_gl_errors::no_extra_info)
+    {
+      _caller = caller;
+    }
+
     template<typename Functions>
     Functions* version_functions() const
     {
@@ -73,6 +158,7 @@ namespace
     char const* _function;
     static std::string no_extra_info() { return {}; }
     std::function<std::string()> _extra_info;
+    std::source_location const* _caller = nullptr;
 
     ~verify_context_and_check_for_gl_errors()
     {
@@ -113,7 +199,7 @@ namespace
       {
         errors += _extra_info();
 #ifndef NOGGIT_DO_NOT_THROW_ON_OPENGL_ERRORS
-        LogError << _function << ":" + errors << std::endl;
+        OpenGL::report_gl_error_throttled (_function, ":" + errors, _caller);
 #else
         throw std::runtime_error (_function + ":" + errors);
 #endif
@@ -400,10 +486,10 @@ void OpenGL::context::activeTexture (GLenum target)
   return _current_context->functions()->glActiveTexture (target);
 }
 
-void OpenGL::context::texParameteri (GLenum target, GLenum pname, GLint param)
+void OpenGL::context::texParameteri (GLenum target, GLenum pname, GLint param, std::source_location const& caller)
 {
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
-  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION, &caller);
 #endif
   return _current_context->functions()->glTexParameteri (target, pname, param);
 }
@@ -443,10 +529,10 @@ void OpenGL::context::deleteVertexArray (GLuint count, GLuint* arrays)
 #endif
   return _4_1_core_func->glDeleteVertexArrays(count, arrays);
 }
-void OpenGL::context::bindVertexArray (GLenum array)
+void OpenGL::context::bindVertexArray (GLenum array, std::source_location const& caller)
 {
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
-  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION, &caller);
 #endif
   return _4_1_core_func->glBindVertexArray(array);
 }
@@ -464,10 +550,10 @@ void OpenGL::context::deleteBuffers (GLuint count, GLuint* buffers)
 #endif
   return _current_context->functions()->glDeleteBuffers (count, buffers);
 }
-void OpenGL::context::bindBuffer (GLenum target, GLuint buffer)
+void OpenGL::context::bindBuffer (GLenum target, GLuint buffer, std::source_location const& caller)
 {
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
-  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION, &caller);
 #endif
   return _current_context->functions()->glBindBuffer (target, buffer);
 }
@@ -492,17 +578,17 @@ GLboolean OpenGL::context::unmapBuffer (GLenum target)
 #endif
   return _4_1_core_func->glUnmapBuffer (target);
 }
-void OpenGL::context::drawElements (GLenum mode, GLsizei count, GLenum type, GLvoid const* indices)
+void OpenGL::context::drawElements (GLenum mode, GLsizei count, GLenum type, GLvoid const* indices, std::source_location const& caller)
 {
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
-  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION, &caller);
 #endif
   return _current_context->functions()->glDrawElements (mode, count, type, indices);
 }
-void OpenGL::context::drawElementsInstanced (GLenum mode, GLsizei count, GLenum type, GLvoid const* indices, GLsizei instancecount)
+void OpenGL::context::drawElementsInstanced (GLenum mode, GLsizei count, GLenum type, GLvoid const* indices, GLsizei instancecount, std::source_location const& caller)
 {
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
-  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION, &caller);
 #endif
   return _4_1_core_func->glDrawElementsInstanced (mode, count, type, indices, instancecount);
 }
@@ -969,7 +1055,7 @@ void OpenGL::context::texBuffer(GLenum target, GLenum internalformat, GLuint buf
 }
 
 template<GLenum target>
-void OpenGL::context::bufferData (GLuint buffer, GLsizeiptr size, GLvoid const* data, GLenum usage)
+void OpenGL::context::bufferData (GLuint buffer, GLsizeiptr size, GLvoid const* data, GLenum usage, std::source_location const& caller)
 {
   GLuint old = 0;
 
@@ -986,16 +1072,16 @@ void OpenGL::context::bufferData (GLuint buffer, GLsizeiptr size, GLvoid const* 
   );
 #endif
 
-  gl.bindBuffer (target, buffer);
-  bufferData (target, size, data, usage);
-  gl.bindBuffer (target, old);
+  gl.bindBuffer (target, buffer, caller);
+  bufferData (target, size, data, usage, caller);
+  gl.bindBuffer (target, old, caller);
 }
-template void OpenGL::context::bufferData<GL_ARRAY_BUFFER> (GLuint buffer, GLsizeiptr size, GLvoid const* data, GLenum usage);
-template void OpenGL::context::bufferData<GL_PIXEL_PACK_BUFFER> (GLuint buffer, GLsizeiptr size, GLvoid const* data, GLenum usage);
-template void OpenGL::context::bufferData<GL_ELEMENT_ARRAY_BUFFER> (GLuint buffer, GLsizeiptr size, GLvoid const* data, GLenum usage);
+template void OpenGL::context::bufferData<GL_ARRAY_BUFFER> (GLuint buffer, GLsizeiptr size, GLvoid const* data, GLenum usage, std::source_location const& caller);
+template void OpenGL::context::bufferData<GL_PIXEL_PACK_BUFFER> (GLuint buffer, GLsizeiptr size, GLvoid const* data, GLenum usage, std::source_location const& caller);
+template void OpenGL::context::bufferData<GL_ELEMENT_ARRAY_BUFFER> (GLuint buffer, GLsizeiptr size, GLvoid const* data, GLenum usage, std::source_location const& caller);
 
 template<GLenum target, typename T>
-void OpenGL::context::bufferData(GLuint buffer, std::vector<T> const& data, GLenum usage)
+void OpenGL::context::bufferData(GLuint buffer, std::vector<T> const& data, GLenum usage, std::source_location const& caller)
 {
 
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
@@ -1011,33 +1097,33 @@ void OpenGL::context::bufferData(GLuint buffer, std::vector<T> const& data, GLen
     , reinterpret_cast<GLint*> (&old)
   );
 
-  gl.bindBuffer(target, buffer);
-  bufferData(target, sizeof(T) * data.size(), data.data(), usage);
-  gl.bindBuffer(target, old);
+  gl.bindBuffer(target, buffer, caller);
+  bufferData(target, sizeof(T) * data.size(), data.data(), usage, caller);
+  gl.bindBuffer(target, old, caller);
 #else
-  gl.bindBuffer(target, buffer);
-  bufferData(target, sizeof(T) * data.size(), data.data(), usage);
+  gl.bindBuffer(target, buffer, caller);
+  bufferData(target, sizeof(T) * data.size(), data.data(), usage, caller);
 #endif
 
 }
 
-void OpenGL::context::bufferData (GLenum target, GLsizeiptr size, GLvoid const* data, GLenum usage)
+void OpenGL::context::bufferData (GLenum target, GLsizeiptr size, GLvoid const* data, GLenum usage, std::source_location const& caller)
 {
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
-  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION, &caller);
 #endif
   return _current_context->functions()->glBufferData (target, size, data, usage);
 }
-void OpenGL::context::bufferSubData (GLenum target, GLintptr offset, GLsizeiptr size, GLvoid const* data)
+void OpenGL::context::bufferSubData (GLenum target, GLintptr offset, GLsizeiptr size, GLvoid const* data, std::source_location const& caller)
 {
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
-  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION);
+  verify_context_and_check_for_gl_errors const _ (_current_context, NOGGIT_CURRENT_FUNCTION, &caller);
 #endif
   return _current_context->functions()->glBufferSubData (target, offset, size, data);
 }
 
 template<GLenum target>
-void OpenGL::context::bufferSubData (GLuint buffer, GLintptr offset, GLsizeiptr size, GLvoid const* data)
+void OpenGL::context::bufferSubData (GLuint buffer, GLintptr offset, GLsizeiptr size, GLvoid const* data, std::source_location const& caller)
 {
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
   GLuint old;
@@ -1051,18 +1137,18 @@ void OpenGL::context::bufferSubData (GLuint buffer, GLintptr offset, GLsizeiptr 
   : throw std::logic_error ("bad bind target")
     , reinterpret_cast<GLint*> (&old)
   );
-  gl.bindBuffer(target, buffer);
-  bufferSubData(target, offset, size, data);
-  gl.bindBuffer(target, old);
+  gl.bindBuffer(target, buffer, caller);
+  bufferSubData(target, offset, size, data, caller);
+  gl.bindBuffer(target, old, caller);
 
 #else
-  gl.bindBuffer (target, buffer);
-  bufferSubData (target, offset, size, data);
+  gl.bindBuffer (target, buffer, caller);
+  bufferSubData (target, offset, size, data, caller);
 #endif
 }
 
 template<GLenum target, typename T>
-void OpenGL::context::bufferSubData(GLuint buffer, GLintptr offset, std::vector<T> const& data)
+void OpenGL::context::bufferSubData(GLuint buffer, GLintptr offset, std::vector<T> const& data, std::source_location const& caller)
 {
 #ifndef NOGGIT_DO_NOT_CHECK_FOR_OPENGL_ERRORS
   GLuint old = 0;
@@ -1076,37 +1162,37 @@ void OpenGL::context::bufferSubData(GLuint buffer, GLintptr offset, std::vector<
                    : throw std::logic_error ("bad bind target")
     , reinterpret_cast<GLint*> (&old)
   );
-  gl.bindBuffer(target, buffer);
-  bufferSubData(target, offset, sizeof(T) * data.size(), data.data());
-  gl.bindBuffer(target, old);
+  gl.bindBuffer(target, buffer, caller);
+  bufferSubData(target, offset, sizeof(T) * data.size(), data.data(), caller);
+  gl.bindBuffer(target, old, caller);
 #else
-  gl.bindBuffer (target, buffer);
-  bufferSubData(target, offset, sizeof(T) * data.size(), data.data());
+  gl.bindBuffer (target, buffer, caller);
+  bufferSubData(target, offset, sizeof(T) * data.size(), data.data(), caller);
 #endif
 }
 
-template void OpenGL::context::bufferData<GL_ARRAY_BUFFER, float>(GLuint buffer, std::vector<float> const& data, GLenum usage);
-template void OpenGL::context::bufferData<GL_ARRAY_BUFFER, glm::vec2>(GLuint buffer, std::vector<glm::vec2> const& data, GLenum usage);
-template void OpenGL::context::bufferData<GL_ARRAY_BUFFER, glm::vec3>(GLuint buffer, std::vector<glm::vec3> const& data, GLenum usage);
-template void OpenGL::context::bufferData<GL_ARRAY_BUFFER, glm::vec4>(GLuint buffer, std::vector<glm::vec4> const& data, GLenum usage);
-template void OpenGL::context::bufferData<GL_ELEMENT_ARRAY_BUFFER, std::uint8_t>(GLuint buffer, std::vector<std::uint8_t> const& data, GLenum usage);
-template void OpenGL::context::bufferData<GL_ELEMENT_ARRAY_BUFFER, std::uint16_t>(GLuint buffer, std::vector<std::uint16_t> const& data, GLenum usage);
-template void OpenGL::context::bufferData<GL_ELEMENT_ARRAY_BUFFER, std::uint32_t>(GLuint buffer, std::vector<std::uint32_t> const& data, GLenum usage);
+template void OpenGL::context::bufferData<GL_ARRAY_BUFFER, float>(GLuint buffer, std::vector<float> const& data, GLenum usage, std::source_location const& caller);
+template void OpenGL::context::bufferData<GL_ARRAY_BUFFER, glm::vec2>(GLuint buffer, std::vector<glm::vec2> const& data, GLenum usage, std::source_location const& caller);
+template void OpenGL::context::bufferData<GL_ARRAY_BUFFER, glm::vec3>(GLuint buffer, std::vector<glm::vec3> const& data, GLenum usage, std::source_location const& caller);
+template void OpenGL::context::bufferData<GL_ARRAY_BUFFER, glm::vec4>(GLuint buffer, std::vector<glm::vec4> const& data, GLenum usage, std::source_location const& caller);
+template void OpenGL::context::bufferData<GL_ELEMENT_ARRAY_BUFFER, std::uint8_t>(GLuint buffer, std::vector<std::uint8_t> const& data, GLenum usage, std::source_location const& caller);
+template void OpenGL::context::bufferData<GL_ELEMENT_ARRAY_BUFFER, std::uint16_t>(GLuint buffer, std::vector<std::uint16_t> const& data, GLenum usage, std::source_location const& caller);
+template void OpenGL::context::bufferData<GL_ELEMENT_ARRAY_BUFFER, std::uint32_t>(GLuint buffer, std::vector<std::uint32_t> const& data, GLenum usage, std::source_location const& caller);
 
-template void OpenGL::context::bufferSubData<GL_ARRAY_BUFFER, float>(GLuint buffer, GLintptr offset, std::vector<float> const& data);
-template void OpenGL::context::bufferSubData<GL_ARRAY_BUFFER, glm::vec2>(GLuint buffer, GLintptr offset, std::vector<glm::vec2> const& data);
-template void OpenGL::context::bufferSubData<GL_ARRAY_BUFFER, glm::vec3>(GLuint buffer, GLintptr offset, std::vector<glm::vec3> const& data);
-template void OpenGL::context::bufferSubData<GL_ARRAY_BUFFER, glm::vec4>(GLuint buffer, GLintptr offset, std::vector<glm::vec4> const& data);
-template void OpenGL::context::bufferSubData<GL_ARRAY_BUFFER>(GLuint buffer, GLintptr offset, GLsizeiptr size, GLvoid const* data);
+template void OpenGL::context::bufferSubData<GL_ARRAY_BUFFER, float>(GLuint buffer, GLintptr offset, std::vector<float> const& data, std::source_location const& caller);
+template void OpenGL::context::bufferSubData<GL_ARRAY_BUFFER, glm::vec2>(GLuint buffer, GLintptr offset, std::vector<glm::vec2> const& data, std::source_location const& caller);
+template void OpenGL::context::bufferSubData<GL_ARRAY_BUFFER, glm::vec3>(GLuint buffer, GLintptr offset, std::vector<glm::vec3> const& data, std::source_location const& caller);
+template void OpenGL::context::bufferSubData<GL_ARRAY_BUFFER, glm::vec4>(GLuint buffer, GLintptr offset, std::vector<glm::vec4> const& data, std::source_location const& caller);
+template void OpenGL::context::bufferSubData<GL_ARRAY_BUFFER>(GLuint buffer, GLintptr offset, GLsizeiptr size, GLvoid const* data, std::source_location const& caller);
 
 
-void OpenGL::context::drawElements (GLenum mode, GLuint index_buffer, GLsizei count, GLenum type, GLvoid const* indices)
+void OpenGL::context::drawElements (GLenum mode, GLuint index_buffer, GLsizei count, GLenum type, GLvoid const* indices, std::source_location const& caller)
 {
   GLuint old = 0;
   gl.getIntegerv (GL_ELEMENT_ARRAY_BUFFER_BINDING, reinterpret_cast<GLint*>(&old));
-  gl.bindBuffer (GL_ELEMENT_ARRAY_BUFFER, index_buffer);
-  drawElements (mode, count, type, indices);
-  gl.bindBuffer (GL_ELEMENT_ARRAY_BUFFER, old);
+  gl.bindBuffer (GL_ELEMENT_ARRAY_BUFFER, index_buffer, caller);
+  drawElements (mode, count, type, indices, caller);
+  gl.bindBuffer (GL_ELEMENT_ARRAY_BUFFER, old, caller);
 }
 
 void OpenGL::context::drawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount)

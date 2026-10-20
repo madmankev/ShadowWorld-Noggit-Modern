@@ -3,6 +3,7 @@
 #pragma once
 #include <opengl/types.hpp>
 #include <QtGui/QOpenGLFunctions_4_1_Core>
+#include <source_location>
 
 // NOGGIT_FORCEINLINE ---------------------------------------------//
 // Macro to use in place of 'inline' to force a function to be inline
@@ -134,7 +135,7 @@ namespace OpenGL
     NOGGIT_FORCEINLINE void generateMipmap (GLenum);
     NOGGIT_FORCEINLINE void activeTexture (GLenum);
 
-    NOGGIT_FORCEINLINE void texParameteri (GLenum target, GLenum pname, GLint param);
+    NOGGIT_FORCEINLINE void texParameteri (GLenum target, GLenum pname, GLint param, std::source_location const& caller = std::source_location::current());
     NOGGIT_FORCEINLINE void texParameterf (GLenum target, GLenum pname, GLfloat param);
     NOGGIT_FORCEINLINE void texParameteriv (GLenum target, GLenum pname, GLint const* params);
     NOGGIT_FORCEINLINE void texParameterfv (GLenum target, GLenum pname, GLfloat const* params);
@@ -142,17 +143,17 @@ namespace OpenGL
 
     NOGGIT_FORCEINLINE void genVertexArrays (GLuint, GLuint*);
     NOGGIT_FORCEINLINE void deleteVertexArray (GLuint, GLuint*);
-    NOGGIT_FORCEINLINE void bindVertexArray (GLenum);
+    NOGGIT_FORCEINLINE void bindVertexArray (GLenum, std::source_location const& caller = std::source_location::current());
 
     NOGGIT_FORCEINLINE void genBuffers (GLuint, GLuint*);
     NOGGIT_FORCEINLINE void deleteBuffers (GLuint, GLuint*);
-    NOGGIT_FORCEINLINE void bindBuffer (GLenum, GLuint);
+    NOGGIT_FORCEINLINE void bindBuffer (GLenum, GLuint, std::source_location const& caller = std::source_location::current());
     NOGGIT_FORCEINLINE void bindBufferRange (GLenum, GLuint, GLuint, GLintptr, GLsizeiptr);
-    NOGGIT_FORCEINLINE void bufferData (GLenum target, GLsizeiptr size, GLvoid const* data, GLenum usage);
+    NOGGIT_FORCEINLINE void bufferData (GLenum target, GLsizeiptr size, GLvoid const* data, GLenum usage, std::source_location const& caller = std::source_location::current());
     NOGGIT_FORCEINLINE GLvoid* mapBuffer (GLenum target, GLenum access);
     NOGGIT_FORCEINLINE GLboolean unmapBuffer (GLenum);
-    NOGGIT_FORCEINLINE void drawElements (GLenum mode, GLsizei count, GLenum type, GLvoid const* indices);
-    NOGGIT_FORCEINLINE void drawElementsInstanced (GLenum mode, GLsizei count, GLenum type, GLvoid const* indices, GLsizei instancecount);
+    NOGGIT_FORCEINLINE void drawElements (GLenum mode, GLsizei count, GLenum type, GLvoid const* indices, std::source_location const& caller = std::source_location::current());
+    NOGGIT_FORCEINLINE void drawElementsInstanced (GLenum mode, GLsizei count, GLenum type, GLvoid const* indices, GLsizei instancecount, std::source_location const& caller = std::source_location::current());
     NOGGIT_FORCEINLINE void drawRangeElements (GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type, GLvoid const* indices);
 
     NOGGIT_FORCEINLINE void genPrograms (GLsizei programs, GLuint*);
@@ -235,23 +236,23 @@ namespace OpenGL
 
 
     template<GLenum target>
-    NOGGIT_FORCEINLINE void bufferData (GLuint buffer, GLsizeiptr size, GLvoid const* data, GLenum usage);
+    NOGGIT_FORCEINLINE void bufferData (GLuint buffer, GLsizeiptr size, GLvoid const* data, GLenum usage, std::source_location const& caller = std::source_location::current());
     template<GLenum target, typename T>
-    NOGGIT_FORCEINLINE void bufferData(GLuint buffer, std::vector<T> const& data, GLenum usage);
+    NOGGIT_FORCEINLINE void bufferData(GLuint buffer, std::vector<T> const& data, GLenum usage, std::source_location const& caller = std::source_location::current());
 
-    NOGGIT_FORCEINLINE void drawElements (GLenum mode, GLuint index_buffer, GLsizei count, GLenum type, GLvoid const* indices);
+    NOGGIT_FORCEINLINE void drawElements (GLenum mode, GLuint index_buffer, GLsizei count, GLenum type, GLvoid const* indices, std::source_location const& caller = std::source_location::current());
 
     NOGGIT_FORCEINLINE void drawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount);
 
     QOpenGLContext* getCurrentContext();
 
-    NOGGIT_FORCEINLINE void bufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data);
+    NOGGIT_FORCEINLINE void bufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data, std::source_location const& caller = std::source_location::current());
 
     template<GLenum target>
-    NOGGIT_FORCEINLINE void bufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const void *data);
+    NOGGIT_FORCEINLINE void bufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const void *data, std::source_location const& caller = std::source_location::current());
 
     template<GLenum target, typename T>
-    NOGGIT_FORCEINLINE void bufferSubData(GLuint buffer, GLintptr offset, const std::vector<T> &data);
+    NOGGIT_FORCEINLINE void bufferSubData(GLuint buffer, GLintptr offset, const std::vector<T> &data, std::source_location const& caller = std::source_location::current());
   };
 }
 
