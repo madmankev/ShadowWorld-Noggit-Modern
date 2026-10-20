@@ -15,7 +15,9 @@ namespace
 
   void log_skipped_gl_resource_release(char const* resource_type)
   {
-    LogError << "A " << resource_type
+    // Normal during teardown: the context goes away before every scoped
+    // resource is destroyed, and the leak at exit is harmless.
+    LogDebug << "A " << resource_type
       << " could not be released because no valid OpenGL context is current."
       << std::endl;
   }

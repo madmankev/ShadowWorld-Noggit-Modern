@@ -239,6 +239,8 @@ namespace Noggit::Database
       std::string build;
       std::string reason;
       std::string error;
+      //! Which definitions directory produced this attempt.
+      std::string source = "definitions";
       int definition_columns = 0;
       bool layout_matches = false;
       bool field_count_matches = false;
@@ -433,6 +435,7 @@ namespace Noggit::Database
     std::int32_t records_count = 0;
     std::int32_t fields_count = 0;
     std::int32_t record_size = 0;
+    std::int32_t total_fields_count = 0;
     bool parsed = false;
 
     // The offsets below mirror BlizzardDatabaseLib::Structures::WDC5Header,
@@ -462,6 +465,16 @@ namespace Noggit::Database
     else if (header.magic == "WDC3" || header.magic == "WDC2" || header.magic == "WDC1")
     {
       parsed = parse_at(HeaderOffsets::magic_size, true);
+
+      // total_field_count sits at file offset 44 in WDC2/WDC3 and 48 in WDC1
+      // (https://wowdev.wiki/DB2); it includes the columns that live only in
+      // the common data block, which is exactly what a .dbd definition lists.
+      auto const total_offset = HeaderOffsets::magic_size
+        + (header.magic == "WDC1" ? 44 : 40);
+      if (!readField(data, size, total_offset, total_fields_count)
+          || total_fields_count < fields_count
+          || total_fields_count > fields_count + 64)
+        total_fields_count = 0;
     }
     else if (header.magic == "WDBC")
     {
@@ -474,6 +487,7 @@ namespace Noggit::Database
     header.layout_hash = layout_hash;
     header.records_count = records_count;
     header.fields_count = fields_count;
+    header.total_fields_count = total_fields_count;
     header.record_size = record_size;
     header.valid = fields_count > 0 && fields_count < 4096 && records_count >= 0 && record_size >= 0;
 
@@ -542,7 +556,8 @@ namespace Noggit::Database
       }
 
       // tier 1 - a block describing the same number of columns
-      if (header.valid && header.fields_count > 0 && block.field_count == header.fields_count)
+      if (header.valid && header.fields_count > 0
+          && block.field_count == header.effective_fields_count())
       {
         consider(index, block, 1);
         continue;
@@ -666,42 +681,72 @@ namespace Noggit::Database
     };
 
     std::size_t constexpr max_attempts = 4;
-    auto const candidates = orderCandidateBuilds(blocks, header, context.client_build, max_attempts);
 
     std::vector<SubstitutionAttempt> attempts;
-    for (auto const& candidate_build : candidates)
+
+    auto const try_definitions = [&](std::vector<DefinitionBlock> const& candidate_blocks,
+                                     std::string const& definitions_directory,
+                                     char const* source)
     {
-      SubstitutionAttempt attempt;
-      attempt.build = candidate_build;
-
-      attempt.layout_matches = blockDeclaresLayout(blocks, candidate_build, header.layout_hash);
-
-      try
+      auto const candidates = orderCandidateBuilds(candidate_blocks, header, context.client_build,
+                                                   max_attempts);
+      for (auto const& candidate_build : candidates)
       {
-        auto& database = fallbackDatabase(context.definitions_directory, candidate_build,
-                                          context.prefer_db2);
-        auto& table = database.LoadTable(table_name, cached_callback);
+        SubstitutionAttempt attempt;
+        attempt.build = candidate_build;
+        attempt.source = source;
 
-        attempt.table = &table;
-        attempt.definition_columns =
-          static_cast<int>(table.GetRecordDefinition().ColumnDefinitions.size());
-        attempt.field_count_matches = attempt.definition_columns == header.fields_count;
-        attempt.accepted = attempt.layout_matches || attempt.field_count_matches;
-        attempt.reason = attempt.layout_matches
-                           ? "layout " + hexText(header.layout_hash)
-                           : std::to_string(header.fields_count) + " matching columns";
+        attempt.layout_matches = blockDeclaresLayout(candidate_blocks, candidate_build,
+                                                      header.layout_hash);
+
+        try
+        {
+          auto& database = fallbackDatabase(definitions_directory, candidate_build,
+                                            context.prefer_db2);
+          auto& table = database.LoadTable(table_name, cached_callback);
+
+          attempt.table = &table;
+          attempt.definition_columns =
+            static_cast<int>(table.GetRecordDefinition().ColumnDefinitions.size());
+          attempt.field_count_matches = attempt.definition_columns == header.effective_fields_count();
+          attempt.accepted = attempt.layout_matches || attempt.field_count_matches;
+          attempt.reason = attempt.layout_matches
+                             ? "layout " + hexText(header.layout_hash)
+                             : std::to_string(header.effective_fields_count()) + " matching columns";
+        }
+        catch (std::exception const& exception)
+        {
+          attempt.error = exception.what();
+          LogDebug << log_context << " " << table_name << ": " << source << " definition for build "
+                   << candidate_build << " did not load (" << exception.what() << ")" << std::endl;
+        }
+
+        attempts.push_back(attempt);
+
+        if (attempt.accepted)
+          return true;
       }
-      catch (std::exception const& exception)
+      return false;
+    };
+
+    bool const accepted = try_definitions(blocks, context.definitions_directory, "definitions");
+
+    // The pinned definition set can lag behind the client on legacy tables
+    // (sound, music, weather, wind, zone light, map difficulty): the client
+    // ships layouts no block in the primary set describes. A sibling
+    // "definitions-supplement" directory, carried in this repository from the
+    // canonical wowdev/WoWDBDefs set, covers exactly those layouts.
+    if (!accepted)
+    {
+      auto const supplement_file = std::filesystem::path(context.definitions_directory).parent_path()
+        / "definitions-supplement" / (table_name + ".dbd");
+      std::error_code unused;
+      if (std::filesystem::exists(supplement_file, unused))
       {
-        attempt.error = exception.what();
-        LogDebug << log_context << " " << table_name << ": definition for build " << candidate_build
-                 << " did not load (" << exception.what() << ")" << std::endl;
+        auto const supplement_blocks = parseDefinitionBlocks(supplement_file);
+        try_definitions(supplement_blocks, supplement_file.parent_path().generic_string(),
+                        "definitions-supplement");
       }
-
-      attempts.push_back(attempt);
-
-      if (attempt.accepted)
-        break;
     }
 
     SubstitutionAttempt const* winner = nullptr;
@@ -717,9 +762,9 @@ namespace Noggit::Database
       std::ostringstream message;
       message << log_context << " " << table_name << ".db2: client build " << context.client_build
               << " is newer than the definitions in " << context.definitions_directory
-              << ". The file has layout " << hexText(header.layout_hash) << ", " << header.fields_count
-              << " columns and " << header.records_count << " records, but none of the definition"
-              << " blocks describes it:";
+              << ". The file has layout " << hexText(header.layout_hash) << ", "
+              << header.effective_fields_count() << " columns and " << header.records_count
+              << " records, but none of the definition blocks describes it:";
 
       for (auto const& attempt : attempts)
       {
@@ -768,8 +813,8 @@ namespace Noggit::Database
     {
       Log << "[DB2Definitions] " << table_name << ".db2: client build " << context.client_build
           << " is not described by " << dbd_file.generic_string() << ", using the " << winner->build
-          << " definition instead (" << winner->reason << ", " << winner->table->RecordCount()
-          << " records)" << std::endl;
+          << " definition from " << winner->source << " instead (" << winner->reason << ", "
+          << winner->table->RecordCount() << " records)" << std::endl;
     }
 
     return *winner->table;

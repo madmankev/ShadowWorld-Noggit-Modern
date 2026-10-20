@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <string>
+
 #include <QWidget>
 #include <glm/vec3.hpp>
 
@@ -45,6 +47,8 @@ namespace Noggit
 
     protected:
       virtual void paintEvent (QPaintEvent* paint_event) override;
+      void paint_minimap_contents ();
+      static void report_paint_failure (std::string const& reason);
       virtual void mouseDoubleClickEvent (QMouseEvent*) override;
       virtual void mouseMoveEvent(QMouseEvent*) override;
       virtual void mousePressEvent(QMouseEvent* event) override;

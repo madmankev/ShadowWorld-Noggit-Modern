@@ -158,3 +158,25 @@ Include `log.txt`, the project's client version (Shadowlands 9.2.7, Retail,
 Forever), the client build Noggit detected (`Detected modern client build: ...`
 near the top of the log), and what you did last. The first 40 lines of the log
 identify the Noggit version, the graphics driver, and the project.
+
+## Legacy tables on 9.2.7: the definitions-supplement directory
+
+The pinned ShadowWorld definitions set does not carry the Shadowlands-era
+layouts of a few legacy tables (MapDifficulty, SoundKit,
+SoundProviderPreferences, TerrainType, ZoneMusic, ZoneIntroMusicTable,
+WindSettings, WeatherXParticulate, ZoneLightPoint, LiquidMaterial). Their
+9.2.7 client files are WDC3, whose header `field_count` only counts the
+columns packed into the record; the complete column list - the one a `.dbd`
+block describes - is `total_field_count`, and the definition fallback now
+compares against that.
+
+`dist/definitions-supplement/` carries the canonical wowdev/WoWDBDefs blocks
+for exactly those tables and is copied next to the executable as
+`definitions-supplement/` at build time. When no block in the primary
+definitions describes a client file, the fallback consults that sibling
+directory and still accepts a block only when it declares the file's layout
+hash or its exact column count, so a wrong definition can never slip in.
+The log names the source that won:
+
+    [DB2Definitions] MapDifficulty.db2: ... using the 9.2.7.45745 definition
+    from definitions-supplement instead (layout 43E2A417, ... records)

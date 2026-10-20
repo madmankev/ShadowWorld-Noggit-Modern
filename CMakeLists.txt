@@ -444,6 +444,13 @@ add_custom_command(TARGET noggit POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E remove -f 
         $<TARGET_FILE_DIR:noggit>/definitions/.git)
 
+#add distribution supplemental definitions (canonical wowdev/WoWDBDefs blocks
+#for legacy tables whose layouts the pinned definitions set does not carry)
+add_custom_command(TARGET noggit POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${PROJECT_SOURCE_DIR}/dist/definitions-supplement"
+        $<TARGET_FILE_DIR:noggit>/definitions-supplement)
+
 # add distribution noggit definitions tables
 # TODO : git repo
 add_custom_command(TARGET noggit POST_BUILD

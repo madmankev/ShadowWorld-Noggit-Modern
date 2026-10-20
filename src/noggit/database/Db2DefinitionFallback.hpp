@@ -38,6 +38,15 @@ namespace Noggit::Database
     std::string magic;
     std::uint32_t layout_hash = 0;
     int fields_count = 0;
+    //! WDC1-3 only: field_count plus the columns carried solely in the common
+    //! data block. This is the count a .dbd definition lists, while
+    //! fields_count only covers the columns packed into the record.
+    int total_fields_count = 0;
+
+    int effective_fields_count() const
+    {
+      return total_fields_count > 0 ? total_fields_count : fields_count;
+    }
     int records_count = 0;
     int record_size = 0;
   };

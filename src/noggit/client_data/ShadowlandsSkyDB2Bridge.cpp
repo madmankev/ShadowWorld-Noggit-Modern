@@ -393,11 +393,11 @@ namespace Noggit::ClientData
     }
     catch (std::exception const& e)
     {
-      LogError << "[ModernDB2][Sky] Failed loading Shadowlands sky DB2 data: " << e.what() << std::endl;
+      LogDebug << "[ModernDB2][Sky] Failed loading Shadowlands sky DB2 data: " << e.what() << std::endl;
     }
     catch (...)
     {
-      LogError << "[ModernDB2][Sky] Failed loading Shadowlands sky DB2 data: unknown error." << std::endl;
+      LogDebug << "[ModernDB2][Sky] Failed loading Shadowlands sky DB2 data: unknown error." << std::endl;
     }
     return false;
   }

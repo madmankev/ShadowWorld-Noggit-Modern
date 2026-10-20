@@ -1,5 +1,6 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
+#include <noggit/Log.h>
 #include <noggit/TextureManager.h>
 #include <noggit/ui/HelperModels.h>
 #include <noggit/ui/ObjectEditor.h>
@@ -25,7 +26,17 @@ namespace Noggit
       layout->addLayout (bottom_layout);
 
       auto icon (new QLabel (this));
-      icon->setPixmap (*BLPRenderer::getInstance().render_blp_to_pixmap ("interface/icons/inv_misc_enggizmos_swissarmy.blp"));
+      try
+      {
+        // Modern clients resolve icons through the listfile; a path-only
+        // lookup can fail, and the window is usable without its decoration.
+        if (auto const* pixmap = BLPRenderer::getInstance().render_blp_to_pixmap ("interface/icons/inv_misc_enggizmos_swissarmy.blp"))
+          icon->setPixmap (*pixmap);
+      }
+      catch (std::exception const& exception)
+      {
+        LogDebug << "Helper models window icon skipped: " << exception.what () << std::endl;
+      }
       top_layout->addWidget (icon);
       top_layout->addWidget (new QLabel ("Select a model to add.\nYou should select a chunk first.", this));
 

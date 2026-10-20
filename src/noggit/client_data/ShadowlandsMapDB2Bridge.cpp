@@ -126,7 +126,9 @@ namespace
     }
     catch (std::exception const& e)
     {
-      LogError << "[ModernDB2][Map] Failed " << name << ".db2: " << e.what() << std::endl;
+      // The definition fallback already reported this table with guidance;
+      // repeating it per bridge call only doubles the noise.
+      LogDebug << "[ModernDB2][Map] Failed " << name << ".db2: " << e.what() << std::endl;
       return nullptr;
     }
   }

@@ -3,6 +3,8 @@
 #include <noggit/Camera.hpp>
 #include <noggit/Sky.h>
 #include <noggit/ui/minimap_widget.hpp>
+
+#include <noggit/Log.h>
 #include <noggit/World.h>
 
 #include <QApplication>
@@ -173,6 +175,25 @@ namespace Noggit
     //! \todo Only redraw stuff as told in event.
     // called by _minimap->update()
     // \todo : massive performance drop after clicking the minimap once until moving cursor out of frame, paintEvent gets called repeatidly
+    void minimap_widget::report_paint_failure (std::string const& reason)
+    {
+      // A repaint that throws does so on every pass until the state changes;
+      // one line per session is enough to chase it.
+      static bool reported = false;
+      if (reported)
+      {
+        return;
+      }
+      reported = true;
+
+      LogError << "[Minimap] Repaint aborted: " << reason
+               << " (selection=" << (_use_selection ? "on" : "off")
+               << ", selection buffer="
+               << (_selected_tiles ? std::to_string (_selected_tiles->size ()) : std::string ("null"))
+               << " entries). The minimap stays blank until a repaint succeeds."
+               << std::endl;
+    }
+
     void minimap_widget::paintEvent (QPaintEvent* paint_event)
     {
       // Everything below dereferences _world. The wizard clears it when a map
@@ -182,6 +203,26 @@ namespace Noggit
       {
         return;
       }
+
+      // Whatever the map state, a throwing repaint must not escape into the
+      // event loop four times a second; report it once and leave the widget
+      // blank instead.
+      try
+      {
+        paint_minimap_contents ();
+      }
+      catch (std::exception const& exception)
+      {
+        report_paint_failure (exception.what ());
+      }
+      catch (...)
+      {
+        report_paint_failure ("an exception outside the std::exception family");
+      }
+    }
+
+    void minimap_widget::paint_minimap_contents ()
+    {
 
         /*
         auto rectangle = paint_event->rect();
@@ -264,7 +305,9 @@ namespace Noggit
                                  );
               }
               
-              if (_use_selection && _selected_tiles->at(64 * i + j))
+              if (_use_selection && _selected_tiles
+                  && static_cast<std::size_t> (64 * i + j) < _selected_tiles->size ()
+                  && (*_selected_tiles)[64 * i + j])
               {
                 painter.setPen(QColor::fromRgbF(1.0f, 0.0f, 0.0f, 1.f));
                 painter.drawRect ( QRect ( tile_size * i + 1

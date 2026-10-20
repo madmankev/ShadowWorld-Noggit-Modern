@@ -129,7 +129,7 @@ namespace OpenGL
       }
       else
       {
-        LogError << "A shader program could not be released because no valid OpenGL context is current." << std::endl;
+        LogDebug << "A shader program could not be released because no valid OpenGL context is current." << std::endl;
       }
     }
   }
