@@ -7,10 +7,12 @@
 #include <noggit/SceneObject.hpp>
 #include <noggit/TileIndex.hpp>
 #include <noggit/ContextObject.hpp>
+#include <noggit/formats/wdt/WdtReader.hpp>
 
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 
 enum class uid_fix_status
@@ -233,7 +235,7 @@ public:
   int const _map_id;
   // std::unordered_map<std::string, std::unordered_map<std::string, std::string>> _minimap_md5translate;
   std::string globalWMOName;
-  ENTRY_MODF wmoEntry;
+  ENTRY_MODF wmoEntry{};
 public:
   // reloadable settings
   void setLoadingRadius(int value);
@@ -261,6 +263,14 @@ private:
   uint32_t highestGUID;
 
   MPHD mphd;
+
+  //! Raw image of the WDT as loaded, plus its parse result. Modern WDTs
+  //! carry chunks the legacy writer cannot reproduce (MAID FileDataIDs,
+  //! MANM, the MPHD FileDataID fields, MODF-only global WMOs), so saving a
+  //! modern map patches the MPHD flags word and the MAIN tile flags inside
+  //! this image and preserves every other chunk byte for byte.
+  std::vector<std::uint8_t> _rawWdt;
+  Noggit::Formats::WDT::ParsedWdt _parsedWdt;
 
   // Holding all MapTiles there can be in a World.
   MapTileEntry mTiles[64][64];

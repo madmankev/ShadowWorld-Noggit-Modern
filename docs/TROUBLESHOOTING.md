@@ -122,15 +122,21 @@ Full design, the 9.2.7 field list, and the validation rules are documented in
 ## "wdl ... skipped N unsupported chunks"
 
 Modern `.wdl` files (the low-detail height map Noggit uses for the minimap)
-contain chunks that Noggit does not need: M2 and WMO placements (`MLDD`, `MLDX`,
-`MLMD`, `MLMX`), sky scenes (`MSSN`, `MSSC`, `MSSO`, `MSSF`), ocean and file-data
-chunks (`MAOE`, `MAID`, `MWAT`). They are skipped and reported once per file at
-`[Debug]` level:
+contain chunks that Noggit does not need for the height data: M2 placements
+(`MLDD`, `MLDX`), sky scenes (`MSSN`, `MSSC`, `MSSO`, `MSSF`), ocean and
+file-data chunks (`MAOE`, `MAID`, `MWAT`). They are skipped and reported once
+per file at `[Debug]` level:
 
 ``` text
-wdl "World\Maps\TwilightHighlands\TwilightHighlands.wdl": skipped 492 unsupported
-chunks (MLDD x123, MLDX x123, MLMD x123, MLMX x123)
+wdl "World\Maps\TwilightHighlands\TwilightHighlands.wdl": skipped 369 unsupported
+chunks (MLDD x123, MLDX x123, MLMB x123)
 ```
+
+Since the modern WDT/WDL parsing rework, the horizon WMO placements (`MLMD`)
+and their bounds (`MLMX`) are no longer skipped: Noggit resolves their
+FileDataIDs through the CASC listfile and feeds them into the horizon WMO
+lists - look for `[WDL Load] ... loaded N horizon WMO placement(s) from MLMD`.
+See [MODERN_WDT_WDL.md](MODERN_WDT_WDL.md).
 
 The height data (`MARE`/`MAHO`, reached through `MAOF`) is still read, so the
 minimap is unaffected. A chunk Noggit does not recognise at all is reported
@@ -211,6 +217,51 @@ What the other messages mean:
 
 Details and the design are documented in
 [`MODERN_ADT_WRITER.md`](MODERN_ADT_WRITER.md).
+
+## Modern map metadata: "[WDT Load]" / "[WDT Save]" / "[WDL Load]" / "[WDL Save]" messages
+
+Noggit now reads `.wdt` and `.wdl` files with a version-aware chunk walker
+instead of the old fixed-order reader, and it validates every chunk it looks
+at. All findings are tagged, with the map file name, so you can grep the log:
+
+``` text
+[WDT Load] World\Maps\TwilightHighlands\TwilightHighlands.wdt: skipped 1 known
+but unused chunk(s) (MANM x1)
+[WDL Load] "World\Maps\TwilightHighlands\TwilightHighlands.wdl": loaded 41
+horizon WMO placement(s) from MLMD (17 unique model(s))
+[WDL Save] Patched 212 MARE tile(s) in the modern WDL "..."; all other chunks
+preserved byte for byte.
+```
+
+`[Debug]`-level lines (skipped/unknown chunk summaries, resolved FileDataIDs)
+are informational. The lines that matter:
+
+- `global WMO FileDataID N has no listfile entry` - the WDT announces a global
+  WMO (WMO-only map) whose FileDataID your listfile cannot name. Check that
+  the project's `listfile.csv` is complete for your client build.
+- `MPHD flag 0x200 ... is set but the WDT has no MAID chunk` - the map wants
+  FileDataID-based ADT loading but carries no MAID table; Noggit falls back
+  to name-based lookups.
+- `N tile(s) flagged as existing in MAIN have no root ADT FileDataID in MAID`
+  - usually tiles created inside Noggit. They work in Noggit, but the modern
+  client needs MAID registration before it can see them (see
+  [MODERN_MAP_REGISTRATION.md](MODERN_MAP_REGISTRATION.md)).
+- `WDT did not parse cleanly; continuing with the recovered MPHD/MAIN data`
+  and `in-place patching failed; falling back to the legacy WDT writer` - the
+  source file is corrupt or truncated. Saving will rebuild a basic WDT and
+  modern-only chunks (MAID/MANM/...) will be lost; restore the file from a
+  backup when you can.
+- `[WDL Save] N horizon tile(s) have no MARE slot in the source WDL` - the
+  map gained tiles that the original WDL has no height slot for; their
+  horizon heights cannot be persisted without rebuilding the whole file,
+  which would destroy the modern chunks, so Noggit keeps the file intact.
+- `MAOF/MARE/MAHO ... unexpected size ... tile skipped` - the WDL height data
+  is damaged; the affected tiles fall back to the tile-index minimap.
+
+Modern saves never rebuild these files from scratch: the loaded image is
+patched in place (MPHD flags + MAIN tile flags for the WDT, MARE/MAHO height
+payloads for the WDL), so chunks Noggit does not understand survive saving
+byte for byte. Full details in [MODERN_WDT_WDL.md](MODERN_WDT_WDL.md).
 
 ## Reporting a problem
 

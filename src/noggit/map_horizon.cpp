@@ -12,15 +12,18 @@
 #include <opengl/context.hpp>
 #include <opengl/context.inl>
 #include <noggit/Misc.h>
+#include <noggit/formats/wdl/WdlObjects.hpp>
 
 #include <algorithm>
 #include <bitset>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <map>
 #include <set>
 #include <sstream>
+#include <vector>
 
 struct color
 {
@@ -146,6 +149,12 @@ map_horizon::map_horizon(const std::string& basename, World * const world)
 
   BlizzardArchive::ClientFile wdl_file (_filename, Application::NoggitApplication::instance()->clientData());
 
+  // Keep the raw image plus the MARE/MAHO payload offsets so modern WDLs
+  // can be saved by patching heights in place instead of being rebuilt with
+  // the legacy writer (which drops the ML*/sky scene/ocean chunks).
+  _raw_wdl.assign(wdl_file.getBuffer(), wdl_file.getBuffer() + wdl_file.getSize());
+  _wdl_loaded_from_disk = true;
+
   uint32_t fourcc;
   uint32_t size;
 
@@ -154,6 +163,11 @@ map_horizon::map_horizon(const std::string& basename, World * const world)
   // chunks that are valid, but unused, and chunks that are not valid at all
   std::map<uint32_t, unsigned int> skipped_chunks;
   std::set<uint32_t> unknown_chunks;
+
+  // Legion+ horizon WMO placements (MLMD) and their bounds (MLMX); parsed
+  // into mWMOFilenames/lWMOInstances after the chunk walk.
+  std::vector<uint8_t> mlmd_payload;
+  std::vector<uint8_t> mlmx_payload;
 
   try
   {
@@ -166,9 +180,14 @@ map_horizon::map_horizon(const std::string& basename, World * const world)
     {
       case 'MVER':
       {
-        uint32_t version;
+        uint32_t version = 0;
         wdl_file.read(&version, 4);
-        assert(size == 4 && version == 18);
+        if (size != 4 || version != 18)
+        {
+          LogError << "[WDL Load] \"" << _filename << "\": unexpected WDL version "
+                   << version << " (MVER chunk size " << size << ", expected 18/4)"
+                   << std::endl;
+        }
 
         break;
       }
@@ -209,7 +228,14 @@ map_horizon::map_horizon(const std::string& basename, World * const world)
       }
       case 'MAOF':
       {
-        assert(size == 64 * 64 * sizeof(uint32_t));
+        if (size != 64 * 64 * sizeof(uint32_t))
+        {
+          LogError << "[WDL Load] \"" << _filename << "\": MAOF chunk has unexpected size "
+                   << size << " (expected " << 64 * 64 * sizeof(uint32_t)
+                   << "); falling back to tile index minimap" << std::endl;
+          done = true;
+          break;
+        }
 
         uint32_t mare_offsets[64][64];
         wdl_file.read(mare_offsets, 64 * 64 * sizeof(uint32_t));
@@ -224,33 +250,96 @@ map_horizon::map_horizon(const std::string& basename, World * const world)
               continue;
             }
 
+            if (mare_offsets[y][x] + 8 > wdl_file.getSize())
+            {
+              LogError << "[WDL Load] \"" << _filename << "\": MAOF entry (" << x << "," << y
+                       << ") points past the end of the file; tile skipped" << std::endl;
+              continue;
+            }
+
             wdl_file.seek(mare_offsets[y][x]);
             wdl_file.read(&fourcc, 4);
             wdl_file.read(&size, 4);
 
-            assert(fourcc == 'MARE');
-            assert(size == 0x442);
+            if (fourcc != 'MARE')
+            {
+              LogError << "[WDL Load] \"" << _filename << "\": MAOF entry (" << x << "," << y
+                       << ") points at " << wdl_chunk_name(fourcc)
+                       << " instead of MARE; tile skipped" << std::endl;
+              continue;
+            }
 
+            if (size != 0x442)
+            {
+              LogError << "[WDL Load] \"" << _filename << "\": MARE chunk at offset "
+                       << mare_offsets[y][x] << " has unexpected size " << size
+                       << " (expected 1090); tile skipped" << std::endl;
+              continue;
+            }
+
+            if (mare_offsets[y][x] + 8 + size > wdl_file.getSize())
+            {
+              LogError << "[WDL Load] \"" << _filename << "\": MARE chunk at offset "
+                       << mare_offsets[y][x] << " extends past the end of the file; tile skipped"
+                       << std::endl;
+              continue;
+            }
+
+            _mare_payload_offsets[y * 64 + x] = static_cast<uint32_t>(wdl_file.getPos());
             _tiles[y][x] = std::make_unique<map_horizon_tile>();
 
-            //! \todo There also is MAHO giving holes into this heightmap.
             wdl_file.read(_tiles[y][x]->height_17, 17 * 17 * sizeof(int16_t));
             wdl_file.read(_tiles[y][x]->height_16, 16 * 16 * sizeof(int16_t));
 
-            if (wdl_file.getPos() < wdl_file.getSize())
+            if (wdl_file.getPos() + 8 <= wdl_file.getSize())
             {
+                auto const pos_before_maho = wdl_file.getPos();
                 wdl_file.read(&fourcc, 4);
                 if (fourcc == 'MAHO')
                 {
                     wdl_file.read(&size, 4);
-                    assert(size == 0x20);
-                    wdl_file.read(_tiles[y][x]->holes, 16 * sizeof(int16_t));
+                    if (size == 0x20 && wdl_file.getPos() + size <= wdl_file.getSize())
+                    {
+                        _maho_payload_offsets[y * 64 + x] = static_cast<uint32_t>(wdl_file.getPos());
+                        wdl_file.read(_tiles[y][x]->holes, 16 * sizeof(int16_t));
+                    }
+                    else
+                    {
+                        LogError << "[WDL Load] \"" << _filename << "\": MAHO chunk for tile ("
+                                 << x << "," << y << ") has unexpected size " << size
+                                 << " (expected 32); hole masks skipped" << std::endl;
+                    }
+                }
+                else
+                {
+                    // Not a MAHO chunk - restore the position, the 4 bytes
+                    // belong to whatever follows this tile.
+                    wdl_file.seek(pos_before_maho);
                 }
             }
 
           }
         }
         done = true;
+        break;
+      }
+      case 'MLMD':
+      case 'MLMX':
+      {
+        // Legion+ horizon WMO placements (MLMD) and their bounds (MLMX),
+        // referencing models by FileDataID. Captured here, converted into
+        // mWMOFilenames/lWMOInstances after the chunk walk.
+        if (wdl_file.getPos() > wdl_file.getSize() || size > wdl_file.getSize() - wdl_file.getPos())
+        {
+          LogError << "[WDL Load] invalid " << wdl_chunk_name(fourcc)
+                   << " chunk size in \"" << _filename << "\", skipping rest of file"
+                   << std::endl;
+          done = true;
+          break;
+        }
+        auto const* ml_payload = reinterpret_cast<uint8_t const*>(wdl_file.getPointer());
+        (fourcc == 'MLMD' ? mlmd_payload : mlmx_payload).assign(ml_payload, ml_payload + size);
+        wdl_file.seekRelative(size);
         break;
       }
       default:
@@ -265,8 +354,6 @@ map_horizon::map_horizon(const std::string& basename, World * const world)
           case 'MLDX': // M2 bounds
           case 'MLDL': // M2 lod
           case 'MLDF': // M2 fade ranges
-          case 'MLMD': // WMO placements
-          case 'MLMX': // WMO bounds
           case 'MLMB': // WMO blend/mask
           case 'MSSN': // sky scene
           case 'MSSC': // sky scene condition
@@ -329,6 +416,60 @@ map_horizon::map_horizon(const std::string& basename, World * const world)
     LogDebug << "wdl \"" << _filename << "\": skipped " << total
              << " unsupported chunk" << (total == 1 ? "" : "s") << " (" << summary.str() << ")"
              << std::endl;
+  }
+
+  // - modern horizon WMOs (Legion+ MLMD/MLMX) --------------
+  if (!mlmd_payload.empty())
+  {
+    auto* client_data = Application::NoggitApplication::instance()->clientData();
+    BlizzardArchive::Listfile::Listfile const* listfile = client_data->listfile();
+
+    auto objects = Noggit::Formats::WDL::parseModernWdlObjects(
+      mlmd_payload, mlmx_payload,
+      [listfile](std::uint32_t file_data_id)
+      {
+        return listfile ? listfile->getPath(file_data_id) : std::string();
+      });
+
+    for (auto const& issue : objects.issues)
+    {
+      switch (issue.severity)
+      {
+        case Noggit::Formats::WDL::IssueSeverity::error:
+          LogError << "[WDL Load] \"" << _filename << "\": " << issue.message << std::endl;
+          break;
+        case Noggit::Formats::WDL::IssueSeverity::warning:
+          Log << "[WDL Load] \"" << _filename << "\": " << issue.message << std::endl;
+          break;
+        case Noggit::Formats::WDL::IssueSeverity::info:
+          LogDebug << "[WDL Load] \"" << _filename << "\": " << issue.message << std::endl;
+          break;
+      }
+    }
+
+    if (!objects.instances.empty())
+    {
+      auto const name_base = static_cast<uint32_t>(mWMOFilenames.size());
+      for (auto const& object_name : objects.filenames)
+      {
+        mWMOFilenames.push_back(
+          BlizzardArchive::ClientData::normalizeFilenameInternal(object_name));
+      }
+      for (auto& instance : objects.instances)
+      {
+        instance.nameID += name_base;
+        lWMOInstances.push_back(instance);
+      }
+
+      Log << "[WDL Load] \"" << _filename << "\": loaded " << objects.instances.size()
+          << " horizon WMO placement(s) from MLMD (" << objects.filenames.size()
+          << " unique model(s))" << std::endl;
+    }
+    if (objects.skipped_count > 0)
+    {
+      Log << "[WDL Load] \"" << _filename << "\": skipped " << objects.skipped_count
+          << " horizon WMO placement(s) with unresolvable FileDataIDs" << std::endl;
+    }
   }
 
   constexpr bool _load_models = true;
@@ -501,6 +642,124 @@ void map_horizon::save_wdl(World* world, bool regenerate)
     std::stringstream filename;
     filename << "World\\Maps\\" << world->basename << "\\" << world->basename << ".wdl";
     //Log << "Saving WDL \"" << filename << "\"." << std::endl;
+
+    auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
+    bool const modern_client =
+      client_data->version() != BlizzardArchive::ClientVersion::WOTLK;
+
+    // Rebuilding the file with the legacy writer below drops every modern
+    // chunk (MLDD/MLDX/MLMD/MLMX placements, MSSN/MSSC/MSSO sky scenes,
+    // MAOE ocean data, ...) and would leave the modern client with a
+    // broken WDL. When a modern WDL was loaded, patch the MARE/MAHO
+    // payloads inside the loaded image instead and preserve all other
+    // chunks byte for byte.
+    if (modern_client && _wdl_loaded_from_disk && !_raw_wdl.empty())
+    {
+        if (regenerate)
+        {
+            // Same pre-pass the legacy writer uses: touch every existing
+            // tile once so _tiles holds fresh heights.
+            for (int y = 0; y < 64; ++y)
+            {
+                for (int x = 0; x < 64; ++x)
+                {
+                    TileIndex index(x, y);
+                    if (!world->mapIndex.hasTile(index))
+                        continue;
+
+                    bool unload = !world->mapIndex.tileLoaded(index)
+                       && !world->mapIndex.tileAwaitingLoading(index);
+                    MapTile* mTile = world->mapIndex.loadTile(index, false, false, false);
+                    if (!mTile)
+                        continue;
+
+                    mTile->wait_until_loaded();
+                    update_horizon_tile(mTile);
+                    if (unload)
+                        world->mapIndex.unloadTile(index);
+                }
+            }
+        }
+
+        std::vector<char> patched(_raw_wdl.begin(), _raw_wdl.end());
+
+        constexpr std::size_t height_17_bytes = 17 * 17 * sizeof(int16_t);
+        constexpr std::size_t height_16_bytes = 16 * 16 * sizeof(int16_t);
+        constexpr std::size_t holes_bytes = 16 * sizeof(int16_t);
+
+        unsigned int patched_tiles = 0;
+        unsigned int missing_slots = 0;
+
+        for (std::size_t y = 0; y < 64; ++y)
+        {
+            for (std::size_t x = 0; x < 64; ++x)
+            {
+                if (!_tiles[y][x])
+                    continue;
+
+                auto const mare_offset = _mare_payload_offsets[y * 64 + x];
+                if (!mare_offset)
+                {
+                    // The source WDL has no MARE slot for this tile, so its
+                    // horizon data cannot be persisted without rebuilding
+                    // the whole file (which would destroy the modern chunks).
+                    ++missing_slots;
+                    continue;
+                }
+
+                if (mare_offset + height_17_bytes + height_16_bytes > patched.size())
+                {
+                    LogError << "[WDL Save] MARE payload for tile (" << x << "," << y
+                             << ") lies outside the WDL image; tile not updated" << std::endl;
+                    continue;
+                }
+
+                std::memcpy(patched.data() + mare_offset,
+                            _tiles[y][x]->height_17, height_17_bytes);
+                std::memcpy(patched.data() + mare_offset + height_17_bytes,
+                            _tiles[y][x]->height_16, height_16_bytes);
+
+                auto const maho_offset = _maho_payload_offsets[y * 64 + x];
+                if (maho_offset && maho_offset + holes_bytes <= patched.size())
+                {
+                    std::memcpy(patched.data() + maho_offset,
+                                _tiles[y][x]->holes, holes_bytes);
+                }
+
+                ++patched_tiles;
+            }
+        }
+
+        LogDebug << "[WDL Save] Patched " << patched_tiles
+                 << " MARE tile(s) in the modern WDL \"" << filename.str()
+                 << "\"; all other chunks preserved byte for byte." << std::endl;
+
+        if (missing_slots > 0)
+        {
+            Log << "[WDL Save] " << missing_slots
+                << " horizon tile(s) have no MARE slot in the source WDL \""
+                << filename.str() << "\"; their horizon heights are not persisted."
+                << std::endl;
+        }
+
+        BlizzardArchive::ClientFile f(filename.str(), client_data,
+                                      BlizzardArchive::ClientFile::NEW_FILE);
+        f.setBuffer(patched);
+        f.save();
+        f.close();
+
+        _raw_wdl.assign(patched.begin(), patched.end());
+
+        set_minimap(&world->mapIndex);
+        return;
+    }
+
+    if (modern_client && !_wdl_loaded_from_disk)
+    {
+        Log << "[WDL Save] No source WDL was loaded for \"" << filename.str()
+            << "\"; writing a legacy-format WDL. Modern clients additionally "
+               "expect ML*/sky scene chunks in this file." << std::endl;
+    }
 
     util::sExtendableArray wdlFile;
     int curPos = 0;

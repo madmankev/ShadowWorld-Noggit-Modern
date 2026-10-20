@@ -14,7 +14,10 @@
 
 #include <QtGui/QImage>
 
+#include <array>
+#include <cstdint>
 #include <memory>
+#include <vector>
 
 class MapIndex;
 class MapTile;
@@ -112,6 +115,17 @@ private:
   std::string _filename;
 
   std::unique_ptr<map_horizon_tile> _tiles[64][64];
+
+  //! Raw image of the WDL as loaded, plus the absolute payload offsets of
+  //! each tile's MARE/MAHO chunk inside it (0 = tile has no chunk). Modern
+  //! WDLs carry chunks the legacy writer cannot reproduce (MLDD/MLDX/MLMD/
+  //! MLMX placements, MSSN/... sky scenes, MAOE ocean data), so saving a
+  //! modern map patches the height payloads inside this image and preserves
+  //! every other chunk byte for byte.
+  std::vector<std::uint8_t> _raw_wdl;
+  std::array<std::uint32_t, 4096> _mare_payload_offsets{};
+  std::array<std::uint32_t, 4096> _maho_payload_offsets{};
+  bool _wdl_loaded_from_disk = false;
 };
 
 }

@@ -106,58 +106,92 @@ MapIndex::MapIndex (const std::string &pBasename, int map_id, World* world,
   std::stringstream filename;
   filename << "World\\Maps\\" << basename << "\\" << basename << ".wdt";
 
-  BlizzardArchive::ClientFile theFile(filename.str(), Noggit::Application::NoggitApplication::instance()->clientData());
+  auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
+  BlizzardArchive::ClientFile theFile(filename.str(), client_data);
 
-  uint32_t fourcc;
-  uint32_t size;
+  // Read the whole file image and hand it to the version aware chunk
+  // reader. Modern WDTs (Legion+) interleave chunks the old sequential
+  // reader never expected (MAID, MANM, MPHD FileDataID fields, MODF-only
+  // global WMOs), and its assert() based validation compiled out to silent
+  // misparses in release builds.
+  _rawWdt.assign(theFile.getBuffer(), theFile.getBuffer() + theFile.getSize());
+  theFile.close();
 
-  // - MVER ----------------------------------------------
+  bool const modern_client =
+    client_data->version() != BlizzardArchive::ClientVersion::WOTLK;
 
-  uint32_t version;
+  _parsedWdt = Noggit::Formats::WDT::parseWdt(_rawWdt, modern_client);
 
-  theFile.read(&fourcc, 4);
-  theFile.read(&size, 4);
-  theFile.read(&version, 4);
+  for (auto const& issue : _parsedWdt.issues)
+  {
+    switch (issue.severity)
+    {
+      case Noggit::Formats::WDT::IssueSeverity::error:
+        LogError << "[WDT Load] " << filename.str() << ": " << issue.message << std::endl;
+        break;
+      case Noggit::Formats::WDT::IssueSeverity::warning:
+        Log << "[WDT Load] " << filename.str() << ": " << issue.message << std::endl;
+        break;
+      case Noggit::Formats::WDT::IssueSeverity::info:
+        LogDebug << "[WDT Load] " << filename.str() << ": " << issue.message << std::endl;
+        break;
+    }
+  }
 
-  //! \todo find the correct version of WDT files.
-  assert(fourcc == 'MVER' && version == 18);
+  if (!_parsedWdt.known_skipped.empty())
+  {
+    std::ostringstream summary;
+    unsigned int total = 0;
+    bool first = true;
+    for (auto const& [chunk, count] : _parsedWdt.known_skipped)
+    {
+      total += count;
+      summary << (first ? "" : ", ") << Noggit::Formats::WDT::chunkName(chunk) << " x" << count;
+      first = false;
+    }
+    LogDebug << "[WDT Load] " << filename.str() << ": skipped " << total
+             << " known but unused chunk" << (total == 1 ? "" : "s")
+             << " (" << summary.str() << ")" << std::endl;
+  }
 
-  // - MHDR ----------------------------------------------
+  for (auto const& [chunk, count] : _parsedWdt.unknown_chunks)
+  {
+    LogDebug << "[WDT Load] " << filename.str() << ": unknown chunk "
+             << Noggit::Formats::WDT::chunkName(chunk) << " x" << count
+             << ", skipping" << std::endl;
+  }
 
-  theFile.read(&fourcc, 4);
-  theFile.read(&size, 4);
+  if (!_parsedWdt.structurally_valid)
+  {
+    LogError << "[WDT Load] " << filename.str()
+             << ": WDT did not parse cleanly; continuing with the recovered "
+                "MPHD/MAIN data (see messages above)." << std::endl;
+  }
 
-  assert(fourcc == 'MPHD');
-
-  theFile.read(&mphd, sizeof(MPHD));
+  mphd = _parsedWdt.mphd;
 
   mHasAGlobalWMO = mphd.flags & FLAG_GLOBAL_OBJECT;
   mBigAlpha = mphd.flags & FLAG_BIG_ALPHA;
   _sort_models_by_size_class = mphd.flags & FLAG_DOODADS_SORT;
 
-  if (!(mphd.flags & FLAG_SHADING))
+  if (!modern_client && !(mphd.flags & FLAG_SHADING))
   {
+    // Legacy projects keep the old behavior. On modern clients this bit
+    // means "every ADT of this map has MCCV" and must not be forced - and
+    // forcing it used to mark the WDT as changed, which made Noggit rewrite
+    // modern WDTs with the legacy writer on save.
     mphd.flags |= FLAG_SHADING;
     changed = true;
   }
 
   // - MAIN ----------------------------------------------
 
-  theFile.read(&fourcc, 4);
-  theFile.seekRelative(4);
-
-  assert(fourcc == 'MAIN');
-
-  /// this is the theory. Sadly, we are also compiling on 64 bit machines with size_t being 8 byte, not 4. Therefore, we can't do the same thing, Blizzard does in its 32bit executable.
-  //theFile.read( &(mTiles[0][0]), sizeof( 8 * 64 * 64 ) );
-
   // We could skip for WMO only maps
   for (int j = 0; j < 64; ++j)
   {
     for (int i = 0; i < 64; ++i)
     {
-      theFile.read(&mTiles[j][i].flags, 4);
-      theFile.seekRelative(4);
+      mTiles[j][i].flags = _parsedWdt.main_flags[j * 64 + i];
 
       mTiles[j][i].tile = nullptr;
 
@@ -177,38 +211,62 @@ MapIndex::MapIndex (const std::string &pBasename, int map_id, World* world,
 		}
 	}
 
-  if (!theFile.isEof() && mHasAGlobalWMO)
+  // - global WMO (MWMO / MODF) ---------------------------
+
+  if (mHasAGlobalWMO)
   {
-    //! \note We actually don't load WMO only worlds, so we just stop reading here, k?
-    //! \bug MODF reads wrong. The assertion fails every time. Somehow, it keeps being MWMO. Or are there two blocks?
-    //! \nofuckingbug  on eof read returns just without doing sth to the var and some wdts have a MWMO without having a MODF so only checking for eof above is not enough
+    if (_parsedWdt.modf_present)
+    {
+      wmoEntry = _parsedWdt.modf;
+      math::to_client(wmoEntry.pos);
 
-    // mHasAGlobalWMO = false;
+      // ENTRY_MODF consumers (WMOInstance) always divide scale by 1024.
+      // Modern MODF records only carry a meaningful scale when flag 0x4
+      // ("has scale", Legion+) is set - otherwise the placement scale is
+      // 1.0 - and legacy records frequently store 0 for "default".
+      if (!(wmoEntry.flags & 0x4) || wmoEntry.scale == 0)
+      {
+        wmoEntry.scale = 1024;
+      }
+    }
 
-    // - MWMO ----------------------------------------------
+    if (_parsedWdt.mwmo_present && !_parsedWdt.mwmo_name.empty())
+    {
+      globalWMOName = _parsedWdt.mwmo_name;
+    }
+    else if (_parsedWdt.modf_present && _parsedWdt.modf_name_is_fdid)
+    {
+      // Modern WMO-only maps carry no MWMO chunk: MODF.nameID is the
+      // FileDataID of the global WMO (MODF flag 0x8, Legion+). Resolve it
+      // through the CASC listfile.
+      globalWMOName = misc::normalize_adt_filename(
+        client_data->listfile()->getPath(_parsedWdt.modf.nameID));
 
-    theFile.read(&fourcc, 4);
-    theFile.read(&size, 4);
-
-    assert(fourcc == 'MWMO');
-
-    globalWMOName = std::string(theFile.getPointer(), size);
-    theFile.seekRelative(size);
-
-    // - MODF ----------------------------------------------
-
-    theFile.read(&fourcc, 4);
-    theFile.read(&size, 4);
-
-    assert(fourcc == 'MODF');
-
-    theFile.read(&wmoEntry, sizeof(ENTRY_MODF));
-    math::to_client(wmoEntry.pos);
+      if (globalWMOName.empty())
+      {
+        LogError << "[WDT Load] " << filename.str() << ": global WMO FileDataID "
+                 << _parsedWdt.modf.nameID
+                 << " has no listfile entry; the global WMO will not be loaded."
+                 << std::endl;
+        mHasAGlobalWMO = false;
+      }
+      else
+      {
+        LogDebug << "[WDT Load] " << filename.str() << ": resolved global WMO FileDataID "
+                 << _parsedWdt.modf.nameID << " to \"" << globalWMOName << "\"" << std::endl;
+      }
+    }
+    else
+    {
+      LogError << "[WDT Load] " << filename.str()
+               << ": MPHD flag 0x1 announces a global WMO but no resolvable "
+                  "MWMO name or MODF FileDataID entry was found; the global "
+                  "WMO will not be loaded." << std::endl;
+      mHasAGlobalWMO = false;
+    }
   }
 
   // -----------------------------------------------------
-
-  theFile.close();
 
   loadMinimapMD5translate();
 }
@@ -279,6 +337,67 @@ void MapIndex::save()
 
   //Log << "Saving WDT \"" << filename << "\"." << std::endl;
 
+  auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
+  bool const modern_client =
+    client_data->version() != BlizzardArchive::ClientVersion::WOTLK;
+
+  // Modern WDTs carry chunks the legacy writer below cannot reproduce
+  // (MAID FileDataIDs, MANM, the MPHD FileDataID fields, MODF-only global
+  // WMOs). When a modern WDT was loaded, patch that image in place instead:
+  // only the MPHD flags word and the MAIN tile flags are rewritten, every
+  // other chunk is preserved byte for byte.
+  if (modern_client && !_rawWdt.empty())
+  {
+    std::uint32_t flags = mphd.flags;
+    flags &= ~(FLAG_GLOBAL_OBJECT | FLAG_BIG_ALPHA | FLAG_DOODADS_SORT | FLAG_SHADING);
+    if (mHasAGlobalWMO)
+      flags |= FLAG_GLOBAL_OBJECT;
+    if (mBigAlpha)
+      flags |= FLAG_BIG_ALPHA;
+    if (_sort_models_by_size_class)
+      flags |= FLAG_DOODADS_SORT;
+    // Note: FLAG_SHADING (0x2) is deliberately NOT forced here - on modern
+    // clients the bit means "every ADT of this map has MCCV".
+
+    std::vector<std::uint32_t> main_flags(4096, 0);
+    for (int j = 0; j < 64; ++j)
+    {
+      for (int i = 0; i < 64; ++i)
+      {
+        main_flags[j * 64 + i] = mTiles[j][i].flags;
+      }
+    }
+
+    std::vector<std::uint8_t> patched = _rawWdt;
+    auto const result =
+      Noggit::Formats::WDT::applyWdtEdits(patched, _parsedWdt, flags, main_flags);
+
+    for (auto const& issue : result.issues)
+    {
+      LogError << "[WDT Save] " << filename.str() << ": " << issue.message << std::endl;
+    }
+
+    if (result.applied)
+    {
+      mphd.flags = flags;
+
+      BlizzardArchive::ClientFile f(filename.str(), client_data,
+                                    BlizzardArchive::ClientFile::NEW_FILE);
+      f.setBuffer(std::vector<char>(patched.begin(), patched.end()));
+      f.save();
+      f.close();
+
+      _rawWdt = std::move(patched);
+      changed = false;
+      return;
+    }
+
+    LogError << "[WDT Save] " << filename.str()
+             << ": in-place patching failed; falling back to the legacy WDT "
+                "writer. Modern-only chunks (MAID/MANM/...) will be lost."
+             << std::endl;
+  }
+
   util::sExtendableArray wdtFile;
   int curPos = 0;
 
@@ -308,7 +427,12 @@ void MapIndex::save()
   if (_sort_models_by_size_class)
       mphd.flags |= FLAG_DOODADS_SORT;
 
-  mphd.flags |= FLAG_SHADING;
+  if (!modern_client)
+  {
+    // Only legacy projects expect Noggit's shading bit; on modern clients
+    // 0x2 means "every ADT of this map has MCCV".
+    mphd.flags |= FLAG_SHADING;
+  }
 
   wdtFile.Insert(curPos, sizeof(MPHD), (char*)&mphd);
   curPos += sizeof(MPHD);
