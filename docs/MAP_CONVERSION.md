@@ -1,7 +1,8 @@
 # Two-way WotLK / modern map conversion
 
-Status: **in development** (see "Implementation plan" at the bottom for what is
-already in place).
+Status: **implemented** - Qt-free core (`src/noggit/formats/conversion/`),
+harness-proven round-trip, and the "Tools → Convert map (WotLK <->
+modern)..." dialog in the editor window.
 
 This document describes the explicit, user-driven conversion between the two
 map file families Noggit supports:
@@ -174,23 +175,46 @@ Map level:
   final check for these; the formats are otherwise built from the same
   verified readers/writers the editor uses.
 
-## Implementation plan
+## Implementation status
 
-1. **Core library** `src/noggit/formats/conversion/` (Qt-free):
-   `MapConversion.hpp/.cpp` (API, orchestrator, WDT/WDL conversion, fdid
-   allocation, manifest/report) and `AdtConversion.cpp` (legacy ADT parse
-   model, modern part assembly, modern tile parse model, legacy assembly,
-   alpha codecs, MCLQ↔MH2O). Reuses the verified format knowledge from
-   `ModernAdtReader/Writer`, `ShadowlandsADTCodec`, `WdtReader`,
-   `WdlObjects` and `ChunkWater/liquid_layer` (layouts re-implemented
-   Qt-free on raw bytes).
-2. **Harness tests** (g++, no CMake): synthetic legacy ADT → modern parts →
-   re-parsed with `ModernAdtReader`; synthetic modern parts (task #9
-   builders) → legacy ADT → re-parsed with the legacy walk; WDT/WDL
-   round-trips; MCLQ↔MH2O round-trips; alpha codec round-trips.
-3. **Qt UI**: "Tools → Convert map…" dialog (source picker, map list from
-   the WDT scan or folder contents, target format, output directory,
-   progress + report view, manifest write, optional registration merge into
-   `extraData/modernMapRegistrations.json`).
-4. **Docs/README**: this file linked from README; conversion moved out of
-   "Outside the Current Scope".
+1. **Core library** `src/noggit/formats/conversion/` (Qt-free) - done:
+   `MapConversion.hpp/.cpp` (API, `convertMap` orchestrator, WDT/WDL
+   builders both directions, FileDataID allocation with per-path caching,
+   manifest/report) and `AdtConversion.cpp` (legacy ADT parse model, modern
+   ROOT/TEX0/OBJ0 assembly, modern tile parse, legacy monolith assembly,
+   shared alpha RLE codec, MCLQ→MH2O synthesis). Reuses the verified
+   readers (`scanAdt`/`classifyAdtLayout`/`parseTex0`/`decodeModernAlpha`/
+   `parseObj0`/`parseWdt`) for parsing **and** as post-conversion
+   self-checks: every converted part is re-parsed before it is accepted.
+2. **Harness tests** (g++, no CMake) - done: a synthetic two-tile WotLK map
+   (WDT + WDL + ADTs with objects, MFBO, MCSH/MCSE, MCLQ water, two texture
+   layers with alpha) converts to modern and validates with the repo's own
+   readers (MAID wiring, MDID indices, alpha plane equality, OBJ0 fdids and
+   flag 0x8, MH2O record contents, WDL MLMD/MLMX and MAOF offsets); the
+   outputs convert back to WotLK with the listfile fed from the forward
+   manifest and round-trip (legacy classification, MTEX names restored,
+   MCVT bytes identical, MH2O preserved, classic WDT/WDL chunk order).
+   Plus same-format refusal, placeholder paths for unresolvable
+   FileDataIDs, and MH2O byte-passthrough.
+3. **Qt UI** - done: `src/noggit/ui/tools/MapConversionTool/`, reachable as
+   **Tools → Convert map (WotLK <-> modern)...** in the editor window. The
+   dialog runs the conversion on a worker thread, writes the files plus
+   `conversion_manifest.json` under the chosen output directory, and offers
+   to merge the suggested Map.db2 registration into the project's
+   `extraData/modernMapRegistrations.json` (validated through
+   `ModernMapRegistrations::validate` first). The conversion source is the
+   project's client data (CASC/MPQ); loose-folder sources are supported by
+   the same adapter API.
+4. **Docs/README** - done: this file is linked from the README; conversion
+   moved out of "Outside the Current Scope".
+
+Known follow-ups (not blockers):
+
+-   Newly allocated FileDataIDs still need server-side registration
+    (listfile/CASC or the private-server equivalent) - the manifest is the
+    input for that; no tooling writes into game installs.
+-   Retail 12.x / Forever targets are not conversion targets yet; the
+    modern side is the Shadowlands 9.2.7 layout the editor saves in.
+-   Per-chunk `MCRD`/`MCRW` reference lists are not carried across in
+    either direction (placements attach per tile in both editors and in the
+    modern client pipeline).

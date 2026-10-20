@@ -109,12 +109,45 @@ Version-specific readers and writers handle the differences between clients.
 See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for what the messages in
 `log.txt` mean and how to resolve them.
 
+### Two-Way Map Conversion (WotLK <-> Modern)
+
+**Tools → Convert map (WotLK <-> modern)...** converts a whole map between
+the two file families, file-to-file and never as a side effect of saving or
+loading:
+
+-   **WotLK → modern (9.2.7)**: monolithic ADTs are split into
+    `ROOT`/`_tex0`/`_obj0` parts, texture/model/WMO names become
+    FileDataIDs (resolved through the client listfile; unknown assets get
+    newly allocated ids), the WDT gains `MAID`, legacy WDL object tables
+    become `MLMD`/`MLMX`, and `MCLQ` liquids are converted to `MH2O`
+    (`MH2O` itself passes through untouched - it is structurally identical
+    since WotLK).
+-   **Modern → WotLK**: the split parts are merged back into a monolithic
+    ADT with `MTEX`/`MMDX`/`MWMO` name tables rebuilt from FileDataIDs,
+    `MAID`/height-texturing data is dropped with warnings, and the WDT/WDL
+    return to their legacy layouts.
+
+Every conversion writes a `conversion_manifest.json` next to the output:
+all FileDataID assignments (which existed in the client, which were newly
+allocated and need registration), a suggested `Map.db2` registration in the
+`extraData/modernMapRegistrations.json` field shape (mergeable from the
+dialog), and the full warning list. See
+[docs/MAP_CONVERSION.md](docs/MAP_CONVERSION.md) for the format details and
+the known fidelity limits (unresolvable FileDataIDs become placeholder
+paths, height texturing and vertex shading have no WotLK equivalent, ...).
+
+Converted modern maps must be registered with the target client (listfile /
+server-side FileDataIDs, Map.db2 row) before the game can load them; the
+manifest lists exactly which ids are new.
+
 ### Outside the Current Scope
 
 -   Automatic creation of every database file needed by a completely new
     modern map.
--   Two-way WotLK/modern map conversion. This is planned for a later release,
-    not performed by the current save operation.
+-   Conversion between post-WotLK generations (e.g. Shadowlands → Retail
+    12.x): the converter targets the two families the editor saves in,
+    WotLK and Shadowlands 9.2.7, as distinct formats - not one generic
+    "modern" format.
 
 ## Version Direction
 
@@ -125,10 +158,6 @@ retains its existing editing and WotLK-format saving behavior.
 Some included DBD definitions already contain `Map.db2` layouts for
 later WoW versions, including 12.x builds. This does **not** mean Noggit
 currently supports editing those versions.
-
-Future development is intended to add explicit two-way conversion between
-client formats rather than treating all post-WotLK clients as one generic
-"modern" format.
 
 ## Modern Terrain Texture Layers
 

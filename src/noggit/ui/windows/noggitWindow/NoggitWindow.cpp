@@ -53,6 +53,7 @@
 #include "revision.h"
 
 #include "ui_TitleBar.h"
+#include <noggit/ui/tools/MapConversionTool/MapConversionTool.hpp>
 #include <noggit/ui/tools/ViewportManager/ViewportManager.hpp>
 
 namespace Noggit::Ui::Windows
@@ -158,6 +159,21 @@ namespace Noggit::Ui::Windows
                        close();
                      }
     );
+
+    auto tools_menu(_menuBar->addMenu("&Tools"));
+
+    auto convert_map_action(tools_menu->addAction("Convert map (WotLK <-> modern)..."));
+    QObject::connect(convert_map_action, &QAction::triggered, [this]
+    {
+      // One modeless dialog per window; it runs conversions on a worker
+      // thread and reports back through the event loop.
+      if (!_map_conversion_dialog)
+        _map_conversion_dialog =
+          new Noggit::Ui::Tools::MapConversionTool::MapConversionDialog(_project, this);
+      _map_conversion_dialog->show();
+      _map_conversion_dialog->raise();
+      _map_conversion_dialog->activateWindow();
+    });
 
     _menuBar->adjustSize();
 

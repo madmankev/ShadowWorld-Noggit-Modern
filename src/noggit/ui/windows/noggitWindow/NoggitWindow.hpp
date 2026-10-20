@@ -39,6 +39,11 @@ namespace Noggit::Ui::Tools::MapCreationWizard::Ui
   class MapCreationWizard;
 }
 
+namespace Noggit::Ui::Tools::MapConversionTool
+{
+  class MapConversionDialog;
+}
+
 namespace Noggit::Ui
 {
     class minimap_widget;
@@ -88,6 +93,7 @@ namespace Noggit::Ui::Windows
     	std::unique_ptr<Component::BuildMapListComponent> _buildMapListComponent;
       std::shared_ptr<Application::NoggitApplicationConfiguration> _applicationConfiguration;
       std::shared_ptr<Project::NoggitProject> _project;
+      Noggit::Ui::Tools::MapConversionTool::MapConversionDialog* _map_conversion_dialog = nullptr;
 
 
       void handleEventMapListContextMenuPinMap(int mapId, std::string MapName);
