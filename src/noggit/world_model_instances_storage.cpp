@@ -18,15 +18,26 @@ namespace Noggit
   {
     std::uint32_t uid = instance.uid;
     std::uint32_t uid_after;
+    ModelInstance* added = nullptr;
 
     {
       std::lock_guard<std::mutex> const lock (_mutex);
       uid_after = unsafe_add_model_instance_no_world_upd(std::move(instance), action);
+
+      // The lookup has to happen under the same lock: tiles are loaded on the
+      // async loader thread while the main thread inserts, moves and erases
+      // instances. Reading _m2s outside the lock raced with a rehash and either
+      // threw std::out_of_range ("invalid map<K, T> key") or walked a bucket
+      // chain that was being rewritten - an access violation in the middle of
+      // placing an object. The duplicate paths also return a uid that was never
+      // inserted here, so .at() was not guaranteed to find it either.
+      if (auto it = _m2s.find(uid_after); it != _m2s.end())
+        added = &it->second;
     }
 
-    if (from_reloading || uid_after != uid)
+    if (added && (from_reloading || uid_after != uid))
     {
-      _world->updateTilesModel(&_m2s.at(uid_after), model_update::add);
+      _world->updateTilesModel(added, model_update::add);
     }
 
     return uid_after;
@@ -84,15 +95,21 @@ namespace Noggit
   {
     std::uint32_t uid = instance.uid;
     std::uint32_t uid_after;
+    WMOInstance* wmo_instance = nullptr;
 
     {
       std::lock_guard<std::mutex> const lock(_mutex);
       uid_after = unsafe_add_wmo_instance_no_world_upd(std::move(instance), action);
+
+      // Same reasoning as add_model_instance(): resolve the instance under the
+      // lock instead of reading _wmos from whichever thread happens to get here
+      // while the loader thread is rehashing the map.
+      if (auto it = _wmos.find(uid_after); it != _wmos.end())
+        wmo_instance = &it->second;
     }
 
-    if (from_reloading || uid_after != uid)
+    if (wmo_instance && (from_reloading || uid_after != uid))
     {
-      WMOInstance* wmo_instance = &_wmos.at(uid_after);
       _world->updateTilesWMO(wmo_instance, model_update::add);
 
       // update WDL uid if it changed
@@ -149,24 +166,32 @@ namespace Noggit
 
   void world_model_instances_storage::delete_instances_from_tile(TileIndex const& tile, bool action)
   {
-    // std::unique_lock<std::mutex> const lock (_mutex);
-    std::vector<selected_object_type> instances_to_remove;
+    // The scan has to hold the lock: the async loader thread inserts into both
+    // maps while a tile is streaming in, and iterating an unordered_map that is
+    // rehashing on another thread is an access violation. delete_instance()
+    // takes the same (non recursive) mutex, so the uids are collected first and
+    // the removal happens after the scan is done.
+    std::vector<std::uint32_t> uids_to_remove;
 
-    for (auto it = _m2s.begin(); it != _m2s.end(); ++it)
     {
-      if (TileIndex(it->second.pos) == tile)
+      std::lock_guard<std::mutex> const lock(_mutex);
+
+      uids_to_remove.reserve(_m2s.size() + _wmos.size());
+
+      for (auto const& entry : _m2s)
       {
-        instances_to_remove.push_back(&it->second);
+        if (TileIndex(entry.second.pos) == tile)
+          uids_to_remove.push_back(entry.first);
+      }
+      for (auto const& entry : _wmos)
+      {
+        if (TileIndex(entry.second.pos) == tile)
+          uids_to_remove.push_back(entry.first);
       }
     }
-    for (auto it = _wmos.begin(); it != _wmos.end();++it)
-    {
-      if (TileIndex(it->second.pos) == tile)
-      {
-        instances_to_remove.push_back(&it->second);
-      }
-    }
-    delete_instances(instances_to_remove, action);
+
+    for (auto uid : uids_to_remove)
+      delete_instance(uid, action);
   }
 
   void world_model_instances_storage::delete_instances(std::vector<selected_object_type> const& instances, bool action)
@@ -214,6 +239,13 @@ namespace Noggit
         NOGGIT_CUR_ACTION->registerObjectRemoved(obj);
       }
     }
+
+    // The instance is about to be freed. Drop it from the world selection first:
+    // _current_selection stores raw pointers into these maps, and the object
+    // tool dereferences them on the next tick (rotation editor, gizmo, box
+    // drawing). Leaving the entry behind turned every later frame into an
+    // access violation. Groups were already detached above, so skip them here.
+    _world->remove_from_selection(uid, true, true);
 
     _instance_count_per_uid.erase(uid);
     _m2s.erase(uid);
@@ -433,6 +465,10 @@ namespace Noggit
 
   unsigned int world_model_instances_storage::getTotalModelsCount() const
   {
-    return _m2s.size() + _wmos.size();
+    // size() is not atomic with respect to a rehash happening on the loader
+    // thread; the count is only informational but reading it unsynchronised is
+    // still undefined behaviour.
+    std::lock_guard<std::mutex> const lock(_mutex);
+    return static_cast<unsigned int>(_m2s.size() + _wmos.size());
   }
 }

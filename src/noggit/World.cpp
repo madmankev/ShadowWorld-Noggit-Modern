@@ -49,6 +49,7 @@
 #include <map>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -385,7 +386,11 @@ void World::update_selection_pivot()
       }
     }
 
-    _multi_select_pivot = pivot / static_cast<float>(model_count);
+    // model_count can be zero when the selection holds entries that are not
+    // objects (or was just emptied); dividing would produce a NaN pivot that
+    // then propagates into the rotation editor and the gizmo.
+    _multi_select_pivot = model_count > 0 ? std::optional<glm::vec3>(pivot / static_cast<float>(model_count))
+                                          : std::nullopt;
   }
   else
   {
@@ -580,7 +585,12 @@ void World::rotate_selected_models_randomly(float minX, float maxX, float minY, 
     updateTilesEntry(entry, model_update::remove);
 
     auto& obj = std::get<selected_object_type>(entry);
-    NOGGIT_CUR_ACTION->registerObjectTransformed(obj);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerObjectTransformed(obj);
+    }
 
     math::degrees::vec3& dir = obj->dir;
 
@@ -643,7 +653,12 @@ void World::rotate_selected_models_randomly(float minX, float maxX, float minY, 
 
 void World::rotate_model_to_ground_normal(SceneObject* obj, bool smoothNormals)
 {
-    NOGGIT_CUR_ACTION->registerObjectTransformed(obj);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerObjectTransformed(obj);
+    }
 
     updateTilesEntry(obj, model_update::remove);
 
@@ -885,10 +900,13 @@ void World::remove_from_selection(selection_type entry, bool skip_group, bool up
 void World::remove_from_selection(std::uint32_t uid, bool skip_group, bool update_pivot)
 {
   ZoneScoped;
-  size_t erased_count = selected_uids.erase(uid);
-  if (erased_count == 0)
-    return;
+  selected_uids.erase(uid);
 
+  // Deliberately no early-out when the uid was not in selected_uids: the two
+  // containers can fall out of step (an instance deleted while its tile was
+  // still unloading, for instance) and _current_selection is what the rotation
+  // editor dereferences every frame. Scrubbing it unconditionally keeps a freed
+  // object from being touched after deletion.
   for (auto it = _current_selection.begin(); it != _current_selection.end(); ++it)
   {
     if (it->index() != eEntry_Object)
@@ -994,7 +1012,12 @@ void World::snap_selected_models_to_the_ground()
     }
 
     auto& obj = std::get<selected_object_type>(entry);
-    NOGGIT_CUR_ACTION->registerObjectTransformed(obj);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerObjectTransformed(obj);
+    }
     glm::vec3& pos = obj->pos;
 
     // the ground can only be intersected once
@@ -1032,7 +1055,12 @@ void World::scale_selected_models(float v, object_scaling_type type)
 
         WMOInstance* wi = static_cast<WMOInstance*>(obj);
 
-        NOGGIT_CUR_ACTION->registerObjectTransformed(wi);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerObjectTransformed(wi);
+        }
 
         float scale = wi->scale;
 
@@ -1064,7 +1092,12 @@ void World::scale_selected_models(float v, object_scaling_type type)
       {
         ModelInstance* mi = static_cast<ModelInstance*>(obj);
 
-        NOGGIT_CUR_ACTION->registerObjectTransformed(mi);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerObjectTransformed(mi);
+        }
 
         float scale = mi->scale;
 
@@ -1111,7 +1144,12 @@ void World::move_selected_models(float dx, float dy, float dz)
     }
 
     auto& obj = std::get<selected_object_type>(entry);
-    NOGGIT_CUR_ACTION->registerObjectTransformed(obj);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerObjectTransformed(obj);
+    }
     glm::vec3& pos = obj->pos;
 
     updateTilesEntry(entry, model_update::remove);
@@ -1138,7 +1176,12 @@ void World::move_model(selection_type entry, float dx, float dy, float dz)
     }
 
     auto& obj = std::get<selected_object_type>(entry);
-    NOGGIT_CUR_ACTION->registerObjectTransformed(obj);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerObjectTransformed(obj);
+    }
     glm::vec3& pos = obj->pos;
 
     updateTilesEntry(entry, model_update::remove);
@@ -1171,7 +1214,17 @@ void World::set_selected_models_pos(glm::vec3 const& pos, bool change_height)
   // move models relative to the pivot when several are selected
   if (has_multiple_model_selected())
   {
-    glm::vec3 diff = pos - _multi_select_pivot.value();
+    // The pivot is normally computed when the selection changes. When it is
+    // missing, recompute it instead of throwing std::bad_optional_access out of
+    // a rotation-editor spin box handler (which arrives here as an "unknown
+    // exception" during a KeyPress event).
+    if (!_multi_select_pivot.has_value())
+      update_selection_pivot();
+
+    if (!_multi_select_pivot.has_value())
+      return;
+
+    glm::vec3 diff = pos - *_multi_select_pivot;
 
     if (change_height)
     {
@@ -1196,7 +1249,12 @@ void World::set_selected_models_pos(glm::vec3 const& pos, bool change_height)
     updateTilesEntry(entry, model_update::remove);
 
     auto& obj = std::get<selected_object_type>(entry);
-    NOGGIT_CUR_ACTION->registerObjectTransformed(obj);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerObjectTransformed(obj);
+    }
     obj->pos = pos;
     obj->recalcExtents();
 
@@ -1218,7 +1276,12 @@ void World::set_model_pos(selection_type entry, glm::vec3 const& pos, bool chang
   updateTilesEntry(entry, model_update::remove);
   
   auto& obj = std::get<selected_object_type>(entry);
-  NOGGIT_CUR_ACTION->registerObjectTransformed(obj);
+  // Guarded: also reachable from the node editor and from scripting, which
+  // begin no undo action - a null dereference there was an access violation.
+  if (auto* const cur_action = NOGGIT_CUR_ACTION)
+  {
+    cur_action->registerObjectTransformed(obj);
+  }
   obj->pos = pos;
   obj->recalcExtents();
   
@@ -1245,13 +1308,20 @@ void World::rotate_selected_models(math::degrees rx, math::degrees ry, math::deg
     updateTilesEntry(entry, model_update::remove);
 
     auto& obj = std::get<selected_object_type>(entry);
-    NOGGIT_CUR_ACTION->registerObjectTransformed(obj);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerObjectTransformed(obj);
+    }
 
     if (use_pivot && has_multi_select)
     {
       glm::vec3& pos = obj->pos;
       math::degrees::vec3& dir = obj->dir;
-      glm::vec3 diff_pos = pos - _multi_select_pivot.value();
+      // See set_selected_models_pos(): no pivot means no orbit centre, so leave
+      // the position alone rather than dereferencing an empty optional.
+      glm::vec3 diff_pos = pos - _multi_select_pivot.value_or(pos);
 
       glm::quat rotationQuat = glm::quat(glm::vec3(glm::radians(rx._), glm::radians(ry._), glm::radians(rz._)));
       glm::vec3 rot_result = glm::toMat4(rotationQuat) * glm::vec4(diff_pos,0);
@@ -1290,7 +1360,12 @@ void World::set_selected_models_rotation(math::degrees rx, math::degrees ry, mat
     }
 
     auto& obj = std::get<selected_object_type>(entry);
-    NOGGIT_CUR_ACTION->registerObjectTransformed(obj);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerObjectTransformed(obj);
+    }
 
     updateTilesEntry(entry, model_update::remove);
 
@@ -1517,7 +1592,12 @@ void World::clearHeight(glm::vec3 const& pos)
   ZoneScoped;
   for_all_chunks_on_tile(pos, [](MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkTerrainChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkTerrainChange(chunk);
+    }
     chunk->clearHeight();
   });
   for_all_chunks_on_tile(pos, [this] (MapChunk* chunk) {
@@ -1539,7 +1619,12 @@ void World::CropWaterADT(const TileIndex& pos)
   {
     for (int i = 0; i < 16; ++i)
       for (int j = 0; j < 16; ++j)
-        NOGGIT_CUR_ACTION->registerChunkLiquidChange(tile->getChunk(i, j));
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkLiquidChange(tile->getChunk(i, j));
+        }
 
     tile->CropWater();
   });
@@ -1552,7 +1637,12 @@ void World::setAreaID(glm::vec3 const& pos, int id, bool adt, float radius)
   {
     for_all_chunks_on_tile(pos, [&](MapChunk* chunk)
     {
-      NOGGIT_CUR_ACTION->registerChunkAreaIDChange(chunk);
+      // Guarded: also reachable from the node editor and from scripting, which
+      // begin no undo action - a null dereference there was an access violation.
+      if (auto* const cur_action = NOGGIT_CUR_ACTION)
+      {
+        cur_action->registerChunkAreaIDChange(chunk);
+      }
       chunk->setAreaID(id);
     });
   }
@@ -1564,7 +1654,12 @@ void World::setAreaID(glm::vec3 const& pos, int id, bool adt, float radius)
       for_all_chunks_in_range(pos, radius,
                               [&] (MapChunk* chunk)
                               {
-                                NOGGIT_CUR_ACTION->registerChunkAreaIDChange(chunk);
+                                // Guarded: also reachable from the node editor and from scripting, which
+                                // begin no undo action - a null dereference there was an access violation.
+                                if (auto* const cur_action = NOGGIT_CUR_ACTION)
+                                {
+                                  cur_action->registerChunkAreaIDChange(chunk);
+                                }
                                 chunk->setAreaID(id);
                                 return true;
                               }
@@ -1575,7 +1670,12 @@ void World::setAreaID(glm::vec3 const& pos, int id, bool adt, float radius)
     {
       for_chunk_at(pos, [&](MapChunk* chunk)
       {
-        NOGGIT_CUR_ACTION->registerChunkAreaIDChange(chunk);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkAreaIDChange(chunk);
+        }
         chunk->setAreaID(id);
       });
     }
@@ -1611,7 +1711,12 @@ void World::changeShader(glm::vec3 const& pos, glm::vec4 const& color, float cha
     ( pos, radius
     , [&] (MapChunk* chunk)
       {
-        NOGGIT_CUR_ACTION->registerChunkVertexColorChange(chunk);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkVertexColorChange(chunk);
+        }
         return chunk->ChangeMCCV(pos, color, change, radius, editMode);
       }
     );
@@ -1624,7 +1729,12 @@ void World::stampShader(glm::vec3 const& pos, glm::vec4 const& color, float chan
     ( pos, radius
       , [&] (MapChunk* chunk)
       {
-        NOGGIT_CUR_ACTION->registerChunkVertexColorChange(chunk);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkVertexColorChange(chunk);
+        }
         return chunk->stampMCCV(pos, color, change, radius, editMode, img, paint, use_image_colors);
       }
     );
@@ -1801,7 +1911,12 @@ void World::changeTerrain(glm::vec3 const& pos, float change, float radius, int 
     ( pos, radius
     , [&] (MapChunk* chunk)
       {
-        NOGGIT_CUR_ACTION->registerChunkTerrainChange(chunk);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkTerrainChange(chunk);
+        }
         return chunk->changeTerrain(pos, change, radius, BrushType, inner_radius);
       }
     , [this] (MapChunk* chunk)
@@ -1876,7 +1991,12 @@ void World::flattenTerrain(glm::vec3 const& pos, float remain, float radius, int
     ( pos, radius
     , [&] (MapChunk* chunk)
       {
-        NOGGIT_CUR_ACTION->registerChunkTerrainChange(chunk);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkTerrainChange(chunk);
+        }
         return chunk->flattenTerrain(pos, remain, radius, BrushType, mode, origin, angle, orientation);
       }
     , [this] (MapChunk* chunk)
@@ -1914,7 +2034,12 @@ void World::blurTerrain(glm::vec3 const& pos, float remain, float radius, int Br
     ( pos, radius
     , [&] (MapChunk* chunk)
       {
-        NOGGIT_CUR_ACTION->registerChunkTerrainChange(chunk);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkTerrainChange(chunk);
+        }
         return chunk->blurTerrain ( pos
                                   , remain
                                   , radius
@@ -1948,7 +2073,12 @@ bool World::paintTexture(glm::vec3 const& pos, Brush* brush, float strength, flo
     ( pos, brush->getRadius()
     , [&] (MapChunk* chunk)
       {
-        NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkTextureChange(chunk);
+        }
         return chunk->paintTexture(pos, brush, strength, pressure, texture);
       }
     );
@@ -1961,7 +2091,12 @@ bool World::stampTexture(glm::vec3 const& pos, Brush *brush, float strength, flo
     ( pos, brush->getRadius()
       , [&] (MapChunk* chunk)
       {
-        NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkTextureChange(chunk);
+        }
         return chunk->stampTexture(pos, brush, strength, pressure, texture, img, paint);
       }
     );
@@ -2007,7 +2142,12 @@ bool World::replaceTexture(glm::vec3 const& pos, float radius, scoped_blp_textur
               for (int j = 0; j < 16; ++j)
               {
                   MapChunk* chunk = tile->getChunk(i, j);
-                  NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+                  // Guarded: also reachable from the node editor and from scripting, which
+                  // begin no undo action - a null dereference there was an access violation.
+                  if (auto* const cur_action = NOGGIT_CUR_ACTION)
+                  {
+                    cur_action->registerChunkTextureChange(chunk);
+                  }
                   if (chunk->replaceTexture(pos, radius, old_texture, new_texture, true))
                   {
                       changed = true;
@@ -2024,7 +2164,12 @@ bool World::replaceTexture(glm::vec3 const& pos, float radius, scoped_blp_textur
       ( pos, radius
         , [&](MapChunk* chunk)
         {
-          NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+          // Guarded: also reachable from the node editor and from scripting, which
+          // begin no undo action - a null dereference there was an access violation.
+          if (auto* const cur_action = NOGGIT_CUR_ACTION)
+          {
+            cur_action->registerChunkTextureChange(chunk);
+          }
           return chunk->replaceTexture(pos, radius, old_texture, new_texture, entire_chunk);
         }
       );
@@ -2036,7 +2181,12 @@ void World::eraseTextures(glm::vec3 const& pos)
   ZoneScoped;
   for_chunk_at(pos, [](MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkTextureChange(chunk);
+    }
     chunk->eraseTextures();
   });
 }
@@ -2046,7 +2196,12 @@ void World::overwriteTextureAtCurrentChunk(glm::vec3 const& pos, scoped_blp_text
   ZoneScoped;
   for_chunk_at(pos, [&](MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkTextureChange(chunk);
+    }
     chunk->switchTexture(oldTexture, std::move (newTexture));
   });
 }
@@ -2059,7 +2214,12 @@ void World::paintGroundEffectExclusion(glm::vec3 const& pos, float radius, bool 
         , [&](MapChunk* chunk)
         {
             // TODO action
-            NOGGIT_CUR_ACTION->registerChunkDetailDoodadExclusionChange(chunk);
+            // Guarded: also reachable from the node editor and from scripting, which
+            // begin no undo action - a null dereference there was an access violation.
+            if (auto* const cur_action = NOGGIT_CUR_ACTION)
+            {
+              cur_action->registerChunkDetailDoodadExclusionChange(chunk);
+            }
 
             // chunk->setHole(pos, radius, exclusion);
             chunk->paintDetailDoodadsExclusion(pos, radius, exclusion);
@@ -2093,7 +2253,12 @@ namespace
             }
             if (!changed && register_action)
             {
-                NOGGIT_CUR_ACTION->registerChunkLayerInfoChange(chunk);
+                // Guarded: also reachable from the node editor and from scripting, which
+                // begin no undo action - a null dereference there was an access violation.
+                if (auto* const cur_action = NOGGIT_CUR_ACTION)
+                {
+                  cur_action->registerChunkLayerInfoChange(chunk);
+                }
             }
             changed = true;
             texture_set->setEffect(layer, static_cast<int>(effect_id));
@@ -2252,7 +2417,12 @@ void World::setHole(glm::vec3 const& pos, float radius, bool big, bool hole)
       ( pos, radius
         , [&](MapChunk* chunk)
         {
-          NOGGIT_CUR_ACTION->registerChunkHoleChange(chunk);
+          // Guarded: also reachable from the node editor and from scripting, which
+          // begin no undo action - a null dereference there was an access violation.
+          if (auto* const cur_action = NOGGIT_CUR_ACTION)
+          {
+            cur_action->registerChunkHoleChange(chunk);
+          }
           chunk->setHole(pos, radius, big, hole);
           return true;
         }
@@ -2265,7 +2435,12 @@ void World::setHoleADT(glm::vec3 const& pos, bool hole)
 
   for_all_chunks_on_tile(pos, [&](MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkHoleChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkHoleChange(chunk);
+    }
     chunk->setHole(pos, 1.0f, true, hole);
   });
 }
@@ -2552,7 +2727,17 @@ ModelInstance* World::addM2AndGetInstance ( BlizzardArchive::Listfile::FileKey c
   auto instance = _model_instance_storage.get_model_instance(uid); // .value();
   // _models_by_filename[file_key.filepath()].push_back(instance);
 
-  return instance.value();
+  // std::bad_optional_access from value() told nobody anything about a failed
+  // placement; name the model and uid instead.
+  if (!instance)
+  {
+    LogError << "World::addM2AndGetInstance: the instance storage did not return"
+                " the model that was just added (uid " << uid << ", "
+             << file_key.stringRepr() << ")." << std::endl;
+    throw std::runtime_error("could not place the model instance with uid " + std::to_string(uid));
+  }
+
+  return *instance;
 }
 
 void World::addWMO ( BlizzardArchive::Listfile::FileKey const& file_key
@@ -2626,7 +2811,17 @@ WMOInstance* World::addWMOAndGetInstance ( BlizzardArchive::Listfile::FileKey co
 
   auto instance = _model_instance_storage.get_wmo_instance(uid);
 
-  return instance.value();
+  // See addM2AndGetInstance(): report the failure instead of throwing an
+  // unexplained std::bad_optional_access.
+  if (!instance)
+  {
+    LogError << "World::addWMOAndGetInstance: the instance storage did not return"
+                " the WMO that was just added (uid " << uid << ", "
+             << file_key.stringRepr() << ")." << std::endl;
+    throw std::runtime_error("could not place the WMO instance with uid " + std::to_string(uid));
+  }
+
+  return *instance;
 }
 
 
@@ -2768,7 +2963,12 @@ void World::clearTextures(glm::vec3 const& pos)
   ZoneScoped;
   for_all_chunks_on_tile(pos, [](MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkTextureChange(chunk);
+    }
     chunk->eraseTextures();
   });
 }
@@ -2909,7 +3109,12 @@ void World::importADTAlphamap(glm::vec3 const& pos, QImage const& image, unsigne
   ZoneScoped;
   for_all_chunks_on_tile(pos, [](MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkTextureChange(chunk);
+    }
   });
 
   if (image.width() != 1024 || image.height() != 1024)
@@ -2941,7 +3146,12 @@ void World::importADTAlphamap(glm::vec3 const& pos, bool cleanup)
   ZoneScoped;
   for_all_chunks_on_tile(pos, [](MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkTextureChange(chunk);
+    }
   });
 
   QString path = QString(Noggit::Project::CurrentProject::get()->ProjectPath.c_str());
@@ -2981,7 +3191,12 @@ void World::importADTHeightmap(glm::vec3 const& pos, QImage const& image, float 
   int desired_dimensions = tiledEdges ? 256 : 257;
   for_all_chunks_on_tile(pos, [](MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkTerrainChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkTerrainChange(chunk);
+    }
   });
 
   if (image.width() != desired_dimensions || image.height() != desired_dimensions)
@@ -3038,7 +3253,12 @@ void World::importADTHeightmap(glm::vec3 const& pos, float min_height, float max
 
       for_all_chunks_on_tile(pos, [](MapChunk* chunk)
       {
-        NOGGIT_CUR_ACTION->registerChunkTerrainChange(chunk);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkTerrainChange(chunk);
+        }
       });
 
       QImage img;
@@ -3060,7 +3280,12 @@ void World::importADTWatermap(glm::vec3 const& pos, QImage const& image, float m
     int desired_dimensions = tiledEdges ? 256 : 257;
     for_all_chunks_on_tile(pos, [](MapChunk* chunk)
         {
-            NOGGIT_CUR_ACTION->registerChunkLiquidChange(chunk);
+            // Guarded: also reachable from the node editor and from scripting, which
+            // begin no undo action - a null dereference there was an access violation.
+            if (auto* const cur_action = NOGGIT_CUR_ACTION)
+            {
+              cur_action->registerChunkLiquidChange(chunk);
+            }
         });
 
     if (image.width() != desired_dimensions || image.height() != desired_dimensions)
@@ -3108,7 +3333,12 @@ void World::importADTVertexColorMap(glm::vec3 const& pos, int mode, bool tiledEd
 
         for_all_chunks_on_tile(pos, [](MapChunk* chunk)
         {
-          NOGGIT_CUR_ACTION->registerChunkVertexColorChange(chunk);
+          // Guarded: also reachable from the node editor and from scripting, which
+          // begin no undo action - a null dereference there was an access violation.
+          if (auto* const cur_action = NOGGIT_CUR_ACTION)
+          {
+            cur_action->registerChunkVertexColorChange(chunk);
+          }
         });
 
         QImage img;
@@ -3134,7 +3364,12 @@ void World::ensureAllTilesetsADT(glm::vec3 const& pos)
 
   for_all_chunks_on_tile(pos, [=](MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkTextureChange(chunk);
+    }
 
     for (int i = 0; i < 4; ++i)
     {
@@ -3153,7 +3388,12 @@ void World::importADTVertexColorMap(glm::vec3 const& pos, QImage const& image, i
   ZoneScoped;
   for_all_chunks_on_tile(pos, [](MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkVertexColorChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkVertexColorChange(chunk);
+    }
   });
 
   size_t desiredDimensions = tiledEdges ? 256 : 257;
@@ -3186,7 +3426,12 @@ void World::setBaseTexture(glm::vec3 const& pos)
   ZoneScoped;
   for_all_chunks_on_tile(pos, [](MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkTextureChange(chunk);
+    }
     chunk->eraseTextures();
     if (!!Noggit::Ui::selected_texture::get())
     {
@@ -3200,7 +3445,12 @@ void World::clear_shadows(glm::vec3 const& pos)
   ZoneScoped;
   for_all_chunks_on_tile(pos, [] (MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkShadowChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkShadowChange(chunk);
+    }
     chunk->clear_shadows();
   });
 }
@@ -3214,7 +3464,12 @@ void World::swapTexture(glm::vec3 const& pos, scoped_blp_texture_reference tex)
   {
     for_all_chunks_on_tile(pos, [&](MapChunk* chunk)
     {
-      NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+      // Guarded: also reachable from the node editor and from scripting, which
+      // begin no undo action - a null dereference there was an access violation.
+      if (auto* const cur_action = NOGGIT_CUR_ACTION)
+      {
+        cur_action->registerChunkTextureChange(chunk);
+      }
       chunk->switchTexture(tex, *Noggit::Ui::selected_texture::get());
     });
   }
@@ -3272,7 +3527,12 @@ void World::removeTexture(glm::vec3 const& pos, scoped_blp_texture_reference tex
     {
         for_all_chunks_on_tile(pos, [&](MapChunk* chunk)
             {
-                NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+                // Guarded: also reachable from the node editor and from scripting, which
+                // begin no undo action - a null dereference there was an access violation.
+                if (auto* const cur_action = NOGGIT_CUR_ACTION)
+                {
+                  cur_action->registerChunkTextureChange(chunk);
+                }
                 // chunk->switchTexture(tex, *Noggit::Ui::selected_texture::get());
                 chunk->eraseTexture(tex);
             });
@@ -3329,7 +3589,12 @@ void World::clearTexturesLoaded()
   {
     for_all_chunks_on_tile(tile, [](MapChunk* chunk)
     {
-      NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+      // Guarded: also reachable from the node editor and from scripting, which
+      // begin no undo action - a null dereference there was an access violation.
+      if (auto* const cur_action = NOGGIT_CUR_ACTION)
+      {
+        cur_action->registerChunkTextureChange(chunk);
+      }
       chunk->eraseTextures();
     });
   }
@@ -3374,7 +3639,12 @@ void World::removeTexDuplicateOnADT(glm::vec3 const& pos)
   ZoneScoped;
   for_all_chunks_on_tile(pos, [](MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkTextureChange(chunk);
+    }
     chunk->texture_set->removeDuplicate();
   } );
 }
@@ -3384,7 +3654,12 @@ void World::change_texture_flags(glm::vec3 const& pos, scoped_blp_texture_refere
   ZoneScoped;
   for_chunk_at(pos, [&] (MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkTextureChange(chunk);
+    }
     chunk->change_texture_flags(tex, flags);
   });
 }
@@ -3405,7 +3680,12 @@ void World::paintLiquid( glm::vec3 const& pos
   ZoneScoped;
   for_all_chunks_in_range(pos, radius, [&](MapChunk* chunk)
   {
-    NOGGIT_CUR_ACTION->registerChunkLiquidChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkLiquidChange(chunk);
+    }
     chunk->liquid_chunk()->paintLiquid(pos, radius, liquid_id, add, angle, orientation, lock, origin, override_height, override_liquid_id, chunk, opacity_factor);
     return true;
   });
@@ -3419,7 +3699,12 @@ void World::setWaterType(const TileIndex& pos, int type, int layer)
                 {
                   for (int i = 0; i < 16; ++i)
                     for (int j = 0; j < 16; ++j)
-                      NOGGIT_CUR_ACTION->registerChunkLiquidChange(tile->getChunk(i, j));
+                      // Guarded: also reachable from the node editor and from scripting, which
+                      // begin no undo action - a null dereference there was an access violation.
+                      if (auto* const cur_action = NOGGIT_CUR_ACTION)
+                      {
+                        cur_action->registerChunkLiquidChange(tile->getChunk(i, j));
+                      }
 
                   tile->Water.setType (type, layer);
                 }
@@ -3446,7 +3731,12 @@ void World::autoGenWaterTrans(const TileIndex& pos, float factor)
   {
     for (int i = 0; i < 16; ++i)
       for (int j = 0; j < 16; ++j)
-        NOGGIT_CUR_ACTION->registerChunkLiquidChange(tile->getChunk(i, j));
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkLiquidChange(tile->getChunk(i, j));
+        }
 
     tile->Water.autoGen(factor);
   });
@@ -3471,7 +3761,12 @@ void World::CleanupEmptyTexturesChunks()
 
                 if (changed)
                 {
-                    NOGGIT_CUR_ACTION->registerChunkTextureChange(chunk);
+                    // Guarded: also reachable from the node editor and from scripting, which
+                    // begin no undo action - a null dereference there was an access violation.
+                    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+                    {
+                      cur_action->registerChunkTextureChange(chunk);
+                    }
                     tileChanged = true;
                 }
             }
@@ -3500,7 +3795,12 @@ void World::fixAllGaps()
       for (unsigned ty = 0; ty < 16; ty++)
       {
         MapChunk* chunk = tile->getChunk(0, ty);
-        NOGGIT_CUR_ACTION->registerChunkTerrainChange(chunk);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkTerrainChange(chunk);
+        }
         if (chunk->fixGapLeft(left->getChunk(15, ty)))
         {
           chunks.emplace_back(chunk);
@@ -3515,7 +3815,12 @@ void World::fixAllGaps()
       for (unsigned tx = 0; tx < 16; tx++)
       {
         MapChunk* chunk = tile->getChunk(tx, 0);
-        NOGGIT_CUR_ACTION->registerChunkTerrainChange(chunk);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkTerrainChange(chunk);
+        }
         if (chunk->fixGapAbove(above->getChunk(tx, 15)))
         {
           chunks.emplace_back(chunk);
@@ -3530,7 +3835,12 @@ void World::fixAllGaps()
       for (unsigned tx = 0; tx < 16; tx++)
       {
         MapChunk* chunk = tile->getChunk(tx, ty);
-        NOGGIT_CUR_ACTION->registerChunkTerrainChange(chunk);
+        // Guarded: also reachable from the node editor and from scripting, which
+        // begin no undo action - a null dereference there was an access violation.
+        if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        {
+          cur_action->registerChunkTerrainChange(chunk);
+        }
         bool changed = false;
 
         // if the chunk isn't the first of the row
@@ -3584,7 +3894,12 @@ bool World::isUnderMap(glm::vec3 const& pos) const
 void World::selectVertices(glm::vec3 const& pos, float radius)
 {
   ZoneScoped;
-  NOGGIT_CUR_ACTION->registerVertexSelectionChange();
+  // Guarded: also reachable from the node editor and from scripting, which
+  // begin no undo action - a null dereference there was an access violation.
+  if (auto* const cur_action = NOGGIT_CUR_ACTION)
+  {
+    cur_action->registerVertexSelectionChange();
+  }
 
   _vertex_center_updated = false;
   _vertex_border_updated = false;
@@ -3601,7 +3916,12 @@ void World::selectVertices(glm::vec3 const& pos, float radius)
 bool World::deselectVertices(glm::vec3 const& pos, float radius)
 {
   ZoneScoped;
-  NOGGIT_CUR_ACTION->registerVertexSelectionChange();
+  // Guarded: also reachable from the node editor and from scripting, which
+  // begin no undo action - a null dereference there was an access violation.
+  if (auto* const cur_action = NOGGIT_CUR_ACTION)
+  {
+    cur_action->registerVertexSelectionChange();
+  }
 
   _vertex_center_updated = false;
   _vertex_border_updated = false;
@@ -3697,7 +4017,12 @@ void World::flattenVertices (float height)
 void World::clearVertexSelection()
 {
   ZoneScoped;
-  NOGGIT_CUR_ACTION->registerVertexSelectionChange();
+  // Guarded: also reachable from the node editor and from scripting, which
+  // begin no undo action - a null dereference there was an access violation.
+  if (auto* const cur_action = NOGGIT_CUR_ACTION)
+  {
+    cur_action->registerVertexSelectionChange();
+  }
   _vertex_border_updated = false;
   _vertex_center_updated = false;
   _vertices_selected.clear();
@@ -4607,7 +4932,6 @@ void World::select_objects_in_area(
         std::array<glm::vec2, 2> obj_screnbounds = misc::getBoundingBoxScreenBounds(local_extents, VPmatrix
           , viewport_width, viewport_height, num_valid_points, instance->transformMatrix(), bounds_check_scale);
           
-        LogError << "point A reached (" << std::endl;
 
         if (num_valid_points < 3)
           continue;
@@ -4621,7 +4945,6 @@ void World::select_objects_in_area(
         //   continue;
         // }
 
-        LogError << "point B reached (" << std::endl;
 
         // 1 : get the intersection rectangle of screen space and bounding box
         glm::vec2 intersectionMin = glm::max(obj_screnbounds[0], selection_box[0]);
@@ -4631,7 +4954,6 @@ void World::select_objects_in_area(
         if (!(intersectionMin.x < intersectionMax.x) || !(intersectionMin.y < intersectionMax.y))
           continue;
 
-        LogError << "point C reached (" << std::endl;
         
         // 2 : get center
         glm::vec2 intersectionCenter = (intersectionMin + intersectionMax) * 0.5f;

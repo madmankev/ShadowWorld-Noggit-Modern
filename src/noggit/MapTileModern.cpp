@@ -353,14 +353,33 @@ namespace
   }
 
 
-  std::size_t bind_modern_texture_layers(MapChunk* chunk,
-                                         Noggit::Formats::ADT::ModernTexChunk const& tex_chunk,
-                                         Noggit::NoggitRenderContext context,
-                                         bool emit_diag,
-                                         std::size_t chunk_index)
+  //! What binding a chunk's MCLY rows to textures produced.
+  //!
+  //! Returning a bare count hid the difference between "this chunk has no
+  //! texture layers" and "this chunk's layers could not be resolved", so the
+  //! per-tile summary reported `0 failed chunk(s)` for tiles that came up
+  //! completely untextured.
+  struct modern_texture_bind_result
+  {
+    std::size_t layers_bound = 0;
+    //! Layers whose FileDataID the project listfile could not resolve.
+    std::size_t unresolved_layers = 0;
+    //! Layers abandoned because an earlier one in the same chunk failed. They
+    //! cannot be kept: MCLY indices must stay aligned with the texture slots.
+    std::size_t dropped_layers = 0;
+    //! First FileDataID that could not be resolved, for the aggregated report.
+    std::uint32_t first_unresolved_fdid = 0;
+  };
+
+  modern_texture_bind_result bind_modern_texture_layers(MapChunk* chunk,
+                                                        Noggit::Formats::ADT::ModernTexChunk const& tex_chunk,
+                                                        Noggit::NoggitRenderContext context,
+                                                        bool emit_diag,
+                                                        std::size_t chunk_index)
   {
     auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
-    std::size_t bound = 0;
+    modern_texture_bind_result result;
+    auto& bound = result.layers_bound;
 
     for (std::size_t layer_index = 0; layer_index < tex_chunk.layers.size(); ++layer_index)
     {
@@ -368,8 +387,15 @@ namespace
       auto const texture_path = client_data->listfile()->getPath(source_layer.file_data_id);
       if (texture_path.empty())
       {
-        LogError << "[ModernADT] Unable to resolve terrain texture FileDataID "
-                 << source_layer.file_data_id << " through the project listfile." << std::endl;
+        // Deliberately silent here: this is a property of the source data, not
+        // of the chunk, and every tile has 256 chunks reporting the same
+        // FileDataIDs. It used to produce one line per layer per chunk -
+        // 18,000+ identical errors for a single map load, which buried every
+        // real problem in the log. The tile summary reports it once.
+        ++result.unresolved_layers;
+        if (!result.first_unresolved_fdid)
+          result.first_unresolved_fdid = source_layer.file_data_id;
+        result.dropped_layers += tex_chunk.layers.size() - layer_index - 1;
         break;
       }
 
@@ -380,6 +406,7 @@ namespace
       {
         LogError << "[ModernADT] Modern terrain texture layer order mismatch: expected "
                  << layer_index << ", got " << added_layer << "." << std::endl;
+        result.dropped_layers += tex_chunk.layers.size() - layer_index - 1;
         break;
       }
 
@@ -463,7 +490,7 @@ namespace
     }
 
     chunk->requeueChunkUpdate(ChunkUpdateFlags::ALPHAMAP);
-    return bound;
+    return result;
   }
 }
 
@@ -566,6 +593,13 @@ void MapTile::finishLoadingShadowlandsTerrainOnly()
   std::size_t textured_chunks = 0;
   std::size_t texture_layers_bound = 0;
   std::size_t failed_chunks = 0;
+  //! Chunks whose MCLY rows could not be turned into textures (unresolvable
+  //! FileDataIDs). Counted separately from failed_chunks, which only covers
+  //! chunks that threw while loading.
+  std::size_t untextured_chunks = 0;
+  std::size_t unresolved_layers = 0;
+  std::size_t dropped_layers = 0;
+  std::uint32_t first_unresolved_fdid = 0;
   std::string first_chunk_failure;
 
   for (std::size_t next_chunk = 0; next_chunk < scan.mcnk_offsets.size(); ++next_chunk)
@@ -591,11 +625,18 @@ void MapTile::finishLoadingShadowlandsTerrainOnly()
 
       if (next_chunk < tex0_data.chunks.size())
       {
-        auto const bound = bind_modern_texture_layers(
+        auto const bind_result = bind_modern_texture_layers(
           chunk, tex0_data.chunks[next_chunk], _context, emit_diag, next_chunk);
-        texture_layers_bound += bound;
-        if (bound)
+        texture_layers_bound += bind_result.layers_bound;
+        if (bind_result.layers_bound)
           ++textured_chunks;
+        else if (!tex0_data.chunks[next_chunk].layers.empty())
+          ++untextured_chunks;
+
+        unresolved_layers += bind_result.unresolved_layers;
+        dropped_layers += bind_result.dropped_layers;
+        if (!first_unresolved_fdid)
+          first_unresolved_fdid = bind_result.first_unresolved_fdid;
       }
     }
     catch (std::exception const& e)
@@ -621,6 +662,20 @@ void MapTile::finishLoadingShadowlandsTerrainOnly()
           placeholder, &root_file, 0, mBigAlpha, false, true, _context, MapChunkHeader{});
       }
     }
+  }
+
+  if (unresolved_layers > 0)
+  {
+    LogError << "[ModernADT] tile " << index.x << ',' << index.z << ": "
+             << unresolved_layers << " terrain texture layer(s) reference FileDataID "
+             << first_unresolved_fdid << " (and possibly others) that the project"
+                " listfile cannot resolve; " << untextured_chunks
+             << "/256 chunk(s) are left without terrain textures"
+             << (dropped_layers ? ", " + std::to_string(dropped_layers)
+                                 + " further layer(s) dropped with them" : "")
+             << ". This is a data problem: the source TEX0/MCLY rows store id 0,"
+                " or the CASC listfile for this client build is incomplete."
+             << std::endl;
   }
 
   if (failed_chunks > 0)
@@ -663,6 +718,7 @@ void MapTile::finishLoadingShadowlandsTerrainOnly()
   LogDebug << "[ModernADT] Shadowlands tile loaded: " << index.x << ',' << index.z
            << ". Direct MCVT terrain, TEX0 textures on " << textured_chunks
            << "/256 chunks (" << texture_layers_bound << " layers bound, "
+           << untextured_chunks << " untextured, "
            << failed_chunks << " failed chunk(s)); normals recalculated"
               " tile-locally for streaming safety." << std::endl;
 }

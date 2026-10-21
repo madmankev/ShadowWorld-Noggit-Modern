@@ -43,6 +43,8 @@
 #include <exception>
 #include <initializer_list>
 #include <string>
+#include <utility>
+#include <vector>
 using namespace Noggit::Ui::Tools::MapCreationWizard::Ui;
 
 namespace
@@ -82,6 +84,75 @@ namespace
     {
       return fallback;
     }
+  }
+
+  //! One MapDifficulty row, reduced to what the wizard displays.
+  struct mapDifficultyRow
+  {
+    int map_id = -1;
+    int difficulty = 0;
+    int record_id = 0;
+    std::string label;
+  };
+
+  //! MapDifficulty is read once per session and cached.
+  //!
+  //! On client builds whose MapDifficulty layout the definition supplement
+  //! cannot describe, the record reader throws (std::bad_alloc) - and the wizard
+  //! used to re-attempt the full table walk for every map the user clicked and
+  //! for every difficulty selection, producing the same allocation failure
+  //! dozens of times in one session. Cache both the rows and the failure.
+  struct mapDifficultyCache
+  {
+    bool attempted = false;
+    bool failed = false;
+    std::string failure;
+    std::vector<mapDifficultyRow> rows;
+  };
+
+  mapDifficultyCache& mapDifficulties()
+  {
+    static mapDifficultyCache cache;
+
+    if (cache.attempted)
+      return cache;
+
+    cache.attempted = true;
+
+    try
+    {
+      auto difficulty_table = ClientDatabase::getTable("MapDifficulty");
+      auto iterator = difficulty_table.Records();
+
+      while (iterator.HasRecords())
+      {
+        auto record = iterator.Next();
+
+        mapDifficultyRow row;
+        row.record_id = record.RecordId;
+        row.map_id = shadowWorldWizardIntValueOr(record, "MapID", -1);
+        row.difficulty = shadowWorldWizardIntValueOr(record, "Difficulty", 0);
+        row.label = shadowWorldWizardTextValue(record, {"Difficulty"});
+        if (row.label.empty())
+          row.label = std::to_string(row.difficulty);
+
+        cache.rows.push_back(std::move(row));
+      }
+    }
+    catch (std::exception const& e)
+    {
+      cache.failed = true;
+      cache.failure = e.what();
+      cache.rows.clear();
+    }
+    catch (...)
+    {
+      cache.failed = true;
+      cache.failure = "unknown error while reading MapDifficulty";
+      cache.rows.clear();
+    }
+
+    return cache;
   }
 }
 
@@ -808,126 +879,147 @@ void MapCreationWizard::selectMap(int map_id)
     return;
   }
 
-  // check if map has a wdl and prompt to create a new one
-  std::stringstream filename;
-  filename << "World\\Maps\\" << _world->basename << "\\" << _world->basename << ".wdl";
-  if (!Application::NoggitApplication::instance()->clientData()->exists(filename.str()))
-  {
-     QMessageBox prompt;
-     prompt.setText(std::string("This map has no existing horizon data (.wdl file).").c_str());
-     prompt.setInformativeText(std::string("Do you want to generate a new .wdl file ?").c_str());
-     prompt.setStandardButtons(QMessageBox::StandardButton::Yes | QMessageBox::StandardButton::No);
-     prompt.setDefaultButton(QMessageBox::Yes);
-     bool answer = prompt.exec() == QMessageBox::StandardButton::Yes;
-     if (answer)
-     {
-        try
-        {
-          _world->horizon.save_wdl(_world.get(), true);
-        }
-        catch (std::exception const& e)
-        {
-          LogError << "Failed to generate WDL for map " << map_id << ": " << e.what() << std::endl;
-        }
-        catch (...)
-        {
-          LogError << "Failed to generate WDL for map " << map_id << ": unknown exception" << std::endl;
-        }
-        _world->horizon.set_minimap(&_world->mapIndex);
-        // _world = new World(directoryName, map_id, Noggit::NoggitRenderContext::MAP_VIEW); // refresh minimap
-     }
-  }
-
-  _warned_about_missing_world = false;
-
-  _minimap_widget->world(_world.get());
-
-  _directory->setText(QString::fromStdString(directoryName));
-  _directory->setEnabled(false);
-
-  _is_big_alpha->setChecked(_world->mapIndex.hasBigAlpha());
-  _is_big_alpha->setEnabled(false);
-
-  _sort_by_size_cat->setChecked(_world->mapIndex.sort_models_by_size_class());
-
-  _instance_type->setCurrentIndex(std::atoi(instanceType.c_str()));
-
-  _map_name->fill(record, "MapName_lang");
-  _map_desc_alliance->fill(record, "MapDescription1_lang");
-  _map_desc_horde->fill(record, "MapDescription0_lang");
-
-  _area_table_id->setValue(std::atoi(areaTableId.c_str()));
-
-  _loading_screen->setValue(std::atoi(loadingScreenId.c_str()));
-  _minimap_icon_scale->setValue(std::atof(minimapIconScale.c_str()));
-
-  int corpse_map_idx = std::atoi(corpseMapId.c_str());
-  for (int i = 0; i < _corpse_map_id->count(); ++i)
-  {
-    if (_corpse_map_id->itemData(i) == corpse_map_idx)
-    {
-      _corpse_map_id->setCurrentIndex(i);
-    }
-  }
-
-  if(corpseCoords.size() > 1)
-  {
-      _corpse_x->setValue(std::atoi(corpseCoords[0].c_str()));
-      _corpse_y->setValue(std::atoi(corpseCoords[1].c_str()));
-  }
-
-  _time_of_day_override->setValue(std::atoi(timeOfDayOverride.c_str()));
-  _expansion_id->setCurrentIndex(std::atoi(expansionId.c_str()));
-
-  _raid_offset->setValue(std::atoi(raidOffset.c_str())); // only ever used in 2 places? not sure what for
-
-  _max_players->setValue(std::atoi(maxPlayers.c_str()));
-
-  QSignalBlocker const difficulty_type_blocker(_difficulty_type);
-  _difficulty_type->clear();
+  // Everything below only wires the wizard UI to the freshly built world; the
+  // world itself is already usable. An exception (or, with /EHa, an access
+  // violation) part way through used to escape all the way to
+  // NoggitWindow::loadMap, which logged "Failed to select map N: unknown
+  // exception" and left the wizard half populated - empty difficulty selector,
+  // no WMO entry tab - even though the map had loaded. Keep going instead, and
+  // say which step failed.
+  char const* select_phase = "post-load wizard wiring";
   try
   {
-    auto difficulty_table = ClientDatabase::getTable("MapDifficulty");
-    auto iterator = difficulty_table.Records();
-    while (iterator.HasRecords())
+    select_phase = "horizon data (.wdl) check";
+    // check if map has a wdl and prompt to create a new one
+    std::stringstream filename;
+    filename << "World\\Maps\\" << _world->basename << "\\" << _world->basename << ".wdl";
+    if (!Application::NoggitApplication::instance()->clientData()->exists(filename.str()))
     {
-      auto record = iterator.Next();
+       QMessageBox prompt;
+       prompt.setText(std::string("This map has no existing horizon data (.wdl file).").c_str());
+       prompt.setInformativeText(std::string("Do you want to generate a new .wdl file ?").c_str());
+       prompt.setStandardButtons(QMessageBox::StandardButton::Yes | QMessageBox::StandardButton::No);
+       prompt.setDefaultButton(QMessageBox::Yes);
+       bool answer = prompt.exec() == QMessageBox::StandardButton::Yes;
+       if (answer)
+       {
+          try
+          {
+            _world->horizon.save_wdl(_world.get(), true);
+          }
+          catch (std::exception const& e)
+          {
+            LogError << "Failed to generate WDL for map " << map_id << ": " << e.what() << std::endl;
+          }
+          catch (...)
+          {
+            LogError << "Failed to generate WDL for map " << map_id << ": unknown exception" << std::endl;
+          }
+          _world->horizon.set_minimap(&_world->mapIndex);
+          // _world = new World(directoryName, map_id, Noggit::NoggitRenderContext::MAP_VIEW); // refresh minimap
+       }
+    }
 
-      // auto difficulty_id = std::atoi(record.Columns["ID"].Value.c_str());
-      auto record_id = record.RecordId;
-      auto diff_mapId = shadowWorldWizardIntValueOr(record, "MapID", -1);
-      auto difficulty_type = shadowWorldWizardIntValueOr(record, "Difficulty", 0);
-      if (diff_mapId == map_id)
+    _warned_about_missing_world = false;
+
+    select_phase = "minimap handover";
+    _minimap_widget->world(_world.get());
+
+    _directory->setText(QString::fromStdString(directoryName));
+    _directory->setEnabled(false);
+
+    select_phase = "WDT map flags";
+    _is_big_alpha->setChecked(_world->mapIndex.hasBigAlpha());
+    _is_big_alpha->setEnabled(false);
+
+    _sort_by_size_cat->setChecked(_world->mapIndex.sort_models_by_size_class());
+
+    _instance_type->setCurrentIndex(std::atoi(instanceType.c_str()));
+
+    select_phase = "Map.db2 text fields";
+    _map_name->fill(record, "MapName_lang");
+    _map_desc_alliance->fill(record, "MapDescription1_lang");
+    _map_desc_horde->fill(record, "MapDescription0_lang");
+
+    _area_table_id->setValue(std::atoi(areaTableId.c_str()));
+
+    _loading_screen->setValue(std::atoi(loadingScreenId.c_str()));
+    _minimap_icon_scale->setValue(std::atof(minimapIconScale.c_str()));
+
+    int corpse_map_idx = std::atoi(corpseMapId.c_str());
+    for (int i = 0; i < _corpse_map_id->count(); ++i)
+    {
+      if (_corpse_map_id->itemData(i) == corpse_map_idx)
       {
-          std::string difficulty_value = shadowWorldWizardTextValue(record, {"Difficulty"});
-          if (difficulty_value.empty())
-            difficulty_value = std::to_string(difficulty_type);
-          std::string diff_text = "Difficulty " + difficulty_value;
-          _difficulty_type->insertItem(difficulty_type, diff_text.c_str(), QVariant(record_id));
+        _corpse_map_id->setCurrentIndex(i);
       }
     }
-  }
-  catch (std::exception const& e)
-  {
-    // one line per session is enough: this runs for every selected map
-    static bool reported = false;
-    if (!reported)
+
+    if(corpseCoords.size() > 1)
     {
-      reported = true;
-      LogError << "Could not populate map difficulty selector: " << e.what()
-               << " - the difficulty tab stays empty for this session." << std::endl;
+        _corpse_x->setValue(std::atoi(corpseCoords[0].c_str()));
+        _corpse_y->setValue(std::atoi(corpseCoords[1].c_str()));
+    }
+
+    _time_of_day_override->setValue(std::atoi(timeOfDayOverride.c_str()));
+    _expansion_id->setCurrentIndex(std::atoi(expansionId.c_str()));
+
+    _raid_offset->setValue(std::atoi(raidOffset.c_str())); // only ever used in 2 places? not sure what for
+
+    _max_players->setValue(std::atoi(maxPlayers.c_str()));
+
+    select_phase = "map difficulty selector";
+    QSignalBlocker const difficulty_type_blocker(_difficulty_type);
+    _difficulty_type->clear();
+
+    auto const& difficulties = mapDifficulties();
+    if (difficulties.failed)
+    {
+      // one line per session is enough: this runs for every selected map
+      static bool reported = false;
+      if (!reported)
+      {
+        reported = true;
+        LogError << "Could not populate map difficulty selector: " << difficulties.failure
+                 << " - the difficulty tab stays empty for this session and the"
+                    " table is not read again." << std::endl;
+      }
+      else
+      {
+        LogDebug << "Could not populate map difficulty selector: " << difficulties.failure << std::endl;
+      }
+
+      _difficulty_type->setEnabled(false);
     }
     else
     {
-      LogDebug << "Could not populate map difficulty selector: " << e.what() << std::endl;
+      for (auto const& row : difficulties.rows)
+      {
+        if (row.map_id != map_id)
+          continue;
+
+        std::string const diff_text = "Difficulty " + row.label;
+        _difficulty_type->insertItem(row.difficulty, diff_text.c_str(), QVariant(row.record_id));
+      }
     }
+    _difficulty_type->setCurrentIndex(0);
+    selectMapDifficulty();
 
-    _difficulty_type->setEnabled(false);
+    select_phase = "WMO entry tab";
+    populateWmoEntryTab();
   }
-  _difficulty_type->setCurrentIndex(0);
-  selectMapDifficulty();
-
-  populateWmoEntryTab();
+  catch (std::exception const& e)
+  {
+    LogError << "MapCreationWizard::selectMap: failed during '" << select_phase
+             << "' for map " << map_id << ": " << e.what()
+             << ". The map is loaded; some wizard fields may be empty." << std::endl;
+  }
+  catch (...)
+  {
+    LogError << "MapCreationWizard::selectMap: unknown exception during '" << select_phase
+             << "' for map " << map_id
+             << ". The map is loaded; some wizard fields may be empty." << std::endl;
+  }
 }
 
 void MapCreationWizard::selectMapDifficulty()
@@ -937,6 +1029,11 @@ void MapCreationWizard::selectMapDifficulty()
 
     auto selected_difficulty_id = _difficulty_type->itemData(_difficulty_type->currentIndex()).toInt();
     if (!selected_difficulty_id)
+        return;
+
+    // Reading MapDifficulty is known to fail on this client build; retrying it
+    // on every combo box change only repeats the same allocation error.
+    if (mapDifficulties().failed)
         return;
 
     try

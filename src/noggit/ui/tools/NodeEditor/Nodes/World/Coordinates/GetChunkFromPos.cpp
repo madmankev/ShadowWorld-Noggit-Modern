@@ -63,7 +63,10 @@ void GetChunkFromPosNode::compute()
 
   MapChunk* chunk = tile->getChunk((pos.x - tile->xbase) / CHUNKSIZE,
                                    (pos.z - tile->zbase) / CHUNKSIZE);
-  NOGGIT_CUR_ACTION->registerAllChunkChanges(chunk);
+  // A node graph can run with no undo action in progress; the current action
+  // is null then and dereferencing it took the whole editor down.
+  if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    cur_action->registerAllChunkChanges(chunk);
 
   _out_ports[1].out_value = std::make_shared<ChunkData>(chunk);
   _node->onDataUpdated(1);

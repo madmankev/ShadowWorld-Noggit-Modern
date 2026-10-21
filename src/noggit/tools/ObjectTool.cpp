@@ -172,7 +172,18 @@ namespace Noggit
 
     void ObjectTool::registerContextMenuItems(QMenu* menu)
     {
-        auto world = mapView()->getWorld();
+        // The menu is built from a mouse release event, which can arrive while
+        // the view is being torn down (the tools are reset in ~MapView). Both
+        // dereferences below were unguarded and produced an access violation
+        // reported as "unknown exception" during a MouseButtonRelease event.
+        auto* const view = mapView();
+        if (!view)
+            return;
+
+        auto world = view->getWorld();
+        if (!world)
+            return;
+
         addMenuTitle(menu, name());
 
         bool has_selected_objects = world->get_selected_model_count();
@@ -181,24 +192,24 @@ namespace Noggit
         addMenuItem(menu, "Copy Object(s)", QKeySequence::Copy, has_selected_objects, [=] { _objectEditor->copy_current_selection(world); });
         addMenuItem(menu, "Paste Object(s)", QKeySequence::Paste, has_copied_objects, [=] {
             auto mv = mapView();
-            NOGGIT_ACTION_MGR->beginAction(mv, Noggit::ActionFlags::eOBJECTS_ADDED);
+            // Scoped so an exception (or an interrupted paste) cannot leave the
+            // action manager holding a current action forever - that silently
+            // disables every object hotkey and context menu item afterwards.
+            Noggit::ActionScope scope(mv, Noggit::ActionFlags::eOBJECTS_ADDED);
             _objectEditor->pasteObject(mv->cursorPosition(), mv->getCamera()->position, world, &_object_paste_params);
-            NOGGIT_ACTION_MGR->endAction();
             });
 
         addMenuItem(menu, "Delete Object(s)", QKeySequence::Delete, has_selected_objects, [=] {
             auto mv = mapView();
-            NOGGIT_ACTION_MGR->beginAction(mv, Noggit::ActionFlags::eOBJECTS_REMOVED);
+            Noggit::ActionScope scope(mv, Noggit::ActionFlags::eOBJECTS_REMOVED);
             mv->DeleteSelectedObjects();
-            NOGGIT_ACTION_MGR->endAction();
             });
 
         addMenuItem(menu, "Duplicate Object(s)", { "CTRL+B" }, has_copied_objects, [=] {
             auto mv = mapView();
-            NOGGIT_ACTION_MGR->beginAction(mv, Noggit::ActionFlags::eOBJECTS_ADDED);
+            Noggit::ActionScope scope(mv, Noggit::ActionFlags::eOBJECTS_ADDED);
             _objectEditor->copy_current_selection(world);
             _objectEditor->pasteObject(mv->cursorPosition(), mv->getCamera()->position, world, &_object_paste_params);
-            NOGGIT_ACTION_MGR->endAction();
             });
 
         addMenuSeperator(menu);
@@ -210,10 +221,16 @@ namespace Noggit
                 auto last_entry = world->get_last_selected_model();
                 if (last_entry)
                 {
-                    if (!last_entry.value().index() == eEntry_Object)
+                    // Was `!last_entry.value().index() == eEntry_Object`, which
+                    // compared a bool against the enum and so let non-object
+                    // entries through to std::get below.
+                    if (last_entry.value().index() != eEntry_Object)
                         return;
 
                     auto obj = std::get<selected_object_type>(last_entry.value());
+                    if (!obj || !obj->instance_model())
+                        return;
+
                     auto model_name = obj->instance_model()->file_key().filepath();
                     // auto models = world->get_models_by_filename()[model_name];
 
@@ -266,11 +283,17 @@ namespace Noggit
                 auto last_entry = world->get_last_selected_model();
                 if (last_entry)
                 {
-                    if (!last_entry.value().index() == eEntry_Object)
+                    // Was `!last_entry.value().index() == eEntry_Object` (a bool
+                    // compared to the enum), so a map chunk selection reached the
+                    // std::get below and threw std::bad_variant_access.
+                    if (last_entry.value().index() != eEntry_Object)
+                        return;
+
+                    auto obj = std::get<selected_object_type>(last_entry.value());
+                    if (!obj || !obj->instance_model())
                         return;
 
                     _object_palette_dock->setVisible(true);
-                    auto obj = std::get<selected_object_type>(last_entry.value());
                     auto model_name = obj->instance_model()->file_key().filepath();
                     _object_palette->addObjectByFilename(model_name.c_str());
                 }
@@ -292,12 +315,17 @@ namespace Noggit
                 if (!_objectEditor->clipboardSize())
                     return;
 
-                // verify this
-                NOGGIT_ACTION_MGR->beginAction(mv, Noggit::ActionFlags::eOBJECTS_ADDED | Noggit::ActionFlags::eOBJECTS_REMOVED);
+                // verify this - scoped so a failure part way through the replace
+                // cannot leave the action manager locked with a current action
+                // (which silently disables object placement for the whole session).
+                Noggit::ActionScope scope(mv, Noggit::ActionFlags::eOBJECTS_ADDED | Noggit::ActionFlags::eOBJECTS_REMOVED);
 
                 // get the model to replace by
                 auto replace_select = _objectEditor->getClipboard().front();
                 auto replacement_obj = std::get<selected_object_type>(replace_select);
+                if (!replacement_obj || !replacement_obj->instance_model())
+                    return;
+
                 auto& replace_path = replacement_obj->instance_model()->file_key().filepath();
 
                 std::vector<SceneObject*> objects_to_delete;
@@ -357,14 +385,11 @@ namespace Noggit
 
                 world->deleteObjects(objects_to_delete, true);
                 world->reset_selection();
-
-                NOGGIT_ACTION_MGR->endAction();
             });
 
         addMenuItem(menu, "Snap Selected To Ground", Qt::Key_PageDown, has_selected_objects, [=] {
-            NOGGIT_ACTION_MGR->beginAction(mapView(), Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+            Noggit::ActionScope scope(mapView(), Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
             mapView()->snap_selected_models_to_the_ground();
-            NOGGIT_ACTION_MGR->endAction();
             });
 
         addMenuItem(menu, "Save objects coords(to file)", QKeySequence::UnknownKey, has_selected_objects, [=] {
@@ -890,9 +915,8 @@ namespace Noggit
 
         addHotkey("paste"_hash, Hotkey{
             .onPress = [=] {
-                NOGGIT_ACTION_MGR->beginAction(mapView, Noggit::ActionFlags::eOBJECTS_ADDED);
+                Noggit::ActionScope scope(mapView, Noggit::ActionFlags::eOBJECTS_ADDED);
                 _objectEditor->pasteObject(mapView->cursorPosition(), mapView->getCamera()->position, mapView->getWorld(), &_object_paste_params);
-                NOGGIT_ACTION_MGR->endAction();
             },
             .condition = [=] { return mapView->get_editing_mode() == editing_mode::object && !NOGGIT_CUR_ACTION; },
             });
@@ -909,10 +933,9 @@ namespace Noggit
 
         addHotkey("duplacteSelection"_hash, Hotkey{
             .onPress = [=] {
-               NOGGIT_ACTION_MGR->beginAction(mapView, Noggit::ActionFlags::eOBJECTS_ADDED);
+               Noggit::ActionScope scope(mapView, Noggit::ActionFlags::eOBJECTS_ADDED);
                _objectEditor->copy_current_selection(mapView->getWorld());
                _objectEditor->pasteObject(mapView->cursorPosition(), mapView->getCamera()->position, mapView->getWorld(), &_object_paste_params);
-               NOGGIT_ACTION_MGR->endAction();
             },
             .condition = [=] { return mapView->get_editing_mode() == editing_mode::object && !NOGGIT_CUR_ACTION; },
             });

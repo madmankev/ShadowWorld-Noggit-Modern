@@ -18,6 +18,7 @@
 
 #include <array>
 #include <forward_list>
+#include <string>
 
 
 class DBCFile;
@@ -393,6 +394,13 @@ private:
   // catch handlers below report which phase of the frame was running (the
   // outer SafeApplication handler alone can only say "Paint event").
   char const* _paint_phase = "outside paint";
+
+  //! Sub-phase inside tick(). paintGL only knows it was in "tick", which is a
+  //! third of the frame; this says which part of it failed.
+  char const* _tick_phase = "outside tick";
+
+  //! " (sub-phase '...')" when the current paint phase is tick, else empty.
+  std::string tick_sub_phase_note() const;
   bool _destroying = false;
   bool _needs_redraw = false;
   bool _unload_tiles = true;

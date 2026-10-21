@@ -61,7 +61,10 @@ void GetTileFromPosNode::compute()
   {
     for (int j = 0; j > 16; ++j)
     {
-      NOGGIT_CUR_ACTION->registerAllChunkChanges(tile->getChunk(i, j));
+      // A node graph can run with no undo action in progress; the current action
+      // is null then and dereferencing it took the whole editor down.
+      if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        cur_action->registerAllChunkChanges(tile->getChunk(i, j));
     }
   }
 

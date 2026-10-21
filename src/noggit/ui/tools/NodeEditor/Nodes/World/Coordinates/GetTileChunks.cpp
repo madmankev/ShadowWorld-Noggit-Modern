@@ -44,7 +44,10 @@ void GetTileChunksNode::compute()
     {
       MapChunk* chunk = tile->getChunk(i, j);
       _chunks[i * 16 + j] = std::make_shared<ChunkData>();
-      NOGGIT_CUR_ACTION->registerAllChunkChanges(chunk);
+      // A node graph can run with no undo action in progress; the current action
+      // is null then and dereferencing it took the whole editor down.
+      if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        cur_action->registerAllChunkChanges(chunk);
     }
   }
 

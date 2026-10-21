@@ -6,6 +6,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
 
 namespace
@@ -32,12 +36,34 @@ namespace
 
 void ModelManager::report()
 {
+  // Grouped by render context with the live reference count. The managers are
+  // global and shared by the map view, the asset browser and every preview
+  // renderer, so a flat list of file keys could not say whether an entry was
+  // leaked or simply still cached somewhere - the reports grew by a handful of
+  // entries on every map load with no way to tell who was holding them.
+  std::map<Noggit::NoggitRenderContext, std::vector<std::pair<std::string, std::size_t>>> by_context;
+
+  _.apply_detailed ( [&] ( BlizzardArchive::Listfile::FileKey const& key
+                         , Noggit::NoggitRenderContext context
+                         , std::size_t references
+                         )
+                     {
+                       by_context[context].emplace_back (key.stringRepr(), references);
+                     }
+                   );
+
   std::string output = "Still in the Model manager:\n";
-  _.apply ( [&] (BlizzardArchive::Listfile::FileKey const& key, Model const&)
-            {
-              output += " - " + key.stringRepr() + "\n";
-            }
-          );
+
+  for (auto const& entry : by_context)
+  {
+    output += std::string (" ") + Noggit::render_context_name (entry.first) + ": "
+            + std::to_string (entry.second.size ()) + " entr"
+            + (entry.second.size () == 1 ? "y" : "ies") + "\n";
+
+    for (auto const& element : entry.second)
+      output += "  - " + element.first + " (refs " + std::to_string (element.second) + ")\n";
+  }
+
   LogDebug << output;
 }
 

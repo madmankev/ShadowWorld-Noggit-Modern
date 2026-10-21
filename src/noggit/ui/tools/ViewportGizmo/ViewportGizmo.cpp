@@ -166,7 +166,12 @@ void ViewportGizmo::handleTransformGizmo(MapView* map_view
         continue;
 
       obj_instance = std::get<selected_object_type>(selected);
-      NOGGIT_CUR_ACTION->registerObjectTransformed(obj_instance);
+      // Guarded: also reachable from the node editor and from scripting, which
+      // begin no undo action - a null dereference there was an access violation.
+      if (auto* const cur_action = NOGGIT_CUR_ACTION)
+      {
+        cur_action->registerObjectTransformed(obj_instance);
+      }
 
       obj_instance->ensureExtents();
       object_matrix = obj_instance->transformMatrix();
@@ -288,7 +293,12 @@ void ViewportGizmo::handleTransformGizmo(MapView* map_view
         continue;
 
       obj_instance = std::get<selected_object_type>(selected);
-      NOGGIT_CUR_ACTION->registerObjectTransformed(obj_instance);
+      // Guarded: also reachable from the node editor and from scripting, which
+      // begin no undo action - a null dereference there was an access violation.
+      if (auto* const cur_action = NOGGIT_CUR_ACTION)
+      {
+        cur_action->registerObjectTransformed(obj_instance);
+      }
 
       obj_instance->ensureExtents();
       object_matrix = obj_instance->transformMatrix();

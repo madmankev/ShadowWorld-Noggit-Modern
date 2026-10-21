@@ -578,7 +578,12 @@ void MapIndex::setFlag(bool to, glm::vec3 const& pos, uint32_t flag)
     int cz = (pos.z - tile.z * TILESIZE) / CHUNKSIZE;
 
     MapChunk* chunk = getTile(tile)->getChunk(cx, cz);
-    NOGGIT_CUR_ACTION->registerChunkFlagChange(chunk);
+    // Guarded: also reachable from the node editor and from scripting, which
+    // begin no undo action - a null dereference there was an access violation.
+    if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    {
+      cur_action->registerChunkFlagChange(chunk);
+    }
     chunk->setFlag(to, flag);
   }
 }

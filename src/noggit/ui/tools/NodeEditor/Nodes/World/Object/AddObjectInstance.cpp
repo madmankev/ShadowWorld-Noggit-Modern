@@ -76,7 +76,10 @@ void AddObjectInstanceNode::compute()
     return;
   }
 
-  NOGGIT_CUR_ACTION->registerObjectAdded(obj);
+  // A node graph can run with no undo action in progress; the current action
+  // is null then and dereferencing it took the whole editor down.
+  if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    cur_action->registerObjectAdded(obj);
 
   _out_ports[0].out_value = std::make_shared<LogicData>(true);
   _node->onDataUpdated(0);

@@ -119,11 +119,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <random>
+#include <string>
 #include <format>
 
 
@@ -257,6 +259,16 @@ void MapView::set_editing_mode(editing_mode mode)
   }
 
   auto previous_mode = _left_sec_toolbar->getCurrentMode();
+
+  // Recovery point: switching tools closes an edit operation that is still
+  // open. Every object hotkey and context menu item refuses to run while a
+  // current action exists, so a single operation interrupted by an exception
+  // used to disable object placement for the rest of the session with nothing
+  // in the log to explain it.
+  if (previous_mode != mode)
+  {
+    NOGGIT_ACTION_MGR->abandonCurrentAction("the editing mode changed");
+  }
 
   _left_sec_toolbar->setCurrentMode(this, mode);
 
@@ -962,9 +974,10 @@ void MapView::setupEditMenu()
     {
       if (get_editing_mode() == editing_mode::object)
       {
-        NOGGIT_ACTION_MGR->beginAction(this, Noggit::ActionFlags::eOBJECTS_REMOVED);
+        // Scoped: an exception here must not leave a current action behind,
+        // or every object hotkey and context menu item stays disabled.
+        Noggit::ActionScope scope(this, Noggit::ActionFlags::eOBJECTS_REMOVED);
         DeleteSelectedObjects();
-        NOGGIT_ACTION_MGR->endAction();
       }
       else
       {
@@ -986,15 +999,17 @@ void MapView::setupEditMenu()
   ADD_ACTION (edit_menu, "Reset rotation", "Ctrl+R",
               [this]
               {
-                NOGGIT_ACTION_MGR->beginAction(this, Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+                // Scoped: an exception here must not leave a current action behind,
+                // or every object hotkey and context menu item stays disabled.
+                Noggit::ActionScope scope(this, Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
                 ResetSelectedObjectRotation();
-                NOGGIT_ACTION_MGR->endAction();
               });
   ADD_ACTION (edit_menu, "Set to ground", Qt::Key_PageDown,
               [this] {
-                NOGGIT_ACTION_MGR->beginAction(this, Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+                // Scoped: an exception here must not leave a current action behind,
+                // or every object hotkey and context menu item stays disabled.
+                Noggit::ActionScope scope(this, Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
                 snap_selected_models_to_the_ground();
-                NOGGIT_ACTION_MGR->endAction();
 
               });
 
@@ -1096,9 +1111,10 @@ void MapView::setupAssistMenu()
                   {
                     makeCurrent();
                     OpenGL::context::scoped_setter const _ (::gl, context());
-                    NOGGIT_ACTION_MGR->beginAction(this, Noggit::ActionFlags::eOBJECTS_REMOVED);
+                    // Scoped: an exception here must not leave a current action behind,
+                    // or every object hotkey and context menu item stays disabled.
+                    Noggit::ActionScope scope(this, Noggit::ActionFlags::eOBJECTS_REMOVED);
                     _world->clearAllModelsOnADT(_camera.position, true);
-                    NOGGIT_ACTION_MGR->endAction();
                     emit rotationChanged();
                   }
   );
@@ -2319,10 +2335,11 @@ void MapView::setupHotkeys()
     , [&]
               {
 
-                NOGGIT_ACTION_MGR->beginAction(this, Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+                // Scoped: an exception here must not leave a current action behind,
+                // or every object hotkey and context menu item stays disabled.
+                Noggit::ActionScope scope(this, Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
                 _world->set_selected_models_pos(_cursor_pos);
                 emit rotationChanged();
-                NOGGIT_ACTION_MGR->endAction();
               }
     , [&] { return terrainMode == editing_mode::object && !NOGGIT_CUR_ACTION; }
   );
@@ -2858,6 +2875,16 @@ void MapView::initializeGL()
   _gl_initialized = true;
 }
 
+//! Extra detail for the paintGL failure report: when the phase was "tick", name
+//! the sub-phase inside tick() as well.
+std::string MapView::tick_sub_phase_note() const
+{
+  if (_paint_phase && std::strcmp(_paint_phase, "tick") == 0)
+    return std::string{" (sub-phase '"} + (_tick_phase ? _tick_phase : "?") + "')";
+
+  return {};
+}
+
 void MapView::paintGL()
 {
   ZoneScoped;
@@ -3026,15 +3053,17 @@ void MapView::paintGL()
     // paintGL leaves the lock set and every later frame returns early -
     // a frozen viewport with no further log output.
     lock = false;
-    LogError << "MapView::paintGL: exception during '" << _paint_phase
-             << "': " << e.what() << std::endl;
+    LogError << "MapView::paintGL: exception during '" << _paint_phase << "'"
+             << tick_sub_phase_note()
+             << ": " << e.what() << std::endl;
     throw;
   }
   catch (...)
   {
     lock = false;
-    LogError << "MapView::paintGL: unknown exception during '" << _paint_phase
-             << "'. The frame was aborted; the editor keeps running."
+    LogError << "MapView::paintGL: unknown exception during '" << _paint_phase << "'"
+             << tick_sub_phase_note()
+             << ". The frame was aborted; the editor keeps running."
              << std::endl;
     throw;
   }
@@ -3120,6 +3149,12 @@ MapView::~MapView()
 
 void MapView::tick (float dt)
 {
+  // Sub-phase tags: paintGL reports the phase it was in when something threw,
+  // and for the object tool the answer was always just "tick" - 584 identical
+  // lines with nothing to narrow it down. These make the next occurrence
+  // self-describing.
+  _tick_phase = "tick: modifier keys / action modality";
+
 	_mod_shift_down = QApplication::keyboardModifiers().testFlag(Qt::ShiftModifier);
 	_mod_ctrl_down = QApplication::keyboardModifiers().testFlag(Qt::ControlModifier);
 	_mod_alt_down = QApplication::keyboardModifiers().testFlag(Qt::AltModifier);
@@ -3148,11 +3183,14 @@ void MapView::tick (float dt)
   NOGGIT_ACTION_MGR->endActionOnModalityMismatch(action_modality);
 
   // start unloading tiles
+  _tick_phase = "tick: tile streaming (enter/unload)";
   _world->mapIndex.enterTile (TileIndex (_camera.position));
   if (_unload_tiles)
     _world->mapIndex.unloadTiles (TileIndex (_camera.position));
 
   dt = std::min(dt, 1.0f);
+
+  _tick_phase = "tick: camera update";
 
   math::degrees yaw (-_camera.yaw()._);
 
@@ -3254,6 +3292,7 @@ void MapView::tick (float dt)
   _projection = projection();
 
   // update cursor pos after camera
+  _tick_phase = "tick: cursor position";
   auto cur_action = NOGGIT_CUR_ACTION;
 
   if ((cur_action && !cur_action->getBlockCursor()) || !cur_action)
@@ -3295,8 +3334,10 @@ void MapView::tick (float dt)
       .dirRight = dirRight,
   };
 
+  _tick_phase = "tick: tool onTick";
   activeTool()->onTick(dt, tickParams);
 
+  _tick_phase = "tick: selection + rotation editor";
   auto currentSelection = _world->current_selection();
   if (_world->has_selection())
   {
@@ -3318,6 +3359,7 @@ void MapView::tick (float dt)
     lastSelected = currentSelection;
   }
 
+  _tick_phase = "tick: status bar";
   QString status;
   status += ( QString ("tile: %1 %2")
             . arg (std::floor (_camera.position.x / TILESIZE))
@@ -3381,6 +3423,7 @@ void MapView::tick (float dt)
 	  _status_selection->setText(QString::number(currentSelection.size()) + " objects selected");
   }
 
+  _tick_phase = "tick: detail infos";
   if (selection_changed || NOGGIT_CUR_ACTION)
     updateDetailInfos(); // checks if sel changed
 
@@ -3425,11 +3468,14 @@ void MapView::tick (float dt)
     _last_fps_update = 0.f;
   }
 
+  _tick_phase = "tick: culling/object counters";
   _status_culling->setText ( "Loaded tiles: " + QString::number(_world->getNumLoadedTiles())
                          + ", Rendered tiles: " + QString::number(_world->getNumRenderedTiles())
                          + "\t Loaded objects: " + QString::number(_world->getModelInstanceStorage().getTotalModelsCount())
                          + ", Rendered objects: " + QString::number(_world->getNumRenderedObjects())
   );
+
+  _tick_phase = "outside tick";
 }
 
 glm::vec4 MapView::normalized_device_coords (int x, int y) const
@@ -4570,29 +4616,38 @@ void MapView::ShowContextMenu(QPoint pos)
 
     // TODO : build the menu only once, store it and instead use setVisible ?
 
-    QMenu* menu = new QMenu(this);
+    // The menu is built fresh for every right click, so it has to die with this
+    // function. It used to be heap allocated and never deleted, and the two
+    // actions were parented to the MapView instead of the menu - every context
+    // menu leaked a QMenu plus two QActions that kept their Undo / Ctrl+Shift+Z
+    // shortcuts registered on the view. A long editing session accumulated
+    // thousands of them (memory growth, and ambiguous shortcut dispatch).
+    if (!activeTool())
+      return;
+
+    QMenu menu(this);
 
     // Undo
-    QAction action_undo("Undo", this);
-    menu->addAction(&action_undo);
+    QAction action_undo("Undo", &menu);
+    menu.addAction(&action_undo);
     action_undo.setShortcut(QKeySequence::Undo);
     QObject::connect(&action_undo, &QAction::triggered, [=]()
         {
             NOGGIT_ACTION_MGR->undo();
         });
     // Redo
-    QAction action_redo("Redo", this);
-    menu->addAction(&action_redo);
+    QAction action_redo("Redo", &menu);
+    menu.addAction(&action_redo);
     action_redo.setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Z));
     QObject::connect(&action_redo, &QAction::triggered, [=]()
         {
             NOGGIT_ACTION_MGR->redo();
         });
 
-    activeTool()->registerContextMenuItems(menu);
+    activeTool()->registerContextMenuItems(&menu);
 
-    menu->exec(mapToGlobal(pos)); // synch
-    // menu->popup(mapToGlobal(pos)); // asynch, needs to be preloaded to work
+    menu.exec(mapToGlobal(pos)); // synch
+    // menu.popup(mapToGlobal(pos)); // asynch, needs to be preloaded to work
 }
 
 void MapView::onApplicationStateChanged(Qt::ApplicationState state)

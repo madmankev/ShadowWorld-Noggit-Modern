@@ -9,7 +9,11 @@
 
 #include <glm/gtc/constants.hpp>
 
+#include <QOpenGLContext>
+
 #include <array>
+#include <map>
+#include <utility>
 #include <vector>
 
 using namespace Noggit::Rendering::Primitives;
@@ -21,15 +25,24 @@ WireBox& WireBox::operator=(WireBox& box)
 
 WireBox& Noggit::Rendering::Primitives::WireBox::getInstance(Noggit::NoggitRenderContext context)
 {
-  static std::unordered_map<Noggit::NoggitRenderContext, WireBox> instances;
+  // Keyed on the QOpenGLContext as well as the render context id: the VAO, the
+  // index buffer and the shader program are uploaded lazily inside whichever GL
+  // context is current on the first draw. A render context id can outlive its
+  // QOpenGLContext (the map view recreates it) or be shared by a second view,
+  // and the cached names then belong to a context that no longer exists - every
+  // glBindVertexArray/glDrawElements with them raised GL_INVALID_OPERATION and
+  // the selection box simply did not render.
+  //
+  // std::map, not unordered_map: the value type is neither copyable nor movable,
+  // and a map keeps node addresses stable so handing out references stays safe.
+  // Stale entries are never touched again; at exit their destructors skip the
+  // release because no GL context is current (see can_release_gl_resource()).
+  using instance_key = std::pair<Noggit::NoggitRenderContext, QOpenGLContext*>;
+  static std::map<instance_key, WireBox> instances;
 
-  if (instances.find(context) == instances.end())
-  {
-    WireBox instance;
-    instances[context] = instance;
-  }
+  instance_key const key{context, QOpenGLContext::currentContext()};
 
-  return instances.at(context);
+  return instances[key];
 }
 
 void WireBox::draw ( glm::mat4x4 const& model_view

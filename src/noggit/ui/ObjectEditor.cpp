@@ -41,6 +41,8 @@
 #include <QtWidgets/QMessageBox>
 #include <QtWidgets/QSlider>
 
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <regex>
 #include <sstream>
@@ -731,21 +733,33 @@ namespace Noggit
 
     object_editor::~object_editor()
     {
+      clearClipboard();
+    }
+
+    void object_editor::clearClipboard()
+    {
+      // copy() and copy_current_selection() fill the clipboard with clones made
+      // with new. Emptying the vector without freeing them leaked one
+      // ModelInstance/WMOInstance - plus the model or WMO reference each of them
+      // keeps alive - every time the clipboard was replaced, which is how a long
+      // editing session exhausted memory (std::bad_alloc while loading assets,
+      // empty map difficulty selectors, failed texture loads).
+      //
+      // The old destructor also tested `instance.index() == eWMO` instead of the
+      // object kind, so WMO clones were never freed at all.
       for (auto& instance : _model_instance_created)
       {
-        auto obj = std::get<selected_object_type>(instance);
+        auto* obj = std::get_if<selected_object_type>(&instance);
+        if (!obj || !*obj)
+          continue;
 
-        if (obj->which() == eMODEL)
-        {
-          ModelInstance* mi = static_cast<ModelInstance*>(obj);
-          delete mi;
-        }
-        else if (instance.index() == eWMO)
-        {
-          WMOInstance* wi = static_cast<WMOInstance*>(obj);
-          delete wi;
-        }
+        if ((*obj)->which() == eMODEL)
+          delete static_cast<ModelInstance*>(*obj);
+        else if ((*obj)->which() == eWMO)
+          delete static_cast<WMOInstance*>(*obj);
       }
+
+      _model_instance_created.clear();
     }
 
     void object_editor::changeRadius(float change)
@@ -784,6 +798,17 @@ namespace Noggit
                                     , object_paste_params* paste_params
                                     )
     {
+      // Say so instead of returning silently: an empty clipboard is the normal
+      // result of copy() rejecting a file name, and "paste does nothing" with an
+      // empty log is undebuggable from the user's side.
+      if (_model_instance_created.empty())
+      {
+        LogError << "object_editor::pasteObject: the object clipboard is empty."
+                    " Pick a model in the object palette or the asset browser, or"
+                    " copy a selection first." << std::endl;
+        return;
+      }
+
       auto last_entry = world->get_last_selected_model();
 
       for (auto& selection : _model_instance_created)
@@ -952,9 +977,20 @@ namespace Noggit
       }
 
       // std::vector<selection_type> selected_model;
-      _model_instance_created.clear();
+      clearClipboard();
 
-      if (filename.ends_with(".m2"))
+      // Case-insensitive, and accepting the legacy model extensions: the object
+      // palette, the asset browser and hand written palette files are not
+      // consistent about case, and ModelManager normalises .mdx/.mdl to .m2
+      // anyway. Matching only on an exact ".m2"/".wmo" suffix silently put
+      // nothing on the clipboard, and pasting then did nothing at all with no
+      // message anywhere - one of the ways "placing objects" appeared broken.
+      std::string lowered = filename;
+      std::transform ( lowered.begin(), lowered.end(), lowered.begin()
+                     , [] (unsigned char c) { return static_cast<char>(std::tolower(c)); }
+                     );
+
+      if (lowered.ends_with(".m2") || lowered.ends_with(".mdx") || lowered.ends_with(".mdl"))
       {
         ModelInstance* mi = new ModelInstance(filename, _map_view->getRenderContext());
 
@@ -963,7 +999,7 @@ namespace Noggit
         // selected_model.push_back(mi);
         update_clipboard();
       }
-      else if (filename.ends_with(".wmo"))
+      else if (lowered.ends_with(".wmo"))
       {
         WMOInstance* wi = new WMOInstance(filename, _map_view->getRenderContext());
 
@@ -971,6 +1007,12 @@ namespace Noggit
 
         // selected_model.push_back(wi);
         update_clipboard();
+      }
+      else
+      {
+        LogError << "object_editor::copy: \"" << filename
+                 << "\" is neither a model (.m2/.mdx/.mdl) nor a WMO (.wmo);"
+                    " nothing was put on the object clipboard." << std::endl;
       }
     }
 
@@ -985,7 +1027,7 @@ namespace Noggit
       }
 
       // std::vector<selection_type> selected_model;
-      _model_instance_created.clear();
+      clearClipboard();
 
       for (auto& selection : current_selection)
       {

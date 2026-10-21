@@ -45,9 +45,22 @@ namespace Noggit
 
       if(!std::filesystem::exists("scripts"))
       {
-          _tool->addLog("[error]: 'scripts' directory does not exist");
-          set_tool_error(_tool);
-          return;
+          // Not an error condition: a fresh checkout simply has no scripts yet.
+          // Creating the folder keeps the scripting tool usable (drop a .lua file
+          // in and restart the tool) instead of putting it into its error state -
+          // which it did on every map view construction, once per map load.
+          std::error_code ec;
+          std::filesystem::create_directories("scripts", ec);
+
+          if (ec)
+          {
+              _tool->addLog("[error]: could not create the 'scripts' directory: " + ec.message());
+              set_tool_error(_tool);
+              return;
+          }
+
+          _tool->addLog("[info]: created an empty 'scripts' directory next to the executable;"
+                        " put .lua files there to extend Noggit.");
       }
 
       if(!std::filesystem::is_directory("scripts"))

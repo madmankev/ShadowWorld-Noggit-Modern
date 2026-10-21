@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace
@@ -42,13 +43,40 @@ namespace
     return row.Columns.find(field) != row.Columns.end();
   }
 
+  //! Tolerant numeric parse.
+  //!
+  //! std::stoll & friends throw std::invalid_argument on the empty or
+  //! non-numeric strings a substituted DB2 definition (a layout recorded for a
+  //! different client build) yields for columns it cannot map. A single bad
+  //! value used to abort the entire bridge, so the legacy table stayed empty and
+  //! the map lost every ground effect, area name or liquid type in it. Fall back
+  //! to a default instead and let the caller report how many rows were affected.
+  template<typename T>
+  T parse_number_or(std::string const& value, T fallback)
+  {
+    if (value.empty())
+      return fallback;
+
+    try
+    {
+      if constexpr (std::is_floating_point_v<T>)
+        return static_cast<T>(std::stof(value));
+      else
+        return static_cast<T>(std::stoll(value));
+    }
+    catch (...)
+    {
+      return fallback;
+    }
+  }
+
   std::uint32_t id_of(Row const& row)
   {
     if (row.RecordId >= 0)
       return static_cast<std::uint32_t>(row.RecordId);
     auto const it = row.Columns.find("ID");
     if (it != row.Columns.end() && !it->second.Value.empty())
-      return static_cast<std::uint32_t>(std::stoul(it->second.Value));
+      return static_cast<std::uint32_t>(parse_number_or<long long>(it->second.Value, 0));
     return 0;
   }
 
@@ -58,7 +86,7 @@ namespace
     if (it == row.Columns.end())
       return fallback;
     if (!it->second.Value.empty())
-      return static_cast<std::uint32_t>(std::stoull(it->second.Value));
+      return static_cast<std::uint32_t>(parse_number_or<long long>(it->second.Value, static_cast<long long>(fallback)));
     if (it->second.ReferenceId >= 0)
       return static_cast<std::uint32_t>(it->second.ReferenceId);
     return fallback;
@@ -69,7 +97,7 @@ namespace
     auto const it = row.Columns.find(field);
     if (it == row.Columns.end() || it->second.Value.empty())
       return fallback;
-    return std::stoi(it->second.Value);
+    return static_cast<int>(parse_number_or<long long>(it->second.Value, fallback));
   }
 
   float f32(Row const& row, std::string const& field, float fallback = 0.0f)
@@ -77,7 +105,7 @@ namespace
     auto const it = row.Columns.find(field);
     if (it == row.Columns.end() || it->second.Value.empty())
       return fallback;
-    return std::stof(it->second.Value);
+    return parse_number_or<float>(it->second.Value, fallback);
   }
 
   std::string text(Row const& row, std::string const& field)
@@ -102,12 +130,7 @@ namespace
       return result;
     result.reserve(it->second.Values.size());
     for (auto const& value : it->second.Values)
-    {
-      if constexpr (std::is_floating_point_v<T>)
-        result.push_back(static_cast<T>(std::stof(value)));
-      else
-        result.push_back(static_cast<T>(std::stoll(value)));
-    }
+      result.push_back(parse_number_or<T>(value, T{}));
     return result;
   }
 
@@ -134,6 +157,55 @@ namespace
     }
   }
 
+  //! Runs `body` for every row of `table`, isolating a failure to its own row.
+  //!
+  //! RecordByPosition() and the column lookups can throw for individual rows when
+  //! the definition that was substituted for this client build does not describe
+  //! the file. Letting that escape bridge_optional() dropped the whole table, so
+  //! the legacy view ended up empty even though most rows were readable. Skipped
+  //! rows are counted and reported once per table.
+  template<typename Body>
+  void for_each_row_guarded(char const* table_name, Table& table, Body&& body)
+  {
+    std::uint32_t bridged = 0;
+    std::uint32_t skipped = 0;
+    std::string first_error;
+
+    for (std::uint32_t i = 0; i < table.RecordCount(); ++i)
+    {
+      try
+      {
+        body(i, table.RecordByPosition(i));
+        ++bridged;
+      }
+      catch (std::exception const& e)
+      {
+        if (first_error.empty())
+          first_error = e.what();
+        ++skipped;
+      }
+      catch (...)
+      {
+        if (first_error.empty())
+          first_error = "unknown error";
+        ++skipped;
+      }
+    }
+
+    if (skipped)
+    {
+      LogError << "[ModernDB2][Map] " << table_name << " legacy bridge: " << bridged
+               << " row(s) bridged, " << skipped << " skipped (first error: "
+               << first_error << "). The bridged rows are still written out."
+               << std::endl;
+    }
+    else
+    {
+      Log << "[ModernDB2][Map] " << table_name << " legacy bridge: " << bridged
+          << " row(s)." << std::endl;
+    }
+  }
+
   template<typename Fn>
   bool bridge_optional(char const* name, Fn&& fn)
   {
@@ -153,9 +225,8 @@ namespace
   {
     auto out = DBCFile::createNew("DBFilesClient\\AreaTable.dbc", 36, 36 * sizeof(std::uint32_t));
     Log << "[ModernDB2][Map] AreaTable legacy bridge start, records=" << table.RecordCount() << std::endl;
-    for (std::uint32_t i = 0; i < table.RecordCount(); ++i)
+    for_each_row_guarded("AreaTable", table, [&](std::uint32_t i, Row const& row)
     {
-      auto row = table.RecordByPosition(i);
       if (i % 500 == 0)
         Log << "[ModernDB2][Map] AreaTable legacy row " << i << " id=" << id_of(row) << std::endl;
       auto rec = out.addRecord(id_of(row));
@@ -178,7 +249,7 @@ namespace
       rec.write(AreaDB::MinElevation, f32(row, "MinElevation"));
       rec.write(AreaDB::AmbientMultiplier, f32(row, "Ambient_multiplier", 1.0f));
       rec.write(AreaDB::LightId, u32(row, "LightID"));
-    }
+    });
     Log << "[ModernDB2][Map] AreaTable legacy rows complete; replacing global DBC" << std::endl;
     gAreaDB.overwriteWith(out);
     Log << "[ModernDB2][Map] AreaTable legacy bridge complete" << std::endl;
@@ -187,9 +258,8 @@ namespace
   void bridge_area_trigger(Table& table)
   {
     auto out = DBCFile::createNew("DBFilesClient\\AreaTrigger.dbc", 10, 10 * sizeof(std::uint32_t));
-    for (std::uint32_t i = 0; i < table.RecordCount(); ++i)
+    for_each_row_guarded("AreaTrigger", table, [&](std::uint32_t i, Row const& row)
     {
-      auto row = table.RecordByPosition(i);
       auto rec = out.addRecord(id_of(row));
       rec.write(AreaTriggerDB::MapId, u32(row, "ContinentID"));
       auto pos = numbers<float>(row, "Pos");
@@ -201,7 +271,7 @@ namespace
       rec.write(AreaTriggerDB::Width, f32(row, "Box_width"));
       rec.write(AreaTriggerDB::Height, f32(row, "Box_height"));
       rec.write(AreaTriggerDB::Orientation, f32(row, "Box_yaw"));
-    }
+    });
     gAreaTriggerDB.overwriteWith(out);
   }
 
@@ -212,9 +282,8 @@ namespace
   void bridge_map(Table& table)
   {
     auto out = DBCFile::createNew("DBFilesClient\\Map.dbc", 66, 66 * sizeof(std::uint32_t));
-    for (std::uint32_t i = 0; i < table.RecordCount(); ++i)
+    for_each_row_guarded("Map", table, [&](std::uint32_t i, Row const& row)
     {
-      auto row = table.RecordByPosition(i);
       auto rec = out.addRecord(id_of(row));
       rec.writeString(MapDB::InternalName, text(row, "Directory"));
       rec.write(MapDB::AreaType, u32(row, "InstanceType"));
@@ -234,7 +303,7 @@ namespace
       rec.write(MapDB::ExpansionID, u32(row, "ExpansionID"));
       rec.write(MapDB::RaidOffset, u32(row, "RaidOffset"));
       rec.write(MapDB::NumberOfPlayers, u32(row, "MaxPlayers"));
-    }
+    });
 
     // Merge maps registered by the map wizard (issue: Map.db2 registration for
     // new maps). CASC rows win on id conflicts. Registrations carry modern
@@ -296,24 +365,22 @@ namespace
   void bridge_loading_screens(Table& table)
   {
     auto out = DBCFile::createNew("DBFilesClient\\LoadingScreens.dbc", 3, 3 * sizeof(std::uint32_t));
-    for (std::uint32_t i = 0; i < table.RecordCount(); ++i)
+    for_each_row_guarded("LoadingScreens", table, [&](std::uint32_t i, Row const& row)
     {
-      auto row = table.RecordByPosition(i);
       auto rec = out.addRecord(id_of(row));
       rec.writeString(LoadingScreensDB::Name, text(row, "Name"));
       // Modern clients use FileDataIDs instead of a string path. Keep Path empty;
       // modern consumers should use the DB2 row directly.
       rec.writeString(LoadingScreensDB::Path, {});
-    }
+    });
     gLoadingScreensDB.overwriteWith(out);
   }
 
   void bridge_wmo_area(Table& table)
   {
     auto out = DBCFile::createNew("DBFilesClient\\WMOAreaTable.dbc", 28, 28 * sizeof(std::uint32_t));
-    for (std::uint32_t i = 0; i < table.RecordCount(); ++i)
+    for_each_row_guarded("WMOAreaTable", table, [&](std::uint32_t i, Row const& row)
     {
-      auto row = table.RecordByPosition(i);
       auto rec = out.addRecord(id_of(row));
       rec.write(WMOAreaTableDB::WmoId, u32(row, "WMOID"));
       rec.write(WMOAreaTableDB::NameSetId, u32(row, "NameSetID"));
@@ -326,16 +393,15 @@ namespace
       rec.write(WMOAreaTableDB::Flags, u32(row, "Flags"));
       rec.write(WMOAreaTableDB::AreaTableRefId, u32(row, "AreaTableID"));
       rec.writeLocalizedString(WMOAreaTableDB::Name, text(row, "AreaName_lang"), 0);
-    }
+    });
     gWMOAreaTableDB.overwriteWith(out);
   }
 
   void bridge_ground_effect_texture(Table& table)
   {
     auto out = DBCFile::createNew("DBFilesClient\\GroundEffectTexture.dbc", 11, 11 * sizeof(std::uint32_t));
-    for (std::uint32_t i = 0; i < table.RecordCount(); ++i)
+    for_each_row_guarded("GroundEffectTexture", table, [&](std::uint32_t i, Row const& row)
     {
-      auto row = table.RecordByPosition(i);
       auto rec = out.addRecord(id_of(row));
       auto doodads = numbers<std::uint32_t>(row, "DoodadID");
       auto weights = numbers<std::uint32_t>(row, "DoodadWeight");
@@ -346,38 +412,36 @@ namespace
       }
       rec.write(GroundEffectTextureDB::Amount, u32(row, "Density"));
       rec.write(GroundEffectTextureDB::TerrainType, u32(row, "Sound"));
-    }
+    });
     gGroundEffectTextureDB.overwriteWith(out);
   }
 
   void bridge_ground_effect_doodad(Table& table)
   {
     auto out = DBCFile::createNew("DBFilesClient\\GroundEffectDoodad.dbc", 3, 3 * sizeof(std::uint32_t));
-    for (std::uint32_t i = 0; i < table.RecordCount(); ++i)
+    for_each_row_guarded("GroundEffectDoodad", table, [&](std::uint32_t i, Row const& row)
     {
-      auto row = table.RecordByPosition(i);
       auto rec = out.addRecord(id_of(row));
       // 9.2.7 stores ModelFileID rather than a path. Preserve a readable token in
       // the legacy compatibility view; modern asset resolution should use FDID.
       auto const fdid = u32(row, "ModelFileID");
       rec.writeString(GroundEffectDoodadDB::Filename, fdid ? ("filedataid:" + std::to_string(fdid)) : text(row, "Doodadpath"));
       rec.write(GroundEffectDoodadDB::Flags, u32(row, "Flags"));
-    }
+    });
     gGroundEffectDoodadDB.overwriteWith(out);
   }
 
   void bridge_liquid_type(Table& table)
   {
     auto out = DBCFile::createNew("DBFilesClient\\LiquidType.dbc", 31, 31 * sizeof(std::uint32_t));
-    for (std::uint32_t i = 0; i < table.RecordCount(); ++i)
+    for_each_row_guarded("LiquidType", table, [&](std::uint32_t i, Row const& row)
     {
-      auto row = table.RecordByPosition(i);
       auto rec = out.addRecord(id_of(row));
       rec.writeString(LiquidTypeDB::Name, text(row, "Name"));
       // Do not pretend modern MaterialID/SoundBank fields are the old liquid
       // Type/ShaderType enums. Those are intentionally left zero until the
       // renderer/editor consumes LiquidMaterial.db2 natively.
-    }
+    });
     gLiquidTypeDB.overwriteWith(out);
   }
 }

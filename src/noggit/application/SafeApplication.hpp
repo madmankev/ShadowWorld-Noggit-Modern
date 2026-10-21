@@ -3,6 +3,7 @@
 #ifndef NOGGIT_SAFE_APPLICATION_HPP
 #define NOGGIT_SAFE_APPLICATION_HPP
 
+#include <noggit/ActionManager.hpp>
 #include <noggit/Log.h>
 
 #include <QCoreApplication>
@@ -40,10 +41,12 @@ namespace Noggit::Application
       }
       catch (std::exception const& exception)
       {
+        releaseInterruptedAction();
         report(receiver, event, exception.what());
       }
       catch (...)
       {
+        releaseInterruptedAction();
         report(receiver, event, "unknown exception");
       }
 
@@ -51,6 +54,22 @@ namespace Noggit::Application
     }
 
   private:
+    //! An exception escaping an event handler means whatever edit operation the
+    //! handler started will never be ended. Left alone the ActionManager keeps a
+    //! "current action" forever and the editor silently stops accepting object
+    //! placement, copy, paste and delete (their hotkeys and menu items are gated
+    //! on there being no action in progress).
+    static void releaseInterruptedAction()
+    {
+      try
+      {
+        Noggit::ActionManager::instance()->abandonCurrentAction("an event handler threw");
+      }
+      catch (...)
+      {
+      }
+    }
+
     //! Named by hand: QEvent::Type is not a reflected enum in every Qt version
     //! this fork builds against.
     static char const* eventName(QEvent const* event)

@@ -162,7 +162,11 @@ namespace Noggit
 
         auto* pLabel = new QLabel(title);
         pLabel->setAlignment(Qt::AlignCenter);
-        auto* separator = new QWidgetAction(_mapView);
+        // Parented to the menu, not the map view: these helpers run every time a
+        // context menu is built (i.e. on every right click), and QWidgetAction
+        // added with addAction() is not reparented by Qt. Parenting to _mapView
+        // leaked one per menu for the lifetime of the view.
+        auto* separator = new QWidgetAction(menu);
         separator->setDefaultWidget(pLabel);
         menu->addAction(separator);
 
@@ -171,7 +175,10 @@ namespace Noggit
 
     void Tool::addMenuItem(QMenu* menu, char const* title, QKeySequence shortcut, BoolToggleProperty& property)
     {
-        QAction* action(new QAction(title, _mapView));
+        // See addMenuTitle(): parented to the menu so it is freed with it, and so
+        // the connection to the property is dropped instead of piling up one stale
+        // QAction per context menu build.
+        QAction* action(new QAction(title, menu));
         action->setShortcut(shortcut);
         action->setCheckable(true);
         action->setChecked(property.get());
@@ -186,7 +193,7 @@ namespace Noggit
 
     void Tool::addMenuItem(QMenu* menu, char const* title, BoolToggleProperty& property)
     {
-        QAction* action(new QAction(title, _mapView));
+        QAction* action(new QAction(title, menu));
         action->setCheckable(true);
         action->setChecked(property.get());
         menu->addAction(action);

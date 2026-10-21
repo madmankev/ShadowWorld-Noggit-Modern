@@ -74,28 +74,28 @@ namespace Noggit
       connect ( _rotation_x, qOverload<double> (&QDoubleSpinBox::valueChanged)
               , [&, world, parent]
       {
-        NOGGIT_ACTION_MGR->beginAction(reinterpret_cast<MapView*>(parent),
-                                                       Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+        // Scoped: an exception escaping a spin box handler must not leave the
+        // action manager holding a current action (that disables object editing).
+        Noggit::ActionScope scope(reinterpret_cast<MapView*>(parent), Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
         set_model_rotation(world);
-        NOGGIT_ACTION_MGR->endAction();
       }
               );
       connect ( _rotation_z, qOverload<double> (&QDoubleSpinBox::valueChanged)
               , [&, world, parent]
               {
-                NOGGIT_ACTION_MGR->beginAction(reinterpret_cast<MapView*>(parent),
-                                                               Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+                // Scoped: an exception escaping a spin box handler must not leave the
+                // action manager holding a current action (that disables object editing).
+                Noggit::ActionScope scope(reinterpret_cast<MapView*>(parent), Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
                 set_model_rotation(world);
-                NOGGIT_ACTION_MGR->endAction();
               }
               );
       connect ( _rotation_y, qOverload<double> (&QDoubleSpinBox::valueChanged)
               , [&, world, parent]
               {
-                NOGGIT_ACTION_MGR->beginAction(reinterpret_cast<MapView*>(parent),
-                                                               Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+                // Scoped: an exception escaping a spin box handler must not leave the
+                // action manager holding a current action (that disables object editing).
+                Noggit::ActionScope scope(reinterpret_cast<MapView*>(parent), Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
                 set_model_rotation(world);
-                NOGGIT_ACTION_MGR->endAction();
               }
               );
 
@@ -107,10 +107,10 @@ namespace Noggit
                     // avoid rotation changes when losing focus
                     if (_rotation_x->hasFocus())
                     {
-                      NOGGIT_ACTION_MGR->beginAction(reinterpret_cast<MapView*>(parent),
-                                                                     Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+                      // Scoped: an exception escaping a spin box handler must not leave the
+                      // action manager holding a current action (that disables object editing).
+                      Noggit::ActionScope scope(reinterpret_cast<MapView*>(parent), Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
                       change_models_rotation(world);
-                      NOGGIT_ACTION_MGR->endAction();
                     }
                     else // reset value
                     {
@@ -128,10 +128,10 @@ namespace Noggit
                     // avoid rotation changes when losing focus
                     if (_rotation_z->hasFocus())
                     {
-                      NOGGIT_ACTION_MGR->beginAction(reinterpret_cast<MapView*>(parent),
-                                                                     Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+                      // Scoped: an exception escaping a spin box handler must not leave the
+                      // action manager holding a current action (that disables object editing).
+                      Noggit::ActionScope scope(reinterpret_cast<MapView*>(parent), Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
                       change_models_rotation(world);
-                      NOGGIT_ACTION_MGR->endAction();
                     }
                     else // reset value
                     {
@@ -149,10 +149,10 @@ namespace Noggit
                     // avoid rotation changes when losing focus
                     if (_rotation_y->hasFocus())
                     {
-                      NOGGIT_ACTION_MGR->beginAction(reinterpret_cast<MapView*>(parent),
-                                                                     Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+                      // Scoped: an exception escaping a spin box handler must not leave the
+                      // action manager holding a current action (that disables object editing).
+                      Noggit::ActionScope scope(reinterpret_cast<MapView*>(parent), Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
                       change_models_rotation(world);
-                      NOGGIT_ACTION_MGR->endAction();
                     }
                     else // reset value
                     {
@@ -166,28 +166,28 @@ namespace Noggit
       connect ( _position_x, qOverload<double> (&QDoubleSpinBox::valueChanged)
               , [&, world, parent] (double v)
                 {
-                  NOGGIT_ACTION_MGR->beginAction(reinterpret_cast<MapView*>(parent),
-                                                                 Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+                  // Scoped: an exception escaping a spin box handler must not leave the
+                  // action manager holding a current action (that disables object editing).
+                  Noggit::ActionScope scope(reinterpret_cast<MapView*>(parent), Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
                   world->set_selected_models_pos(v, _position_y->value(), _position_z->value());
-                  NOGGIT_ACTION_MGR->endAction();
                 }
               );
       connect ( _position_z, qOverload<double> (&QDoubleSpinBox::valueChanged)
               , [&, world, parent] (double v)
                 {
-                  NOGGIT_ACTION_MGR->beginAction(reinterpret_cast<MapView*>(parent),
-                                                                 Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+                  // Scoped: an exception escaping a spin box handler must not leave the
+                  // action manager holding a current action (that disables object editing).
+                  Noggit::ActionScope scope(reinterpret_cast<MapView*>(parent), Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
                   world->set_selected_models_pos(_position_x->value(), _position_y->value(), v);
-                  NOGGIT_ACTION_MGR->endAction();
                 }
               );
       connect ( _position_y, qOverload<double> (&QDoubleSpinBox::valueChanged)
               , [&, world, parent] (double v)
                 {
-                  NOGGIT_ACTION_MGR->beginAction(reinterpret_cast<MapView*>(parent),
-                                                                 Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+                  // Scoped: an exception escaping a spin box handler must not leave the
+                  // action manager holding a current action (that disables object editing).
+                  Noggit::ActionScope scope(reinterpret_cast<MapView*>(parent), Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
                   world->set_selected_models_pos(_position_x->value(), v, _position_z->value());
-                  NOGGIT_ACTION_MGR->endAction();
                 }
               );
 
@@ -196,10 +196,10 @@ namespace Noggit
                 {
                   if (!world->has_multiple_model_selected())
                   {
-                    NOGGIT_ACTION_MGR->beginAction(reinterpret_cast<MapView*>(parent),
-                                                                   Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+                    // Scoped: an exception escaping a spin box handler must not leave the
+                    // action manager holding a current action (that disables object editing).
+                    Noggit::ActionScope scope(reinterpret_cast<MapView*>(parent), Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
                     world->scale_selected_models(v, World::object_scaling_type::set);
-                    NOGGIT_ACTION_MGR->endAction();
                   }
                 }
               );
@@ -211,10 +211,10 @@ namespace Noggit
                     // avoid scale changes when losing focus
                     if (_scale->hasFocus())
                     {
-                      NOGGIT_ACTION_MGR->beginAction(reinterpret_cast<MapView*>(parent),
-                                                                     Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
+                      // Scoped: an exception escaping a spin box handler must not leave the
+                      // action manager holding a current action (that disables object editing).
+                      Noggit::ActionScope scope(reinterpret_cast<MapView*>(parent), Noggit::ActionFlags::eOBJECTS_TRANSFORMED);
                       world->scale_selected_models(_scale->value(), World::object_scaling_type::mult);
-                      NOGGIT_ACTION_MGR->endAction();
                     }
                     else // reset value
                     {
@@ -238,7 +238,15 @@ namespace Noggit
 
       if (world->has_multiple_model_selected())
       {
-        glm::vec3 const& p = world->multi_select_pivot().value();
+        // The pivot is only computed when at least one of the selected entries is
+        // an object; has_multiple_model_selected() can be true with a pivot that
+        // was just reset, and value() on an empty optional aborted the editor
+        // (std::bad_optional_access during the per-frame rotationChanged signal).
+        auto const pivot = world->multi_select_pivot();
+        if (!pivot.has_value())
+          return;
+
+        glm::vec3 const& p = *pivot;
 
         _position_x->setValue(p.x);
         _position_y->setValue(p.y);
@@ -265,7 +273,15 @@ namespace Noggit
         {
           selection_type selection = entry.value();
 
-          auto obj = std::get<selected_object_type>(selection);
+          auto obj = std::get_if<selected_object_type>(&selection)
+            ? *std::get_if<selected_object_type>(&selection)
+            : nullptr;
+
+          // A deleted instance can still be referenced by a stale selection
+          // entry; dereferencing it here is what crashed every frame while the
+          // object tool was active.
+          if (!obj)
+            return;
 
           if(obj->which() == eWMO)
           {

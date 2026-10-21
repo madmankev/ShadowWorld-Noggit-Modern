@@ -54,7 +54,10 @@ void GetChunksInRangeNode::compute()
     for (MapChunk* chunk : tile->chunks_in_range({pos.x, pos.y, pos.z}, radius))
     {
       _chunks.push_back(std::make_shared<ChunkData>(chunk));
-      NOGGIT_CUR_ACTION->registerAllChunkChanges(chunk);
+      // A node graph can run with no undo action in progress; the current action
+      // is null then and dereferencing it took the whole editor down.
+      if (auto* const cur_action = NOGGIT_CUR_ACTION)
+        cur_action->registerAllChunkChanges(chunk);
     }
   }
 

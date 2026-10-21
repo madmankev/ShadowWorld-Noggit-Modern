@@ -1,6 +1,7 @@
 // This file is part of Noggit3, licensed under GNU General Public License (version 3).
 
 #include "ActionManager.hpp"
+#include <noggit/Log.h>
 #include <noggit/MapView.h>
 #include <cmath>
 
@@ -105,6 +106,12 @@ void ActionManager::endAction()
 {
   assert(_cur_action && "ActionStack Error: endAction() called with no action running.");
 
+  // Release builds have no assert: calling endAction() without a running action
+  // (a double end, or one after abandonCurrentAction() already cleaned up) used
+  // to dereference a null pointer here.
+  if (!_cur_action)
+    return;
+
   _cur_action->finish();
   if (!(_cur_action->getFlags() & eDO_NOT_WRITE_HISTORY))
   {
@@ -117,6 +124,59 @@ void ActionManager::endAction()
 
   emit onActionEnd(_cur_action);
   _cur_action = nullptr;
+  emit currentActionChanged(_undo_index);
+}
+
+void ActionManager::abandonCurrentAction(char const* reason)
+{
+  Action* action = _cur_action;
+  if (!action)
+    return;
+
+  // Clear the member before doing anything else: finish() and the signals below
+  // can re-enter the manager (undo buttons refreshing, tools reacting to
+  // onActionEnd), and re-entering with a half closed action is how the editor
+  // ends up permanently refusing to record operations.
+  _cur_action = nullptr;
+
+  // An action with modality controllers is a drag that was still held down; a
+  // tool switch or a lost mouse release cutting it short is ordinary. A one-shot
+  // action (paste, delete, duplicate, ...) still being open means something
+  // bailed out between beginAction() and endAction(), which is what used to
+  // wedge the editor - that one is worth an error line.
+  if (action->getModalityControllers())
+  {
+    LogDebug << "ActionManager: closed an in-flight drag operation ("
+             << (reason && *reason ? reason : "unknown reason") << ")." << std::endl;
+  }
+  else
+  {
+    LogError << "ActionManager: an edit operation was interrupted ("
+             << (reason && *reason ? reason : "unknown reason")
+             << "). The pending undo entry was closed so the editor stays usable;"
+             << " the interrupted change may be incomplete." << std::endl;
+  }
+
+  try
+  {
+    action->finish();
+  }
+  catch (...)
+  {
+    // The whole point of this function is to run while the editor is already in
+    // a bad state; a second failure here must not escape.
+  }
+
+  if (!(action->getFlags() & eDO_NOT_WRITE_HISTORY))
+  {
+    emit addedAction(action);
+  }
+  else if (!_action_stack.empty() && _action_stack.back() == action)
+  {
+    _action_stack.pop_back();
+  }
+
+  emit onActionEnd(action);
   emit currentActionChanged(_undo_index);
 }
 

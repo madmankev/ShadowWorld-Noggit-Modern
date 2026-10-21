@@ -147,6 +147,26 @@ namespace Noggit
       }
     }
 
+    //! Diagnostic walk: file key, owning context and live reference count.
+    //!
+    //! The manager reports use this to say *who* is still holding an entry,
+    //! which is what tells a genuine leak apart from a preview renderer cache.
+    void apply_detailed(std::function<void (BlizzardArchive::Listfile::FileKey const&
+                                            , NoggitRenderContext
+                                            , std::size_t)> fun) const
+    {
+      std::scoped_lock lock(_mutex);
+
+      for (auto const& element : _elements)
+      {
+        auto const count_it = _counts.find(element.first);
+        fun ( element.first.second
+            , static_cast<NoggitRenderContext>(element.first.first)
+            , count_it == _counts.end() ? 0 : count_it->second
+            );
+      }
+    }
+
     void context_aware_apply(std::function<void (BlizzardArchive::Listfile::FileKey const&, T&)> fun, Noggit::NoggitRenderContext context)
     {
       std::scoped_lock lock(_mutex);

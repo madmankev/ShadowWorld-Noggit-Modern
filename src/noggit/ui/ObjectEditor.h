@@ -123,6 +123,9 @@ namespace Noggit
       
       void update_clipboard();
 
+      //! Empties the clipboard and frees the clones it owns.
+      void clearClipboard();
+
       void showImportModels();
       void SaveObjecttoTXT (World*);
       int pasteMode;

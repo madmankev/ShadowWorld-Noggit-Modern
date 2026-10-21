@@ -440,7 +440,12 @@ namespace Noggit::Ui::Tools
       area_trigger trigger{ _selected_trigger_id };
 
       NOGGIT_ACTION_MGR->beginAction(_map_view, Noggit::ActionFlags::eAREA_TRIGGER_TRANSFORMED, Noggit::ActionModalityControllers::eLMB);
-      NOGGIT_CUR_ACTION->registerAreaTriggerTransformed(&trigger);
+      // Guarded: also reachable from the node editor and from scripting, which
+      // begin no undo action - a null dereference there was an access violation.
+      if (auto* const cur_action = NOGGIT_CUR_ACTION)
+      {
+        cur_action->registerAreaTriggerTransformed(&trigger);
+      }
 
       trigger.position = value;
       trigger.write_to_dbc();
@@ -457,7 +462,12 @@ namespace Noggit::Ui::Tools
       area_trigger trigger{ _selected_trigger_id };
 
       NOGGIT_ACTION_MGR->beginAction(_map_view, Noggit::ActionFlags::eAREA_TRIGGER_TRANSFORMED, Noggit::ActionModalityControllers::eLMB);
-      NOGGIT_CUR_ACTION->registerAreaTriggerTransformed(&trigger);
+      // Guarded: also reachable from the node editor and from scripting, which
+      // begin no undo action - a null dereference there was an access violation.
+      if (auto* const cur_action = NOGGIT_CUR_ACTION)
+      {
+        cur_action->registerAreaTriggerTransformed(&trigger);
+      }
 
       if (trigger.trigger.index() != 1)
       {
@@ -481,7 +491,12 @@ namespace Noggit::Ui::Tools
       area_trigger trigger{ _selected_trigger_id };
 
       NOGGIT_ACTION_MGR->beginAction(_map_view, Noggit::ActionFlags::eAREA_TRIGGER_TRANSFORMED, Noggit::ActionModalityControllers::eLMB);
-      NOGGIT_CUR_ACTION->registerAreaTriggerTransformed(&trigger);
+      // Guarded: also reachable from the node editor and from scripting, which
+      // begin no undo action - a null dereference there was an access violation.
+      if (auto* const cur_action = NOGGIT_CUR_ACTION)
+      {
+        cur_action->registerAreaTriggerTransformed(&trigger);
+      }
 
       if (trigger.trigger.index() != 1)
       {
@@ -505,7 +520,12 @@ namespace Noggit::Ui::Tools
       area_trigger trigger{ _selected_trigger_id };
 
       NOGGIT_ACTION_MGR->beginAction(_map_view, Noggit::ActionFlags::eAREA_TRIGGER_TRANSFORMED, Noggit::ActionModalityControllers::eLMB);
-      NOGGIT_CUR_ACTION->registerAreaTriggerTransformed(&trigger);
+      // Guarded: also reachable from the node editor and from scripting, which
+      // begin no undo action - a null dereference there was an access violation.
+      if (auto* const cur_action = NOGGIT_CUR_ACTION)
+      {
+        cur_action->registerAreaTriggerTransformed(&trigger);
+      }
 
       if (trigger.trigger.index() != 0)
       {

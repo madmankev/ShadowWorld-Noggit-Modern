@@ -115,24 +115,39 @@ namespace OpenGL
     template<GLenum type>
     buffer_binder<type>::buffer_binder (GLuint buffer, std::source_location const& caller)
     {
-      //! \todo commented out targets not supported on macOS due to
-      //! old OpenGL. If we ever need them, find workaround.
-      gl.getIntegerv ( type == GL_ARRAY_BUFFER ? GL_ARRAY_BUFFER_BINDING
-                     //: type == GL_ATOMIC_COUNTER_BUFFER ? GL_ATOMIC_COUNTER_BUFFER_BINDING
-                     //: type == GL_COPY_READ_BUFFER ? GL_COPY_READ_BUFFER_BINDING
-                     //: type == GL_COPY_WRITE_BUFFER ? GL_COPY_WRITE_BUFFER_BINDING
-                     : type == GL_DRAW_INDIRECT_BUFFER ? GL_DRAW_INDIRECT_BUFFER_BINDING
-                     //: type == GL_DISPATCH_INDIRECT_BUFFER ? GL_DISPATCH_INDIRECT_BUFFER_BINDING
-                     : type == GL_ELEMENT_ARRAY_BUFFER ? GL_ELEMENT_ARRAY_BUFFER_BINDING
-                     : type == GL_PIXEL_PACK_BUFFER ? GL_PIXEL_PACK_BUFFER_BINDING
-                     : type == GL_PIXEL_UNPACK_BUFFER ? GL_PIXEL_UNPACK_BUFFER_BINDING
-                     //: type == GL_SHADER_STORAGE_BUFFER ? GL_SHADER_STORAGE_BUFFER_BINDING
-                     : type == GL_TRANSFORM_FEEDBACK_BUFFER ? GL_TRANSFORM_FEEDBACK_BUFFER_BINDING
-                     : type == GL_UNIFORM_BUFFER ? GL_UNIFORM_BUFFER_BINDING
-                     : type == GL_TEXTURE_BUFFER ? GL_TEXTURE_BINDING_BUFFER
-                     : throw std::logic_error ("bad bind target")
-                     , reinterpret_cast<GLint*> (&_old)
-                     );
+      // GL_TEXTURE_BINDING_BUFFER does not answer "which buffer is bound to
+      // GL_TEXTURE_BUFFER": it reports the *texture object* bound to that target
+      // on the active texture unit. Feeding that texture name back into
+      // glBindBuffer on scope exit made every animated model raise
+      // GL_INVALID_OPERATION twice per frame (measured: >10k errors every five
+      // seconds while flying over a populated map). There is no generic query
+      // for the TEXTURE_BUFFER data-store binding - it lives on the texture
+      // object - and no caller nests binders for this target, so restoring "no
+      // buffer" is both correct and cheap.
+      if constexpr (type == GL_TEXTURE_BUFFER)
+      {
+        _old = 0;
+      }
+      else
+      {
+        //! \todo commented out targets not supported on macOS due to
+        //! old OpenGL. If we ever need them, find workaround.
+        gl.getIntegerv ( type == GL_ARRAY_BUFFER ? GL_ARRAY_BUFFER_BINDING
+                       //: type == GL_ATOMIC_COUNTER_BUFFER ? GL_ATOMIC_COUNTER_BUFFER_BINDING
+                       //: type == GL_COPY_READ_BUFFER ? GL_COPY_READ_BUFFER_BINDING
+                       //: type == GL_COPY_WRITE_BUFFER ? GL_COPY_WRITE_BUFFER_BINDING
+                       : type == GL_DRAW_INDIRECT_BUFFER ? GL_DRAW_INDIRECT_BUFFER_BINDING
+                       //: type == GL_DISPATCH_INDIRECT_BUFFER ? GL_DISPATCH_INDIRECT_BUFFER_BINDING
+                       : type == GL_ELEMENT_ARRAY_BUFFER ? GL_ELEMENT_ARRAY_BUFFER_BINDING
+                       : type == GL_PIXEL_PACK_BUFFER ? GL_PIXEL_PACK_BUFFER_BINDING
+                       : type == GL_PIXEL_UNPACK_BUFFER ? GL_PIXEL_UNPACK_BUFFER_BINDING
+                       //: type == GL_SHADER_STORAGE_BUFFER ? GL_SHADER_STORAGE_BUFFER_BINDING
+                       : type == GL_TRANSFORM_FEEDBACK_BUFFER ? GL_TRANSFORM_FEEDBACK_BUFFER_BINDING
+                       : type == GL_UNIFORM_BUFFER ? GL_UNIFORM_BUFFER_BINDING
+                       : throw std::logic_error ("bad bind target")
+                       , reinterpret_cast<GLint*> (&_old)
+                       );
+      }
       gl.bindBuffer (type, buffer, caller);
     }
     template<GLenum type>

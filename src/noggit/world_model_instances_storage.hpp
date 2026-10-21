@@ -103,7 +103,8 @@ namespace Noggit
 
   private:
     World* _world;
-    std::mutex _mutex;
+    //! mutable: the const accessors (getTotalModelsCount) have to hold it too.
+    mutable std::mutex _mutex;
     std::atomic<bool> _uid_duplicates_found = {false};
 
     m2_instance_umap _m2s;

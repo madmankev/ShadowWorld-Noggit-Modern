@@ -33,7 +33,10 @@ void ObjectInstanceSetRotationNode::compute()
   OpenGL::context::scoped_setter const _ (::gl, gCurrentContext->getViewport()->context());
 
   SceneObject* obj = defaultPortData<ObjectInstanceData>(PortType::In, 1)->value();
-  NOGGIT_CUR_ACTION->registerObjectTransformed(obj);
+  // A node graph can run with no undo action in progress; the current action
+  // is null then and dereferencing it took the whole editor down.
+  if (auto* const cur_action = NOGGIT_CUR_ACTION)
+    cur_action->registerObjectTransformed(obj);
   auto rot_data = defaultPortData<Vector3DData>(PortType::In, 2);
   glm::vec3 const& rotation = rot_data->value();
 
