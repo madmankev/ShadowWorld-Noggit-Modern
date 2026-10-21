@@ -1101,7 +1101,16 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
                  << ", " << report.skipped_placements << " placement(s) dropped"
                  << (report.first_skipped_placement.empty()
                        ? "" : " (first: " + report.first_skipped_placement + ")")
-                 << ". Everything else on the tile was saved." << std::endl;
+                 << ", " << report.custom_fdids
+                 << " asset(s) written with an invented FileDataID the client does not know"
+                 << (report.first_custom_fdid.empty()
+                       ? "" : " (first: " + report.first_custom_fdid + ")")
+                 << (report.synthesized
+                       ? ". The parts were synthesized from the edited tile, so chunks that"
+                         " exist only in the retail file (MTXP height textures, MHID) are"
+                         " not in this tile."
+                       : ". Everything else on the tile was saved.")
+                 << std::endl;
       }
 
       wrote_split_tile = true;
@@ -1114,38 +1123,27 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
 
     if (!wrote_split_tile)
     {
-      // Last resort, and the reason a tile can no longer save as nothing at all.
+      // Nothing was written, and nothing is written as a substitute either.
       //
-      // The modern conversion needs the original split tile to merge into, so it
-      // can preserve every chunk the editor does not own. When that original
-      // cannot be used the whole tile was dropped - heights, textures, objects
-      // and water together - which is what "I saved it and reloading showed none
-      // of the changes" turned out to be. Noggit's canonical single-file ADT
-      // needs no original, and AsyncLoader's split-ADT gate explicitly routes a
-      // legacy_single_file ROOT to the legacy loader, so the tile reloads.
-      try
-      {
-        BlizzardArchive::ClientFile fallback(_file_key.filepath(), client_data,
-                                             BlizzardArchive::ClientFile::NEW_FILE);
-        fallback.setBuffer(lADTFile.data_up_to(lCurrentPosition));
-        fallback.save();
-
-        LogError << "[ModernADT][Save] Wrote \"" << _file_key.stringRepr()
-                 << "\" as a legacy single-file ADT because the modern split"
-                    " conversion could not run. The edits are on disk and the tile"
-                    " will reload in Noggit, but chunks that only exist in the"
-                    " split parts (MTXP height textures, MHID, the MAID-referenced"
-                    " LOD) are not carried over." << std::endl;
-      }
-      catch (std::exception const& error)
-      {
-        LogError << "[ModernADT][Save] Could not write \"" << _file_key.stringRepr()
-                 << "\" in either the modern split or the legacy single-file"
-                    " format: " << error.what()
-                 << ". No part of this tile was written, so none of the edits to"
-                    " it are on disk." << std::endl;
-        return false;
-      }
+      // modern_backing is only ever set for a client newer than WotLK, so the
+      // canonical single-file serialization is the wrong format here by
+      // definition: a modern client resolves its ADT parts through the WDT's
+      // MAID FileDataIDs and reads a WotLK monolith as a corrupt modern ROOT
+      // rather than as a tile it can load. Emitting one would trade a tile that
+      // is visibly missing for a tile that is silently broken.
+      //
+      // The recovery that does keep the format is inside the codec: when the
+      // original split tile cannot be merged into, the parts are synthesized
+      // from the edited tile with the legacy-to-modern converter. Reaching this
+      // point means even that failed, which is a real defect and is reported as
+      // one instead of being papered over.
+      LogError << "[ModernADT][Save] No part of \"" << _file_key.stringRepr()
+               << "\" was written, in neither the merged nor the synthesized"
+                  " modern format, so none of the edits to this tile are on disk."
+                  " The tile stays marked as changed and the next save retries it."
+                  " Please report this with the log: the [ModernADT][Save] lines"
+                  " above say which of the two paths failed and why." << std::endl;
+      return false;
     }
   }
   else

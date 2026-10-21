@@ -3,6 +3,7 @@
 #include <noggit/formats/adt/ShadowlandsADTCodec.hpp>
 
 #include <noggit/formats/adt/ModernAdtWriter.hpp>
+#include <noggit/formats/conversion/MapConversion.hpp>
 
 #include <noggit/application/NoggitApplication.hpp>
 #include <noggit/MapHeaders.h>
@@ -1092,7 +1093,178 @@ namespace Noggit::Formats::ADT
       std::vector<std::uint8_t> tex0;
       std::vector<std::uint8_t> obj0;
       std::vector<std::uint8_t> obj1;
+      //! OBJ1 and LOD are written from the originals only when the rest of the
+      //! tile was merged into them. Synthesized parts do not line up with the
+      //! original OBJ1 any more, and an OBJ1 that contradicts its ROOT is worse
+      //! than none: the loader treats a missing optional part as a degraded
+      //! load, not as a refusal. Whatever is not overridden still comes from
+      //! CASC untouched.
+      bool write_obj1 = false;
+      bool write_lod = false;
     };
+
+    //! Base name of the map a ROOT path belongs to, for conversion metadata.
+    std::string map_name_from_root_path(std::string const& root_path)
+    {
+      std::filesystem::path const path(root_path);
+      auto const parent = path.parent_path();
+      return parent.empty() ? path.stem().string() : parent.filename().string();
+    }
+
+    //! Whether the originals in this backing store can be merged into.
+    //!
+    //! The normal save patches the original split tile so every chunk the editor
+    //! does not own survives. That needs a usable ROOT (MVER/MHDR/MCIN plus the
+    //! 256 MCNKs) and TEX0/OBJ0 to rewrite. When any of them is missing, or too
+    //! small to hold a chunk header, merging is impossible - which used to abort
+    //! the save and cost the whole tile.
+    //!
+    //! The three are decided together on purpose. A synthesized TEX0 written next
+    //! to an original-derived ROOT would not be self-consistent: MDID indices in
+    //! one have to line up with MCLY layers in the other.
+    bool backing_supports_merge(ShadowlandsADTBackingStore const& backing,
+                                std::string* reason)
+    {
+      auto const fail = [reason](std::string text)
+      {
+        if (reason)
+          *reason = std::move(text);
+        return false;
+      };
+
+      struct required_part
+      {
+        ShadowlandsADTPart part;
+        char const* label;
+      };
+
+      for (auto const& entry : {required_part{ShadowlandsADTPart::Root, "ROOT"},
+                                required_part{ShadowlandsADTPart::Tex0, "TEX0"},
+                                required_part{ShadowlandsADTPart::Obj0, "OBJ0"}})
+      {
+        if (!backing.has(entry.part))
+          return fail(std::string(entry.label) + " could not be read");
+
+        auto const size = backing.part(entry.part).bytes.size();
+        if (size < minimum_adt_part_size)
+          return fail(std::string(entry.label) + " is " + std::to_string(size)
+                      + " byte(s), too small to hold a chunk header");
+      }
+
+      try
+      {
+        auto const chunks =
+          parse_chunks(backing.part(ShadowlandsADTPart::Root).bytes, "original ROOT");
+
+        for (auto const magic : {fourcc('M','V','E','R'), fourcc('M','H','D','R'),
+                                 fourcc('M','C','I','N')})
+        {
+          if (!find_chunk(chunks, magic))
+            return fail("original ROOT is missing a chunk the writer needs");
+        }
+      }
+      catch (std::exception const& error)
+      {
+        return fail(std::string("original ROOT does not parse: ") + error.what());
+      }
+
+      return true;
+    }
+
+    //! Build the split parts from the edited tile alone, in the client's own
+    //! modern format.
+    //!
+    //! This is the recovery path for a tile whose originals cannot be merged
+    //! into. It reuses the legacy-to-modern converter, so the output is the same
+    //! ROOT/TEX0/OBJ0 a converted map gets rather than a downgraded WotLK file:
+    //! a modern client and Noggit's split-ADT gate both read it as a modern
+    //! split tile. What cannot be recovered is data Noggit never had - chunks
+    //! with no legacy equivalent are simply absent.
+    ConvertedParts synthesize_parts(std::string const& root_path,
+                                    std::vector<std::uint8_t> const& legacy_adt,
+                                    ModernAdtFdidHints const& fdid_hints,
+                                    ModernAdtSaveReport* report)
+    {
+      auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
+
+      Conversion::ConversionFileSource source;
+      // Nothing else is read: a single tile is converted from bytes already in
+      // hand, not from files on disk.
+      source.read_file = [](std::string const&)
+      {
+        return std::optional<std::vector<std::uint8_t>>{};
+      };
+      // Same resolution order the merge path uses: the FileDataID the tile was
+      // loaded with, then the project listfile. Feeding the hints in is what
+      // keeps assets resolving on a retail install whose listfile is incomplete;
+      // without them the allocator would invent ids the client never heard of.
+      source.path_to_fdid = [&fdid_hints](std::string const& path)
+      {
+        if (auto const id = lookup_fdid(path, fdid_hints))
+          return std::optional<std::uint32_t>{id};
+        return std::optional<std::uint32_t>{};
+      };
+      source.fdid_to_path = [client_data](std::uint32_t fdid)
+      {
+        return client_data->listfile()->getPath(fdid);
+      };
+
+      Conversion::ConversionOptions options;
+      options.target = Conversion::MapFormat::modern;
+      options.map_name = map_name_from_root_path(root_path);
+      options.convert_liquids = true;
+      options.include_wdl = false;
+
+      Conversion::FdidAllocator fdids(options.custom_fdid_base);
+      Conversion::AdtConversionResult result;
+      try
+      {
+        result = Conversion::convertAdtLegacyToModern(legacy_adt, options, source, fdids);
+      }
+      catch (std::exception const& error)
+      {
+        throw ModernAdtWriterError(std::string("could not synthesize modern split parts: ")
+                                   + error.what());
+      }
+
+      if (!result.ok || result.root.empty() || result.tex0.empty() || result.obj0.empty())
+      {
+        std::string first_error;
+        for (auto const& issue : result.issues)
+        {
+          if (issue.severity == Conversion::ConversionIssue::Severity::error)
+          {
+            first_error = issue.message;
+            break;
+          }
+        }
+        throw ModernAdtWriterError("could not synthesize modern split parts from the edited"
+                                   " tile" + (first_error.empty() ? std::string()
+                                                                  : ": " + first_error));
+      }
+
+      // Ids the allocator had to invent are still written, but the client has no
+      // such FileDataID, so those assets stay invisible. That is worth saying out
+      // loud rather than leaving the player to wonder.
+      if (report)
+      {
+        report->synthesized = true;
+        for (auto const& assignment : fdids.assignments())
+        {
+          if (assignment.existed_in_client)
+            continue;
+          ++report->custom_fdids;
+          if (report->first_custom_fdid.empty())
+            report->first_custom_fdid = assignment.path;
+        }
+      }
+
+      ConvertedParts parts;
+      parts.root = std::move(result.root);
+      parts.tex0 = std::move(result.tex0);
+      parts.obj0 = std::move(result.obj0);
+      return parts;
+    }
 
     ConvertedParts assemble_parts(ShadowlandsADTBackingStore const& backing,
                                   std::vector<std::uint8_t> const& legacy_adt,
@@ -1100,6 +1272,17 @@ namespace Noggit::Formats::ADT
                                   ModernAdtFdidHints const& fdid_hints,
                                   ModernAdtSaveReport* report)
     {
+      std::string merge_blocker;
+      if (!backing_supports_merge(backing, &merge_blocker))
+      {
+        LogError << "[ModernADT][Save] The original split tile for '"
+                 << backing.source.root_path << "' cannot be merged into ("
+                 << merge_blocker << "), so the modern parts were synthesized from"
+                    " the edited tile instead of the save being abandoned. The"
+                    " output is still a modern split ADT." << std::endl;
+        return synthesize_parts(backing.source.root_path, legacy_adt, fdid_hints, report);
+      }
+
       ConvertedParts parts;
       auto const& profile = adt_profile_v18();
 
@@ -1135,7 +1318,9 @@ namespace Noggit::Formats::ADT
       auto const modf = modern_placements<ENTRY_MODF>(
         legacy_adt, fourcc('M','O','D','F'), fourcc('M','W','I','D'), fourcc('M','W','M','O'),
         original_obj0, fdid_hints, report);
-      if (backing.has(ShadowlandsADTPart::Obj1))
+      parts.write_obj1 = backing.has(ShadowlandsADTPart::Obj1);
+      parts.write_lod = backing.has(ShadowlandsADTPart::Lod);
+      if (parts.write_obj1)
         parts.obj1 = rewrite_obj1(backing.part(ShadowlandsADTPart::Obj1).bytes, mddf, modf);
       parts.obj0 = original_obj0;
       parts.obj0 = replace_top_level_chunk(
@@ -1171,9 +1356,9 @@ namespace Noggit::Formats::ADT
         throw ModernAdtValidationError(std::string("TEX0 alpha layout: ") + error.what());
       }
       ModernAdtWriter::validatePartOrThrow(profile, parts.obj0, AdtPartExpectation::Object, "OBJ0 part");
-      if (backing.has(ShadowlandsADTPart::Obj1))
+      if (parts.write_obj1)
         ModernAdtWriter::validatePartOrThrow(profile, parts.obj1, AdtPartExpectation::Generic, "OBJ1 part");
-      if (backing.has(ShadowlandsADTPart::Lod))
+      if (parts.write_lod)
         ModernAdtWriter::validatePartOrThrow(
           profile, backing.part(ShadowlandsADTPart::Lod).bytes, AdtPartExpectation::Generic, "LOD part");
 
@@ -1182,9 +1367,9 @@ namespace Noggit::Formats::ADT
       save_part(backing.source.paths[part_index(ShadowlandsADTPart::Root)], parts.root);
       save_part(backing.source.paths[part_index(ShadowlandsADTPart::Tex0)], parts.tex0);
       save_part(backing.source.paths[part_index(ShadowlandsADTPart::Obj0)], parts.obj0);
-      if (backing.has(ShadowlandsADTPart::Obj1))
+      if (parts.write_obj1)
         save_part(backing.source.paths[part_index(ShadowlandsADTPart::Obj1)], parts.obj1);
-      if (backing.has(ShadowlandsADTPart::Lod))
+      if (parts.write_lod)
         save_part(backing.source.paths[part_index(ShadowlandsADTPart::Lod)],
                   backing.part(ShadowlandsADTPart::Lod).bytes);
 

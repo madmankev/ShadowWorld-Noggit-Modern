@@ -52,13 +52,25 @@ namespace Noggit::Formats::ADT
     //! Placements that could not be resolved at all and were dropped.
     std::size_t skipped_placements = 0;
 
+    //! True when the parts were synthesized from the edited tile because the
+    //! original split tile could not be merged into. The result is still a
+    //! modern split ADT, but chunks that only exist in the retail file and have
+    //! no legacy equivalent (MTXP height textures, MHID) are absent.
+    bool synthesized = false;
+    //! Assets written with a FileDataID the converter had to invent because
+    //! neither the tile nor the project listfile knew one. The client has no
+    //! such id, so those assets stay invisible until they are registered.
+    std::size_t custom_fdids = 0;
+
     std::string first_unresolved_texture;
     std::string first_recovered_placement;
     std::string first_skipped_placement;
+    std::string first_custom_fdid;
 
     [[nodiscard]] bool empty() const noexcept
     {
-      return !unresolved_textures && !recovered_placements && !skipped_placements;
+      return !unresolved_textures && !recovered_placements && !skipped_placements
+             && !synthesized && !custom_fdids;
     }
   };
 
