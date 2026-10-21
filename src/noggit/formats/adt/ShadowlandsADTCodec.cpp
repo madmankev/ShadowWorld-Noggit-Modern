@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -337,8 +338,8 @@ namespace Noggit::Formats::ADT
     std::vector<std::uint8_t> rewrite_obj0_refs(
       std::vector<std::uint8_t> const& obj0,
       std::vector<std::uint8_t> const& legacy,
-      std::size_t m2_count,
-      std::size_t wmo_count)
+      std::vector<std::int32_t> const& doodad_remap,
+      std::vector<std::int32_t> const& wmo_remap)
     {
       auto const modern_chunks = parse_chunks(obj0, "modern OBJ0");
       auto const legacy_chunks = parse_chunks(legacy, "legacy ADT");
@@ -375,19 +376,37 @@ namespace Noggit::Formats::ADT
         if (!refs || refs->size != doodad_bytes + wmo_bytes)
           throw std::runtime_error("Legacy MCNK MCRF size does not match object reference counts.");
 
-        for (std::size_t i = 0; i < header.nDoodadRefs + header.nMapObjRefs; ++i)
+        // MCRF holds nDoodadRefs indices into MDDF followed by nMapObjRefs
+        // indices into MODF. Both lists were just compacted, because a placement
+        // whose asset cannot be resolved at all is dropped rather than costing
+        // the whole tile. Every index after a drop has therefore moved, so the
+        // references are renumbered through the tables and the ones whose
+        // placement is gone are dropped with it. Validating them against the new
+        // counts instead - which is what this used to do - threw as soon as a
+        // single object was unresolvable and lost the tile anyway.
+        auto const remap_refs = [&legacy](std::size_t at, std::uint32_t count,
+                                          std::vector<std::int32_t> const& table)
         {
-          std::uint32_t index = 0;
-          std::memcpy(&index, legacy.data() + refs->payload + i * 4, 4);
-          if (index >= (i < header.nDoodadRefs ? m2_count : wmo_count))
-            throw std::runtime_error("Legacy MCNK references an invalid OBJ0 placement index.");
-        }
+          std::vector<std::uint8_t> out;
+          out.reserve(static_cast<std::size_t>(count) * 4);
+          for (std::uint32_t i = 0; i < count; ++i)
+          {
+            std::uint32_t index = 0;
+            std::memcpy(&index, legacy.data() + at + static_cast<std::size_t>(i) * 4, 4);
+            if (index >= table.size())
+              throw std::runtime_error("Legacy MCNK references an invalid OBJ0 placement index.");
+            if (table[index] < 0)
+              continue;
+            std::uint32_t const mapped = static_cast<std::uint32_t>(table[index]);
+            out.insert(out.end(), reinterpret_cast<std::uint8_t const*>(&mapped),
+                       reinterpret_cast<std::uint8_t const*>(&mapped) + 4);
+          }
+          return out;
+        };
 
-        auto const doodad_refs = std::vector<std::uint8_t>(
-          legacy.begin() + refs->payload, legacy.begin() + refs->payload + doodad_bytes);
-        auto const wmo_refs = std::vector<std::uint8_t>(
-          legacy.begin() + refs->payload + doodad_bytes,
-          legacy.begin() + refs->payload + doodad_bytes + wmo_bytes);
+        auto const doodad_refs = remap_refs(refs->payload, header.nDoodadRefs, doodad_remap);
+        auto const wmo_refs = remap_refs(refs->payload + doodad_bytes, header.nMapObjRefs,
+                                         wmo_remap);
         auto const modern_subs = parse_chunks(
           obj0, chunk.payload, chunk.payload + chunk.size, "modern OBJ0 MCNK");
         std::vector<std::uint8_t> payload;
@@ -965,7 +984,8 @@ namespace Noggit::Formats::ADT
                                                 std::uint32_t strings_magic,
                                                 std::vector<std::uint8_t> const& original_obj0,
                                                 ModernAdtFdidHints const& fdid_hints,
-                                                ModernAdtSaveReport* report)
+                                                ModernAdtSaveReport* report,
+                                                std::vector<std::int32_t>& index_remap)
     {
       auto const chunks = parse_chunks(legacy, "legacy ADT");
       auto const* placements = find_chunk(chunks, placement_magic);
@@ -1041,6 +1061,7 @@ namespace Noggit::Formats::ADT
             if (report->first_skipped_placement.empty())
               report->first_skipped_placement = path;
           }
+          index_remap.push_back(-1);
           continue;
         }
 
@@ -1061,6 +1082,10 @@ namespace Noggit::Formats::ADT
           // Existing modern OBJ0 WMO placements use these bits with FileDataIDs.
           entry.flags |= 0x000C;
         }
+        // Record the new index before appending, so the per-chunk MCRF
+        // references can be renumbered: dropping a placement shifts every index
+        // after it, and the references are indices into this compacted list.
+        index_remap.push_back(static_cast<std::int32_t>(kept.size()));
         kept.push_back(entry);
       }
 
@@ -1312,12 +1337,14 @@ namespace Noggit::Formats::ADT
         parts.tex0, fourcc('M','D','I','D'), make_chunk(fourcc('M','D','I','D'), uint32_payload(texture_ids)));
 
       auto const original_obj0 = backing.part(ShadowlandsADTPart::Obj0).bytes;
+      std::vector<std::int32_t> doodad_remap;
+      std::vector<std::int32_t> wmo_remap;
       auto const mddf = modern_placements<ENTRY_MDDF>(
         legacy_adt, fourcc('M','D','D','F'), fourcc('M','M','I','D'), fourcc('M','M','D','X'),
-        original_obj0, fdid_hints, report);
+        original_obj0, fdid_hints, report, doodad_remap);
       auto const modf = modern_placements<ENTRY_MODF>(
         legacy_adt, fourcc('M','O','D','F'), fourcc('M','W','I','D'), fourcc('M','W','M','O'),
-        original_obj0, fdid_hints, report);
+        original_obj0, fdid_hints, report, wmo_remap);
       parts.write_obj1 = backing.has(ShadowlandsADTPart::Obj1);
       parts.write_lod = backing.has(ShadowlandsADTPart::Lod);
       if (parts.write_obj1)
@@ -1327,9 +1354,7 @@ namespace Noggit::Formats::ADT
         parts.obj0, fourcc('M','D','D','F'), make_chunk(fourcc('M','D','D','F'), mddf));
       parts.obj0 = replace_top_level_chunk(
         parts.obj0, fourcc('M','O','D','F'), make_chunk(fourcc('M','O','D','F'), modf));
-      parts.obj0 = rewrite_obj0_refs(parts.obj0, legacy_adt,
-                                     mddf.size() / sizeof(ENTRY_MDDF),
-                                     modf.size() / sizeof(ENTRY_MODF));
+      parts.obj0 = rewrite_obj0_refs(parts.obj0, legacy_adt, doodad_remap, wmo_remap);
       return parts;
     }
 

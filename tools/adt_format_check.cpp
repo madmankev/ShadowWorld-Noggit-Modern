@@ -2,14 +2,19 @@
 // path. Not part of the build (the noggit target globs src/noggit only, so this
 // stays out of it); build it by hand from the repository root:
 //
-//   g++ -std=c++20 -I src -I src/external -o /tmp/adt_format_check \
-//       tools/adt_format_check.cpp \
-//       src/noggit/formats/adt/ModernAdtWriter.cpp \
-//       src/noggit/formats/adt/ModernAdtReader.cpp \
-//       src/noggit/formats/wdt/WdtReader.cpp \
-//       src/noggit/formats/conversion/AdtConversion.cpp \
+//   g++ -std=c++20 -I src -I src/external -o /tmp/adt_format_check
+//       tools/adt_format_check.cpp
+//       src/noggit/formats/adt/ModernAdtWriter.cpp
+//       src/noggit/formats/adt/ModernAdtReader.cpp
+//       src/noggit/formats/wdt/WdtReader.cpp
+//       src/noggit/formats/conversion/AdtConversion.cpp
 //       src/noggit/formats/conversion/MapConversion.cpp
+//
 //   /tmp/adt_format_check        # exit 0 = all checks passed
+//
+// (join the g++ lines with a trailing backslash, or put them on one line; they
+// are split here only because a backslash at the end of a // comment makes the
+// comment continue onto the next line.)
 //
 // Every source it links is Qt-free, so it needs no Qt and no CMake configure.
 //
@@ -20,6 +25,9 @@
 //   * the converted ROOT/TEX0/OBJ0 pass ModernAdtWriter's pre-write validation,
 //     which is the gate the save pipeline actually uses - the converter's own
 //     self-check uses the readers and is more permissive;
+//   * OBJ0 carries all 256 MCNK chunks, and a placement the converter has to
+//     drop takes its own per-chunk reference with it while the survivors are
+//     renumbered into the compacted MDDF;
 //   * a ROOT written by the recovery path can be merged into by the next save,
 //     so synthesis happens once rather than on every save;
 //   * MCIN.size is the whole MCNK chunk including its 8 byte tag.
@@ -305,6 +313,66 @@ namespace
     return src;
   }
 
+  //! Counts the per-chunk object references in a modern OBJ0 and records the
+  //! highest index each list uses, so a wrong remap is caught even when it
+  //! happens to stay in range.
+  struct Obj0Refs
+  {
+    std::size_t mcnks = 0;
+    std::size_t mcrd = 0;
+    std::size_t mcrw = 0;
+    long highest_mcrd = -1;
+  };
+
+  Obj0Refs scan_obj0(std::vector<std::uint8_t> const& b)
+  {
+    Obj0Refs r;
+    std::size_t pos = 0;
+    auto const rd32 = [&b](std::size_t at)
+    {
+      return std::uint32_t(b[at]) | (std::uint32_t(b[at + 1]) << 8)
+           | (std::uint32_t(b[at + 2]) << 16) | (std::uint32_t(b[at + 3]) << 24);
+    };
+    while (pos + 8 <= b.size())
+    {
+      std::uint32_t const magic = rd32(pos);
+      std::uint32_t const size = rd32(pos + 4);
+      std::size_t const payload = pos + 8;
+      if (payload + size > b.size())
+        break;
+      if (magic == fc('M', 'C', 'N', 'K'))
+      {
+        ++r.mcnks;
+        std::size_t sub = payload;
+        while (sub + 8 <= payload + size)
+        {
+          std::uint32_t const sm = rd32(sub);
+          std::uint32_t const ss = rd32(sub + 4);
+          std::size_t const sp = sub + 8;
+          if (sp + ss > payload + size)
+            break;
+          if (sm == fc('M', 'C', 'R', 'D'))
+          {
+            for (std::size_t i = 0; i + 4 <= ss; i += 4)
+            {
+              ++r.mcrd;
+              long const v = static_cast<long>(rd32(sp + i));
+              if (v > r.highest_mcrd)
+                r.highest_mcrd = v;
+            }
+          }
+          else if (sm == fc('M', 'C', 'R', 'W'))
+          {
+            r.mcrw += ss / 4;
+          }
+          sub = sp + ss;
+        }
+      }
+      pos = payload + size;
+    }
+    return r;
+  }
+
   std::string issues_text(std::vector<ConversionIssue> const& issues)
   {
     std::string out;
@@ -388,14 +456,24 @@ int main()
     check(tex0_ok, "synthesized TEX0 passes ModernAdtWriter validation");
     check(obj0_ok, "synthesized OBJ0 passes ModernAdtWriter validation");
 
-    // The dropped MDDF entry must take its per-chunk reference with it, and the
-    // surviving references must be renumbered rather than left pointing past the
-    // end of the shortened MDDF.
+    // The fixture gives MDDF v.doodads + 1 entries, the last one unresolvable so
+    // the converter must drop it, and chunks 0..v.doodads each reference one
+    // entry - the last of them the dropped one. So exactly v.doodads references
+    // survive, renumbered into 0..v.doodads-1.
     {
-      auto const problems = ModernAdtWriter::validatePart(
-        profile, result.obj0, AdtPartExpectation::Object);
-      for (auto const& pr : problems)
-        std::printf("    obj0 problem: %s\n", pr.c_str());
+      auto const refs = scan_obj0(result.obj0);
+      check(refs.mcnks == 256, "OBJ0 carries all 256 MCNK chunks");
+      if (v.doodads)
+      {
+        check(refs.mcrd == v.doodads,
+              "a dropped placement takes its own MCRF reference with it");
+        check(refs.highest_mcrd == static_cast<long>(v.doodads) - 1,
+              "surviving references are renumbered into the compacted MDDF");
+      }
+      else
+      {
+        check(refs.mcrd == 0, "no references emitted for a tile with no placements");
+      }
     }
 
     // Textures must resolve through the listfile rather than get invented ids.
