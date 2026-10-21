@@ -771,6 +771,18 @@ void MapIndex::saveChanged (World* world, bool save_unloaded)
   Log << "[ADT Save] Save changed requested: " << loaded_tile_count
       << " loaded tile(s), " << changed_tile_count << " changed tile(s)." << std::endl;
 
+  // "Save changed tiles" (Ctrl+S) only writes tiles that were marked dirty, so
+  // this produces the WDT and the WDL and no ADT at all. That is indistinguishable
+  // from "every tile save failed" unless the log says which of the two happened.
+  if (!changed_tile_count)
+  {
+    LogError << "[ADT Save] No loaded tile is marked as changed, so no ADT was"
+                " written. If you did edit this map, either the edits are not"
+                " marking their tile dirty (a bug worth reporting with this log)"
+                " or they were already saved - File > Save all tiles (Ctrl+Shift+A)"
+                " writes every loaded tile regardless." << std::endl;
+  }
+
   if (changed)
   {
     save();

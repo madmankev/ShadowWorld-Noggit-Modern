@@ -620,11 +620,24 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
 
   if (client_data->version() != BlizzardArchive::ClientVersion::WOTLK)
   {
+    // Two separate failures that used to share one message (and named no tile),
+    // which made "no ADT was written" undiagnosable from the log.
     try
     {
       modern_backing = Noggit::Formats::ADT::ShadowlandsADTCodec::loadBackingStore(
         _file_key.filepath());
+    }
+    catch (std::exception const& error)
+    {
+      LogError << "[ModernADT][Save] Could not read the original split tile \""
+               << _file_key.stringRepr() << "\" (ROOT/TEX0/OBJ0) before saving: "
+               << error.what() << ". No part of this tile was written, so none of"
+                  " the edits to it are on disk." << std::endl;
+      return false;
+    }
 
+    try
+    {
       // Modern split ADTs require full 8-bit alpha maps when MCLY does not set
       // FLAG_ALPHA_COMPRESSED. Writing the legacy 4-bit (2048-byte) layout
       // with that flag cleared is tolerated by Noggit's loader, but retail
@@ -633,8 +646,10 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
     }
     catch (std::exception const& error)
     {
-      LogError << "[ModernADT][Save] Could not load the original split tile before saving: "
-               << error.what() << std::endl;
+      LogError << "[ModernADT][Save] Could not convert \"" << _file_key.stringRepr()
+               << "\" to 8-bit alpha maps before saving: " << error.what()
+               << ". No part of this tile was written, so none of the edits to it"
+                  " are on disk." << std::endl;
       return false;
     }
   }
