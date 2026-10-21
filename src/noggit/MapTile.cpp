@@ -1036,6 +1036,7 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
 
   if (modern_backing)
   {
+    bool wrote_split_tile = false;
     try
     {
       auto const legacy_bytes = lADTFile.data_up_to(lCurrentPosition);
@@ -1063,12 +1064,12 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
       }
       catch (Noggit::Formats::ADT::ModernAdtValidationError const& error)
       {
-        // Pre-write validation exists so suspect tiles never reach disk. The
-        // fallback path would assemble the same data, so abort instead of
-        // retrying: a corrupt tile is worse than a failed save.
+        // Pre-write validation exists so suspect modern parts never reach disk,
+        // and the conversion fallback would assemble the same data, so it is not
+        // retried. The tile is still written below in the legacy single-file
+        // format instead of being dropped.
         LogError << "[ModernADT][Save] Validation rejected the tile \""
                  << _file_key.stringRepr() << "\": " << error.what() << std::endl;
-        return false;
       }
       catch (std::exception const& error)
       {
@@ -1102,14 +1103,49 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
                        ? "" : " (first: " + report.first_skipped_placement + ")")
                  << ". Everything else on the tile was saved." << std::endl;
       }
+
+      wrote_split_tile = true;
     }
     catch (std::exception const& error)
     {
       LogError << "[ModernADT][Save] Split ADT save failed for \""
-               << _file_key.stringRepr() << "\": " << error.what()
-               << ". No part of this tile was written, so none of the edits to it"
-                  " are on disk." << std::endl;
-      return false;
+               << _file_key.stringRepr() << "\": " << error.what() << std::endl;
+    }
+
+    if (!wrote_split_tile)
+    {
+      // Last resort, and the reason a tile can no longer save as nothing at all.
+      //
+      // The modern conversion needs the original split tile to merge into, so it
+      // can preserve every chunk the editor does not own. When that original
+      // cannot be used the whole tile was dropped - heights, textures, objects
+      // and water together - which is what "I saved it and reloading showed none
+      // of the changes" turned out to be. Noggit's canonical single-file ADT
+      // needs no original, and AsyncLoader's split-ADT gate explicitly routes a
+      // legacy_single_file ROOT to the legacy loader, so the tile reloads.
+      try
+      {
+        BlizzardArchive::ClientFile fallback(_file_key.filepath(), client_data,
+                                             BlizzardArchive::ClientFile::NEW_FILE);
+        fallback.setBuffer(lADTFile.data_up_to(lCurrentPosition));
+        fallback.save();
+
+        LogError << "[ModernADT][Save] Wrote \"" << _file_key.stringRepr()
+                 << "\" as a legacy single-file ADT because the modern split"
+                    " conversion could not run. The edits are on disk and the tile"
+                    " will reload in Noggit, but chunks that only exist in the"
+                    " split parts (MTXP height textures, MHID, the MAID-referenced"
+                    " LOD) are not carried over." << std::endl;
+      }
+      catch (std::exception const& error)
+      {
+        LogError << "[ModernADT][Save] Could not write \"" << _file_key.stringRepr()
+                 << "\" in either the modern split or the legacy single-file"
+                    " format: " << error.what()
+                 << ". No part of this tile was written, so none of the edits to"
+                    " it are on disk." << std::endl;
+        return false;
+      }
     }
   }
   else
