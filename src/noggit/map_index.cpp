@@ -27,6 +27,7 @@
 #include <forward_list>
 #include <cstring>
 #include <filesystem>
+#include <string>
 #include <map>
 #include <set>
 #include <sstream>
@@ -317,6 +318,30 @@ void MapIndex::ensureModernWdtInProject()
   }
 }
 
+namespace
+{
+  //! One line per save run: how many tiles reached disk and how many did not.
+  //!
+  //! A tile whose save failed keeps *none* of its edits, and its own error line
+  //! only tells that one tile's story. Without this summary, "I saved the map and
+  //! reloading it showed no changes" cannot be answered from the log at all.
+  void reportSaveOutcome(char const* what, std::size_t saved, std::size_t failed,
+                         std::string const& first_failure)
+  {
+    if (!failed)
+    {
+      Log << "[ADT Save] " << what << ": " << saved << " tile(s) written." << std::endl;
+      return;
+    }
+
+    LogError << "[ADT Save] " << what << ": " << saved << " tile(s) written, "
+             << failed << " tile(s) FAILED"
+             << (first_failure.empty() ? std::string() : ", first: " + first_failure)
+             << ". Those tiles have none of their edits on disk; the reason is in"
+                " the [ModernADT][Save] line logged for each one." << std::endl;
+  }
+}
+
 void MapIndex::saveall (World* world)
 {
   world->wait_for_all_tile_updates();
@@ -325,14 +350,27 @@ void MapIndex::saveall (World* world)
 
   saveMaxUID();
 
+  std::size_t saved = 0;
+  std::size_t failed = 0;
+  std::string first_failure;
+
   for (MapTile* tile : loaded_tiles())
   {
     world->horizon.update_horizon_tile(tile);
     if (tile->saveTile(world))
     {
       tile->changed = false;
+      ++saved;
+    }
+    else
+    {
+      ++failed;
+      if (first_failure.empty())
+        first_failure = tile->file_key().stringRepr();
     }
   }
+
+  reportSaveOutcome("Save all", saved, failed, first_failure);
 }
 
 void MapIndex::save()
@@ -777,6 +815,10 @@ void MapIndex::saveChanged (World* world, bool save_unloaded)
     return;
   }
 
+  std::size_t saved = 0;
+  std::size_t failed = 0;
+  std::string first_failure;
+
   for (MapTile* tile : loaded_tiles())
   {
     if (tile->changed.load())
@@ -785,9 +827,19 @@ void MapIndex::saveChanged (World* world, bool save_unloaded)
       if (tile->saveTile(world))
       {
         tile->changed = false;
+        ++saved;
+      }
+      else
+      {
+        // Left dirty on purpose, so the next save retries it.
+        ++failed;
+        if (first_failure.empty())
+          first_failure = tile->file_key().stringRepr();
       }
     }
   }
+
+  reportSaveOutcome("Save changed", saved, failed, first_failure);
 }
 
 bool MapIndex::hasAGlobalWMO() const
