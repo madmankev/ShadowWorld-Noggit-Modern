@@ -211,6 +211,46 @@ namespace Noggit::Formats::ADT
 
   // ---- helpers ---------------------------------------------------------------
 
+  //! How a file counts MCIN.size.
+  //!  //! The two candidate conventions differ by the 8 bytes of magic and size every
+  //! chunk carries. A client that reads MCIN.size to bound an MCNK walks 8 bytes
+  //! too far or stops 8 bytes short when the file disagrees with it, so which one
+  //! a real retail file uses is worth measuring rather than assuming.
+  enum class McinSizeConvention
+  {
+    //! No usable MCIN/MCNK pair to compare against.
+    unknown,
+    //! MCIN.size is the MCNK payload size, tag excluded.
+    payload_only,
+    //! MCIN.size is the whole MCNK chunk, tag included.
+    payload_plus_tag,
+    //! Entries match neither convention, or do not agree with each other.
+    inconsistent
+  };
+
+  McinSizeConvention detectMcinSizeConvention(char const* data, std::size_t size);
+  inline McinSizeConvention detectMcinSizeConvention(std::vector<std::uint8_t> const& data)
+  {
+    return detectMcinSizeConvention(reinterpret_cast<char const*>(data.data()), data.size());
+  }
+  std::string mcinSizeConventionName(McinSizeConvention convention);
+
+  //! One-line inventory of an ADT part: byte count, MVER, every top-level chunk
+  //! with its payload size (the 256 MCNKs collapsed to one entry) and the
+  //! subchunk inventory of the first MCNK.
+  //!  //! For comparing what a real client file contains against what the writer
+  //! assumes. Reports rather than throws, so a malformed file still yields
+  //! whatever parsed. `mcnk_has_header` is true for ROOT, whose MCNKs carry the
+  //! 128 byte MapChunkHeader before their subchunks, and false for TEX0/OBJ0.
+  std::string describeAdtPart(char const* data, std::size_t size,
+                              char const* label, bool mcnk_has_header);
+  inline std::string describeAdtPart(std::vector<std::uint8_t> const& data,
+                                     char const* label, bool mcnk_has_header)
+  {
+    return describeAdtPart(reinterpret_cast<char const*>(data.data()), data.size(),
+                           label, mcnk_has_header);
+  }
+
   //! Render a chunk fourcc (canonical MSB-first value as compared against the
   //! little-endian magic read from disk) as printable name or hex.
   std::string adtChunkName(std::uint32_t fourcc);

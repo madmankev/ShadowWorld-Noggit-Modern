@@ -42,12 +42,49 @@ namespace Noggit::Formats::ADT
     constexpr std::uint32_t FOURCC_MCAL = fourccOf('M', 'C', 'A', 'L');
 
     constexpr std::size_t mcnk_header_size = 128;
+    constexpr std::size_t chunk_tag_size = 8;
+
 
     std::uint32_t readU32(char const* p)
     {
       std::uint32_t value = 0;
       std::memcpy(&value, p, sizeof(value));
       return value;
+    }
+
+    //! Chunk view for the diagnostics below.
+    struct DiagChunk
+    {
+      std::uint32_t magic = 0;
+      std::uint32_t size = 0;
+      std::size_t offset = 0;
+      std::size_t payload = 0;
+    };
+
+    //! Walk that reports instead of throwing: a truncated or over-run chunk ends
+    //! the walk and the return value says whether the range was consumed exactly.
+    //! Whatever was parsed before that point is still in `out`, because a file
+    //! that disagrees with our assumptions is precisely the one worth describing.
+    bool diag_walk(char const* data, std::size_t size,
+                   std::size_t from, std::size_t to,
+                   std::vector<DiagChunk>& out)
+    {
+      if (to > size || from > to)
+        return false;
+      std::size_t pos = from;
+      while (pos + chunk_tag_size <= to)
+      {
+        DiagChunk chunk;
+        chunk.magic = readU32(data + pos);
+        chunk.size = readU32(data + pos + 4);
+        chunk.offset = pos;
+        chunk.payload = pos + chunk_tag_size;
+        if (chunk.size > to - chunk.payload)
+          return false;
+        out.push_back(chunk);
+        pos = chunk.payload + chunk.size;
+      }
+      return pos == to;
     }
 
     bool isKnownTopLevelChunk(std::uint32_t fourcc)
@@ -144,6 +181,135 @@ namespace Noggit::Formats::ADT
         }
       }
     }
+  }
+
+  McinSizeConvention detectMcinSizeConvention(char const* data, std::size_t size)
+  {
+    std::vector<DiagChunk> top;
+    if (!diag_walk(data, size, 0, size, top))
+      return McinSizeConvention::unknown;
+
+    DiagChunk const* mcin = nullptr;
+    std::vector<DiagChunk const*> mcnks;
+    for (auto const& chunk : top)
+    {
+      if (chunk.magic == FOURCC_MCIN)
+        mcin = &chunk;
+      else if (chunk.magic == FOURCC_MCNK)
+        mcnks.push_back(&chunk);
+    }
+
+    if (!mcin || mcnks.empty() || mcin->size < mcnks.size() * sizeof(ENTRY_MCIN))
+      return McinSizeConvention::unknown;
+
+    std::size_t payload_only = 0;
+    std::size_t plus_tag = 0;
+    std::size_t neither = 0;
+    for (std::size_t i = 0; i < mcnks.size(); ++i)
+    {
+      std::uint32_t const stored = readU32(
+        data + mcin->payload + i * sizeof(ENTRY_MCIN) + offsetof(ENTRY_MCIN, size));
+      if (stored == mcnks[i]->size)
+        ++payload_only;
+      else if (stored == mcnks[i]->size + chunk_tag_size)
+        ++plus_tag;
+      else
+        ++neither;
+    }
+
+    if (neither || (payload_only && plus_tag))
+      return McinSizeConvention::inconsistent;
+    if (plus_tag)
+      return McinSizeConvention::payload_plus_tag;
+    if (payload_only)
+      return McinSizeConvention::payload_only;
+    return McinSizeConvention::unknown;
+  }
+
+  std::string mcinSizeConventionName(McinSizeConvention convention)
+  {
+    switch (convention)
+    {
+      case McinSizeConvention::payload_only: return "payload only";
+      case McinSizeConvention::payload_plus_tag: return "payload + 8 byte tag";
+      case McinSizeConvention::inconsistent: return "inconsistent";
+      case McinSizeConvention::unknown:
+      default: return "unknown";
+    }
+  }
+
+  std::string describeAdtPart(char const* data, std::size_t size,
+                              char const* label, bool mcnk_has_header)
+  {
+    std::ostringstream out;
+    out << label << ": " << size << " byte(s)";
+    if (!size)
+      return out.str();
+
+    std::vector<DiagChunk> top;
+    bool const walked = diag_walk(data, size, 0, size, top);
+
+    for (auto const& chunk : top)
+    {
+      if (chunk.magic == FOURCC_MVER && chunk.size >= 4)
+      {
+        out << ", MVER=" << readU32(data + chunk.payload);
+        break;
+      }
+    }
+
+    out << ", chunks=[";
+    bool first = true;
+    std::size_t mcnk_count = 0;
+    DiagChunk const* first_mcnk = nullptr;
+    for (auto const& chunk : top)
+    {
+      if (chunk.magic == FOURCC_MCNK)
+      {
+        ++mcnk_count;
+        if (!first_mcnk)
+          first_mcnk = &chunk;
+        continue;
+      }
+      if (!first)
+        out << " ";
+      first = false;
+      out << adtChunkName(chunk.magic) << "(" << chunk.size << ")";
+    }
+    if (mcnk_count)
+    {
+      if (!first)
+        out << " ";
+      out << "MCNK x" << mcnk_count;
+    }
+    out << "]";
+
+    if (first_mcnk)
+    {
+      std::size_t const sub_from =
+        first_mcnk->payload + (mcnk_has_header ? mcnk_header_size : 0);
+      std::size_t const sub_to = first_mcnk->payload + first_mcnk->size;
+      if (sub_from <= sub_to && sub_to <= size)
+      {
+        std::vector<DiagChunk> subs;
+        diag_walk(data, size, sub_from, sub_to, subs);
+        out << ", MCNK[0] subs=[";
+        bool first_sub = true;
+        for (auto const& sub : subs)
+        {
+          if (!first_sub)
+            out << " ";
+          first_sub = false;
+          out << adtChunkName(sub.magic) << "(" << sub.size << ")";
+        }
+        out << "]";
+      }
+    }
+
+    if (!walked)
+      out << ", top-level walk did not end on a chunk boundary";
+
+    return out.str();
   }
 
   std::string adtChunkName(std::uint32_t fourcc)

@@ -39,6 +39,7 @@
 //
 // Both libraries are Qt-free, so this links the real sources.
 
+#include <noggit/formats/adt/ModernAdtReader.hpp>
 #include <noggit/formats/adt/ModernAdtWriter.hpp>
 #include <noggit/formats/conversion/MapConversion.hpp>
 #include <noggit/MapHeaders.h>
@@ -515,6 +516,93 @@ int main()
       std::printf("    refreshRootBookkeeping: %s\n", e.what());
     }
     check(bookkeeping_ok, "refreshRootBookkeeping accepts the synthesized ROOT");
+  }
+
+  // The MCIN convention probe, against files whose convention is known.
+  std::printf("\nMCIN.size convention probe\n");
+  {
+    auto const legacy = build_legacy_adt(true, 2, 5);
+    ConversionOptions options;
+    options.target = MapFormat::modern;
+    options.map_name = "emeralddream";
+    auto source = make_source(known);
+    FdidAllocator fdids(options.custom_fdid_base);
+    auto const result = convertAdtLegacyToModern(legacy, options, source, fdids);
+    check(result.ok, "fixture converted for the convention probe");
+
+    if (result.ok)
+    {
+      check(detectMcinSizeConvention(result.root) == McinSizeConvention::payload_plus_tag,
+            "converter output is detected as payload + 8 byte tag");
+
+      auto input = ModernAdtWriter::rootInputFromLegacy(profile, legacy);
+      auto written = ModernAdtWriter::writeRoot(profile, result.root, input);
+      check(detectMcinSizeConvention(written) == McinSizeConvention::payload_plus_tag,
+            "writer output is detected as payload + 8 byte tag");
+
+      // Rewrite every MCIN size to the payload-only convention and confirm the
+      // probe distinguishes it rather than reporting whichever it prefers.
+      auto stripped = written;
+      std::size_t mcin_payload = 0;
+      std::vector<std::size_t> mcnk_sizes;
+      std::size_t pos = 0;
+      auto const rd32 = [&stripped](std::size_t at)
+      {
+        return std::uint32_t(stripped[at]) | (std::uint32_t(stripped[at + 1]) << 8)
+             | (std::uint32_t(stripped[at + 2]) << 16) | (std::uint32_t(stripped[at + 3]) << 24);
+      };
+      auto const wr32 = [&stripped](std::size_t at, std::uint32_t v)
+      {
+        for (int i = 0; i < 4; ++i)
+          stripped[at + i] = static_cast<std::uint8_t>((v >> (8 * i)) & 0xFF);
+      };
+      while (pos + 8 <= stripped.size())
+      {
+        std::uint32_t const magic = rd32(pos);
+        std::uint32_t const size = rd32(pos + 4);
+        if (magic == fc('M', 'C', 'I', 'N'))
+          mcin_payload = pos + 8;
+        else if (magic == fc('M', 'C', 'N', 'K'))
+          mcnk_sizes.push_back(size);
+        pos += 8 + size;
+      }
+      check(mcin_payload != 0 && mcnk_sizes.size() == 256,
+            "probe fixture has an MCIN and 256 MCNKs");
+      for (std::size_t i = 0; i < mcnk_sizes.size() && mcin_payload; ++i)
+        wr32(mcin_payload + i * sizeof(ENTRY_MCIN) + 4,
+             static_cast<std::uint32_t>(mcnk_sizes[i]));
+      check(detectMcinSizeConvention(stripped) == McinSizeConvention::payload_only,
+            "payload-only file is detected as payload only");
+
+      // Half and half must not be reported as either.
+      for (std::size_t i = 0; i < 128; ++i)
+        wr32(mcin_payload + i * sizeof(ENTRY_MCIN) + 4,
+             static_cast<std::uint32_t>(mcnk_sizes[i] + 8));
+      check(detectMcinSizeConvention(stripped) == McinSizeConvention::inconsistent,
+            "a file mixing both conventions is reported as inconsistent");
+
+      std::string const described = describeAdtPart(result.root, "ROOT", true);
+      std::printf("    %s\n", described.c_str());
+      check(described.find("MVER=18") != std::string::npos, "inventory reports MVER");
+      check(described.find("MCNK x256") != std::string::npos, "inventory collapses the MCNK grid");
+      check(described.find("MCVT") != std::string::npos, "inventory lists MCNK subchunks");
+
+      std::string const obj0_text = describeAdtPart(result.obj0, "OBJ0", false);
+      std::printf("    %s\n", obj0_text.c_str());
+      check(obj0_text.find("MDDF") != std::string::npos, "OBJ0 inventory lists MDDF");
+      check(obj0_text.find("MCNK x256") != std::string::npos, "OBJ0 inventory has the MCNK grid");
+
+      // An empty and a truncated part must be described, not crash.
+      std::vector<std::uint8_t> const empty;
+      check(describeAdtPart(empty, "ROOT", true).find("0 byte(s)") != std::string::npos,
+            "an empty part is described safely");
+      std::vector<std::uint8_t> const truncated(result.root.begin(),
+                                                result.root.begin() + 40);
+      check(!describeAdtPart(truncated, "ROOT", true).empty(),
+            "a truncated part is described safely");
+      check(detectMcinSizeConvention(empty) == McinSizeConvention::unknown,
+            "an empty part has no detectable convention");
+    }
   }
 
   // An asset the listfile does not know must still convert, with an invented id

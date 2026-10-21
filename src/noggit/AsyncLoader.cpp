@@ -21,6 +21,7 @@
 #include <cstring>
 #include <exception>
 #include <list>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -156,6 +157,25 @@ namespace
              << " structurally_valid=" << (root.structurally_valid ? "yes" : "no")
              << std::endl;
 
+    // Sampling a single tile is enough to compare what a real client file
+    // contains against what the writer assumes, and logging all 41 would bury
+    // it. The flag is taken before the ROOT inventory so all three parts of the
+    // same tile are described together and can be read as one set.
+    static std::once_flag format_probe_once;
+    bool probe_this_tile = false;
+    std::call_once(format_probe_once, [&probe_this_tile] { probe_this_tile = true; });
+
+    if (probe_this_tile)
+    {
+      Log << "[ModernADT][FormatProbe] "
+          << Noggit::Formats::ADT::describeAdtPart(root_bytes, "ROOT", true)
+          << "  <- '" << root_path << "'" << std::endl;
+      Log << "[ModernADT][FormatProbe] ROOT MCIN.size convention: "
+          << Noggit::Formats::ADT::mcinSizeConventionName(
+               Noggit::Formats::ADT::detectMcinSizeConvention(root_bytes))
+          << " (the writer stores payload + the 8 byte tag)" << std::endl;
+    }
+
     if (layout == Noggit::Formats::ADT::AdtLayout::legacy_single_file)
     {
       LogDebug << "[ModernADT] '" << root_path
@@ -174,6 +194,10 @@ namespace
       auto const tex0 = Noggit::Formats::ADT::scanAdt(
         part_bytes, Noggit::Formats::ADT::AdtScanOptions{false, true, 8, "TEX0"});
       log_modern_adt_issues(tex0_path, tex0.issues);
+      if (probe_this_tile)
+        Log << "[ModernADT][FormatProbe] "
+            << Noggit::Formats::ADT::describeAdtPart(part_bytes, "TEX0", false)
+            << "  <- '" << tex0_path << "'" << std::endl;
       if (!tex0.structurally_valid || tex0.mcnk_offsets.size() != 256)
         LogError << "[ModernADT] TEX0 '" << tex0_path << "' is unusable (MCNK="
                  << tex0.mcnk_offsets.size() << ", valid="
@@ -193,6 +217,10 @@ namespace
       auto const obj0 = Noggit::Formats::ADT::scanAdt(
         part_bytes, Noggit::Formats::ADT::AdtScanOptions{false, false, 8, "OBJ0"});
       log_modern_adt_issues(obj0_path, obj0.issues);
+      if (probe_this_tile)
+        Log << "[ModernADT][FormatProbe] "
+            << Noggit::Formats::ADT::describeAdtPart(part_bytes, "OBJ0", false)
+            << "  <- '" << obj0_path << "'" << std::endl;
       if (!obj0.structurally_valid)
         LogError << "[ModernADT] OBJ0 '" << obj0_path
                  << "' is unusable; the tile will load without model/WMO placements."
