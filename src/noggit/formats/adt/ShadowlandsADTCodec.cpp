@@ -1248,12 +1248,52 @@ namespace Noggit::Formats::ADT
                : std::string("absent");
     };
 
+    //! The first four bytes of a part as text, straight from the file - no
+    //! fourcc byte-order assumption, so it cannot misreport a valid part. An ADT
+    //! part starts with its version chunk, so anything else here is the answer to
+    //! "why did the writer say this ROOT has no MVER".
+    auto first_bytes = [] (std::vector<std::uint8_t> const& bytes)
+    {
+      if (bytes.size() < 4)
+        return std::string("(none)");
+
+      std::string text;
+      for (std::size_t i = 0; i < 4; ++i)
+      {
+        auto const character = static_cast<char>(bytes[i]);
+        text += (character >= 32 && character < 127) ? character : '?';
+      }
+      return "'" + text + "'";
+    };
+
+    auto const& root_bytes = backing.parts[part_index(ShadowlandsADTPart::Root)].bytes;
+
     LogDebug << "[ModernADT][Save] Backing store for '" << root_path << "': ROOT="
-             << part_size(ShadowlandsADTPart::Root)
+             << part_size(ShadowlandsADTPart::Root) << " (starts " << first_bytes(root_bytes) << ")"
              << " TEX0=" << part_size(ShadowlandsADTPart::Tex0)
              << " OBJ0=" << part_size(ShadowlandsADTPart::Obj0)
              << " OBJ1=" << part_size(ShadowlandsADTPart::Obj1)
              << " LOD=" << part_size(ShadowlandsADTPart::Lod) << " byte(s)." << std::endl;
+
+    // A ROOT that is not empty but is not an ADT either would otherwise surface
+    // three layers down as "Original ROOT lacks MVER/MHDR/MCIN", which does not
+    // say what the file turned out to be. Compared exactly the way parse_chunks()
+    // and find_chunk() compare magics, so this cannot disagree with them about a
+    // valid part. Reported rather than thrown: a diagnostic must not add a new
+    // way for a save to fail, and the writer below already refuses a ROOT it
+    // cannot use.
+    std::uint32_t first_magic = 0;
+    if (root_bytes.size() >= sizeof(first_magic))
+      std::memcpy(&first_magic, root_bytes.data(), sizeof(first_magic));
+
+    if (root_bytes.size() >= minimum_adt_part_size
+        && first_magic != fourcc('M','V','E','R'))
+    {
+      LogError << "[ModernADT][Save] The ROOT part read for '" << root_path << "' is "
+               << root_bytes.size() << " byte(s) and does not begin with a version chunk"
+               << " (first four bytes " << first_bytes(root_bytes) << "); the writer will"
+                  " refuse this tile." << std::endl;
+    }
 
     return backing;
   }
