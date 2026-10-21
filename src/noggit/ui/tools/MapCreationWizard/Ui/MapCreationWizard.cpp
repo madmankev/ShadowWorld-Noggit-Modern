@@ -121,7 +121,10 @@ namespace
 
     try
     {
-      auto difficulty_table = ClientDatabase::getTable("MapDifficulty");
+      // Fully qualified: this helper is a free function at global scope, unlike
+      // the member functions below which find Noggit::ClientDatabase through the
+      // class' enclosing namespace.
+      auto difficulty_table = Noggit::ClientDatabase::getTable("MapDifficulty");
       auto iterator = difficulty_table.Records();
 
       while (iterator.HasRecords())
