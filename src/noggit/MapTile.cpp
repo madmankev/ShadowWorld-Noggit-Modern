@@ -598,6 +598,26 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
 
   auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
   std::optional<Noggit::Formats::ADT::ShadowlandsADTBackingStore> modern_backing;
+
+  //! FileDataIDs for every asset this tile references, taken from the FileKeys
+  //! the editor is already holding.
+  //!
+  //! The legacy serialization only stores path strings, so converting back to the
+  //! modern split layout has to recover a FileDataID per asset. Relying on the
+  //! project listfile for that made the whole tile save abort whenever a single
+  //! path was unknown - common on retail installs, where assets whose id had to be
+  //! guessed get a synthetic path and partial CASC copies are missing entries.
+  //! The tile was then never written at all, so reloading the map showed none of
+  //! the edits: heights, textures, objects and water all lost together.
+  Noggit::Formats::ADT::ModernAdtFdidHints fdid_hints;
+  auto add_fdid_hint = [&fdid_hints] (std::string const& path, BlizzardArchive::Listfile::FileKey const& key)
+  {
+    if (path.empty() || !key.hasFileDataID() || !key.fileDataID())
+      return;
+
+    fdid_hints.emplace(BlizzardArchive::ClientData::normalizeFilenameInternal(path), key.fileDataID());
+  };
+
   if (client_data->version() != BlizzardArchive::ClientVersion::WOTLK)
   {
     try
@@ -673,6 +693,7 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
     {
       lModels.emplace (model->model->file_key().filepath(), nullyThing);
     }
+    add_fdid_hint(model->model->file_key().filepath(), model->model->file_key());
   }
 
   lID = 0;
@@ -689,6 +710,7 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
     {
       lObjects.emplace(object->wmo->file_key().filepath(), nullyThing);
     }
+    add_fdid_hint(object->wmo->file_key().filepath(), object->wmo->file_key());
   }
 
   lID = 0;
@@ -715,6 +737,11 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
         {
           lTextures.emplace(mChunks[i][j]->texture_set->filename(tex), -1);
         }
+
+        // scoped_blp_texture_reference has no boolean conversion; test get().
+        auto texture = mChunks[i][j]->texture_set->texture(tex);
+        if (texture.get())
+          add_fdid_hint(mChunks[i][j]->texture_set->filename(tex), texture->file_key());
       }
     }
   }
@@ -1007,6 +1034,7 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
       // written.
       auto const& profile = Noggit::Formats::ADT::adt_profile_v18();
       bool saved_natively = false;
+      Noggit::Formats::ADT::ModernAdtSaveReport report;
       try
       {
         auto input = Noggit::Formats::ADT::ModernAdtWriter::rootInputFromLegacy(profile, serialized);
@@ -1015,7 +1043,7 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
             modern_backing->part(Noggit::Formats::ADT::ShadowlandsADTPart::Root).bytes,
             input);
         Noggit::Formats::ADT::ShadowlandsADTCodec::saveNativeRoot(
-            *modern_backing, std::move(root), serialized);
+            *modern_backing, std::move(root), serialized, fdid_hints, &report);
         saved_natively = true;
       }
       catch (Noggit::Formats::ADT::ModernAdtValidationError const& error)
@@ -1035,12 +1063,37 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
       }
 
       if (!saved_natively)
-        Noggit::Formats::ADT::ShadowlandsADTCodec::saveFromLegacy(*modern_backing, serialized);
+      {
+        // The aborted attempt may already have counted losses; only the run that
+        // actually wrote the tile should be reported.
+        report = {};
+        Noggit::Formats::ADT::ShadowlandsADTCodec::saveFromLegacy(
+            *modern_backing, serialized, fdid_hints, &report);
+      }
+
+      // The tile is on disk. Say what could not be carried over, because those
+      // losses are visible in game and the alternative is guessing.
+      if (!report.empty())
+      {
+        LogError << "[ModernADT][Save] Saved \"" << _file_key.stringRepr()
+                 << "\" with losses: "
+                 << report.unresolved_textures << " texture layer(s) written with FileDataID 0"
+                 << (report.first_unresolved_texture.empty()
+                       ? "" : " (first: " + report.first_unresolved_texture + ")")
+                 << ", " << report.recovered_placements
+                 << " placement(s) kept the FileDataID they were loaded with"
+                 << ", " << report.skipped_placements << " placement(s) dropped"
+                 << (report.first_skipped_placement.empty()
+                       ? "" : " (first: " + report.first_skipped_placement + ")")
+                 << ". Everything else on the tile was saved." << std::endl;
+      }
     }
     catch (std::exception const& error)
     {
       LogError << "[ModernADT][Save] Split ADT save failed for \""
-               << _file_key.stringRepr() << "\": " << error.what() << std::endl;
+               << _file_key.stringRepr() << "\": " << error.what()
+               << ". No part of this tile was written, so none of the edits to it"
+                  " are on disk." << std::endl;
       return false;
     }
   }

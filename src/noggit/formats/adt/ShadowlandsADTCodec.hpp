@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace Noggit::Formats::ADT
@@ -21,6 +22,44 @@ namespace Noggit::Formats::ADT
     Obj1,
     Lod,
     Count
+  };
+
+  //! FileDataIDs the editor already knows, keyed by normalized asset path.
+  //!
+  //! The legacy ADT serialization only carries path strings (MTEX/MMDX/MWMO), so
+  //! converting back to the modern split layout has to recover a FileDataID for
+  //! every one of them. The project listfile is not complete on retail installs:
+  //! it has no entry for assets whose id Noggit had to guess, and none for files
+  //! missing from a partial CASC. The in-memory FileKeys do carry the real id, so
+  //! MapTile::save hands them over and the conversion no longer depends on
+  //! listfile coverage.
+  using ModernAdtFdidHints = std::unordered_map<std::string, std::uint32_t>;
+
+  //! What a modern tile save could not carry over.
+  //!
+  //! Nothing in here aborts the save. Losing one texture layer or one placement
+  //! is visible and recoverable; losing the whole tile - heights, textures,
+  //! objects and water together - because a single path could not be resolved is
+  //! what used to happen, and it looked like "saving does nothing".
+  struct ModernAdtSaveReport
+  {
+    //! Texture paths with no FileDataID: the layer is written with id 0 and
+    //! renders untextured.
+    std::size_t unresolved_textures = 0;
+    //! Placement paths with no FileDataID whose original id could be recovered
+    //! from the tile being rewritten (an untouched object, so nothing is lost).
+    std::size_t recovered_placements = 0;
+    //! Placements that could not be resolved at all and were dropped.
+    std::size_t skipped_placements = 0;
+
+    std::string first_unresolved_texture;
+    std::string first_recovered_placement;
+    std::string first_skipped_placement;
+
+    [[nodiscard]] bool empty() const noexcept
+    {
+      return !unresolved_textures && !recovered_placements && !skipped_placements;
+    }
   };
 
   struct ShadowlandsADTSource
@@ -66,7 +105,9 @@ namespace Noggit::Formats::ADT
     // (MCIN offsets/sizes, MHDR mcin/mh2o/mfbo) and validate every part
     // before anything is written to disk.
     static void saveFromLegacy(ShadowlandsADTBackingStore const& backing,
-                               std::vector<std::uint8_t> const& legacy_adt);
+                               std::vector<std::uint8_t> const& legacy_adt,
+                               ModernAdtFdidHints const& fdid_hints = {},
+                               ModernAdtSaveReport* report = nullptr);
 
     // Saves a ROOT part that ModernAdtWriter assembled natively, converting
     // TEX0/OBJ0/OBJ1 from the legacy serialization as before. Throws
@@ -74,6 +115,8 @@ namespace Noggit::Formats::ADT
     // nothing is written in that case.
     static void saveNativeRoot(ShadowlandsADTBackingStore const& backing,
                                std::vector<std::uint8_t> root,
-                               std::vector<std::uint8_t> const& legacy_adt);
+                               std::vector<std::uint8_t> const& legacy_adt,
+                               ModernAdtFdidHints const& fdid_hints = {},
+                               ModernAdtSaveReport* report = nullptr);
   };
 }

@@ -417,16 +417,46 @@ namespace Noggit::Formats::ADT
       return result;
     }
 
-    std::vector<std::uint32_t> resolve_file_ids(std::vector<std::string> const& paths)
+    //! Resolve an asset path to a FileDataID.
+    //!
+    //! The editor's own hints come first: they carry the id the asset was really
+    //! loaded with, which the project listfile does not necessarily know. Retail
+    //! installs routinely have assets whose id Noggit had to guess (they get a
+    //! synthetic path such as models/world/unk_exp11_6212428/6212428.m2) and
+    //! partial CASC copies are missing listfile entries altogether.
+    std::uint32_t lookup_fdid(std::string const& path, ModernAdtFdidHints const& hints)
     {
-      auto* listfile = Noggit::Application::NoggitApplication::instance()->clientData()->listfile();
+      auto const normalized = BlizzardArchive::ClientData::normalizeFilenameInternal(path);
+
+      if (auto const it = hints.find(normalized); it != hints.end() && it->second)
+        return it->second;
+
+      return Noggit::Application::NoggitApplication::instance()->clientData()
+               ->listfile()->getFileDataID(normalized);
+    }
+
+    //! Resolve the MTEX string table into an MDID payload.
+    //!
+    //! MDID is index aligned with MCLY, so an unresolvable layer has to keep its
+    //! slot: id 0 leaves that one layer untextured. Throwing here instead used to
+    //! abort the whole tile conversion before anything was written, so a single
+    //! texture the listfile did not know cost the player every height, texture,
+    //! object and water edit on that tile.
+    std::vector<std::uint32_t> resolve_file_ids(std::vector<std::string> const& paths,
+                                                ModernAdtFdidHints const& fdid_hints,
+                                                ModernAdtSaveReport* report)
+    {
       std::vector<std::uint32_t> result;
       result.reserve(paths.size());
       for (auto const& path : paths)
       {
-        auto const id = listfile->getFileDataID(path);
-        if (!id)
-          throw std::runtime_error("No FileDataID found for modern ADT asset: " + path);
+        auto const id = lookup_fdid(path, fdid_hints);
+        if (!id && report)
+        {
+          ++report->unresolved_textures;
+          if (report->first_unresolved_texture.empty())
+            report->first_unresolved_texture = path;
+        }
         result.push_back(id);
       }
       return result;
@@ -895,7 +925,9 @@ namespace Noggit::Formats::ADT
                                                 std::uint32_t placement_magic,
                                                 std::uint32_t offsets_magic,
                                                 std::uint32_t strings_magic,
-                                                std::vector<std::uint8_t> const& original_obj0)
+                                                std::vector<std::uint8_t> const& original_obj0,
+                                                ModernAdtFdidHints const& fdid_hints,
+                                                ModernAdtSaveReport* report)
     {
       auto const chunks = parse_chunks(legacy, "legacy ADT");
       auto const* placements = find_chunk(chunks, placement_magic);
@@ -906,35 +938,74 @@ namespace Noggit::Formats::ADT
       auto const* offsets = find_chunk(chunks, offsets_magic);
       auto const* strings = find_chunk(chunks, strings_magic);
       auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
-      auto* listfile = client_data->listfile();
 
       std::unordered_map<std::uint64_t, std::uint16_t> original_flags;
-      if constexpr (std::is_same_v<Entry, ENTRY_MDDF>)
+      //! In a modern OBJ0 the nameID *is* the FileDataID, so a placement that was
+      //! loaded from this tile can always give its id back even when its path
+      //! cannot be resolved any more.
+      std::unordered_map<std::uint32_t, std::uint32_t> original_fdid_by_uid;
       {
         auto const original_chunks = parse_chunks(original_obj0, "original OBJ0");
         if (auto const* original = find_chunk(original_chunks, placement_magic))
         {
           if (original->size % sizeof(Entry) != 0)
-            throw std::runtime_error("Original OBJ0 MDDF chunk has an invalid size.");
+            throw std::runtime_error("Original OBJ0 placement chunk has an invalid size.");
           for (std::size_t i = 0; i < original->size / sizeof(Entry); ++i)
           {
             Entry entry{};
             std::memcpy(&entry, original_obj0.data() + original->payload + i * sizeof(Entry), sizeof(Entry));
-            auto const key = (static_cast<std::uint64_t>(entry.uniqueID) << 32) | entry.nameID;
-            original_flags.emplace(key, entry.flags);
+            original_fdid_by_uid.emplace(entry.uniqueID, entry.nameID);
+
+            if constexpr (std::is_same_v<Entry, ENTRY_MDDF>)
+            {
+              auto const key = (static_cast<std::uint64_t>(entry.uniqueID) << 32) | entry.nameID;
+              original_flags.emplace(key, entry.flags);
+            }
           }
         }
       }
 
-      std::vector<std::uint8_t> payload(placements->size);
+      std::vector<Entry> kept;
+      kept.reserve(placements->size / sizeof(Entry));
+
       for (std::size_t i = 0; i < placements->size / sizeof(Entry); ++i)
       {
         Entry entry{};
         std::memcpy(&entry, legacy.data() + placements->payload + i * sizeof(Entry), sizeof(Entry));
         auto const path = indexed_path(legacy, offsets, strings, entry.nameID);
-        auto const id = listfile->getFileDataID(path);
+        auto id = lookup_fdid(path, fdid_hints);
+
         if (!id)
-          throw std::runtime_error("No FileDataID found for modern ADT placement: " + path);
+        {
+          // Unmodified placements keep the id they were loaded with, so an
+          // unresolvable path on an existing object costs nothing.
+          if (auto const it = original_fdid_by_uid.find(entry.uniqueID);
+              it != original_fdid_by_uid.end() && it->second)
+          {
+            id = it->second;
+            if (report)
+            {
+              ++report->recovered_placements;
+              if (report->first_recovered_placement.empty())
+                report->first_recovered_placement = path;
+            }
+          }
+        }
+
+        if (!id)
+        {
+          // Drop this one placement rather than the tile. A newly placed object
+          // whose asset is not in the listfile cannot be written as a FileDataID,
+          // but aborting here lost every other edit on the tile as well.
+          if (report)
+          {
+            ++report->skipped_placements;
+            if (report->first_skipped_placement.empty())
+              report->first_skipped_placement = path;
+          }
+          continue;
+        }
+
         entry.nameID = id;
         if constexpr (std::is_same_v<Entry, ENTRY_MDDF>)
         {
@@ -952,8 +1023,12 @@ namespace Noggit::Formats::ADT
           // Existing modern OBJ0 WMO placements use these bits with FileDataIDs.
           entry.flags |= 0x000C;
         }
-        std::memcpy(payload.data() + i * sizeof(Entry), &entry, sizeof(Entry));
+        kept.push_back(entry);
       }
+
+      std::vector<std::uint8_t> payload(kept.size() * sizeof(Entry));
+      if (!kept.empty())
+        std::memcpy(payload.data(), kept.data(), payload.size());
       return payload;
     }
 
@@ -984,7 +1059,9 @@ namespace Noggit::Formats::ADT
 
     ConvertedParts assemble_parts(ShadowlandsADTBackingStore const& backing,
                                   std::vector<std::uint8_t> const& legacy_adt,
-                                  std::optional<std::vector<std::uint8_t>> native_root)
+                                  std::optional<std::vector<std::uint8_t>> native_root,
+                                  ModernAdtFdidHints const& fdid_hints,
+                                  ModernAdtSaveReport* report)
     {
       ConvertedParts parts;
       auto const& profile = adt_profile_v18();
@@ -1010,15 +1087,17 @@ namespace Noggit::Formats::ADT
 
       parts.tex0 = rewrite_mcnks(backing.part(ShadowlandsADTPart::Tex0).bytes, legacy_adt, false);
       auto const texture_paths = legacy_string_table(legacy_adt, fourcc('M','T','E','X'));
-      auto const texture_ids = resolve_file_ids(texture_paths);
+      auto const texture_ids = resolve_file_ids(texture_paths, fdid_hints, report);
       parts.tex0 = replace_top_level_chunk(
         parts.tex0, fourcc('M','D','I','D'), make_chunk(fourcc('M','D','I','D'), uint32_payload(texture_ids)));
 
       auto const original_obj0 = backing.part(ShadowlandsADTPart::Obj0).bytes;
       auto const mddf = modern_placements<ENTRY_MDDF>(
-        legacy_adt, fourcc('M','D','D','F'), fourcc('M','M','I','D'), fourcc('M','M','D','X'), original_obj0);
+        legacy_adt, fourcc('M','D','D','F'), fourcc('M','M','I','D'), fourcc('M','M','D','X'),
+        original_obj0, fdid_hints, report);
       auto const modf = modern_placements<ENTRY_MODF>(
-        legacy_adt, fourcc('M','O','D','F'), fourcc('M','W','I','D'), fourcc('M','W','M','O'), original_obj0);
+        legacy_adt, fourcc('M','O','D','F'), fourcc('M','W','I','D'), fourcc('M','W','M','O'),
+        original_obj0, fdid_hints, report);
       if (backing.has(ShadowlandsADTPart::Obj1))
         parts.obj1 = rewrite_obj1(backing.part(ShadowlandsADTPart::Obj1).bytes, mddf, modf);
       parts.obj0 = original_obj0;
@@ -1128,16 +1207,22 @@ namespace Noggit::Formats::ADT
 
   void ShadowlandsADTCodec::saveFromLegacy(
     ShadowlandsADTBackingStore const& backing,
-    std::vector<std::uint8_t> const& legacy_adt)
+    std::vector<std::uint8_t> const& legacy_adt,
+    ModernAdtFdidHints const& fdid_hints,
+    ModernAdtSaveReport* report)
   {
-    validate_and_save_parts(backing, assemble_parts(backing, legacy_adt, std::nullopt));
+    validate_and_save_parts(backing,
+                            assemble_parts(backing, legacy_adt, std::nullopt, fdid_hints, report));
   }
 
   void ShadowlandsADTCodec::saveNativeRoot(
     ShadowlandsADTBackingStore const& backing,
     std::vector<std::uint8_t> root,
-    std::vector<std::uint8_t> const& legacy_adt)
+    std::vector<std::uint8_t> const& legacy_adt,
+    ModernAdtFdidHints const& fdid_hints,
+    ModernAdtSaveReport* report)
   {
-    validate_and_save_parts(backing, assemble_parts(backing, legacy_adt, std::move(root)));
+    validate_and_save_parts(backing,
+                            assemble_parts(backing, legacy_adt, std::move(root), fdid_hints, report));
   }
 }
