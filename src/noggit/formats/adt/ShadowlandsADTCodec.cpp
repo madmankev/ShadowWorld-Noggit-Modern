@@ -25,6 +25,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <optional>
@@ -65,18 +66,54 @@ namespace Noggit::Formats::ADT
       return root_path.substr(0, extension) + suffix + ".adt";
     }
 
+    //! Smallest byte count that can hold the MVER chunk every ADT part starts
+    //! with: an 8 byte header plus its 4 byte payload.
+    constexpr std::size_t minimum_adt_part_size = 12;
+
     ShadowlandsADTRawPart read_part(std::string const& path, bool required)
     {
+      auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
+
       try
       {
         BlizzardArchive::Listfile::FileKey key(path);
-        BlizzardArchive::ClientFile file(
-          key,
-          Noggit::Application::NoggitApplication::instance()->clientData());
+        BlizzardArchive::ClientFile file(key, client_data);
+
+        auto const size = file.getSize();
+
+        // ClientFile prefers the loose project override, and an override that is
+        // present but too small to hold a chunk header still "reads" fine. An
+        // empty buffer walks as zero chunks, which surfaced much further down as
+        // "Original ROOT lacks MVER/MHDR/MCIN" and then failed every save of that
+        // tile, permanently: the stale override kept masking the real file.
+        // Read the original back from CASC instead of trusting it.
+        if (size < minimum_adt_part_size)
+        {
+          BlizzardArchive::Listfile::FileKey casc_key(path);
+          casc_key.deduceOtherComponent(client_data->listfile());
+
+          std::vector<char> casc_bytes;
+          if (client_data->readFile(casc_key, casc_bytes)
+              && casc_bytes.size() >= minimum_adt_part_size)
+          {
+            LogError << "[ModernADT][Save] The project override for '" << path << "' is "
+                     << size << " byte(s), too small to be an ADT part, so the original "
+                     << casc_bytes.size() << " byte(s) were read from CASC instead. Delete"
+                        " that stale file if the override was not intentional." << std::endl;
+
+            ShadowlandsADTRawPart result;
+            result.present = true;
+            result.bytes.assign(casc_bytes.begin(), casc_bytes.end());
+            return result;
+          }
+
+          throw std::runtime_error("'" + path + "' is " + std::to_string(size)
+                                   + " byte(s), too small to be an ADT part, and CASC has no"
+                                     " usable copy of it either");
+        }
 
         ShadowlandsADTRawPart result;
         result.present = true;
-        auto const size = file.getSize();
         auto const* buffer = reinterpret_cast<std::uint8_t const*>(file.getBuffer());
         result.bytes.assign(buffer, buffer + size);
         return result;
@@ -1201,6 +1238,22 @@ namespace Noggit::Formats::ADT
       read_part(backing.source.paths[part_index(ShadowlandsADTPart::Obj1)], false);
     backing.parts[part_index(ShadowlandsADTPart::Lod)] =
       read_part(backing.source.paths[part_index(ShadowlandsADTPart::Lod)], false);
+
+    // Sizes, not contents: when a part turns out to be unusable further down,
+    // "0 bytes" and "the wrong file" need to be tellable apart in the log.
+    auto part_size = [&backing] (ShadowlandsADTPart part)
+    {
+      return backing.has(part)
+               ? std::to_string(backing.part(part).bytes.size())
+               : std::string("absent");
+    };
+
+    LogDebug << "[ModernADT][Save] Backing store for '" << root_path << "': ROOT="
+             << part_size(ShadowlandsADTPart::Root)
+             << " TEX0=" << part_size(ShadowlandsADTPart::Tex0)
+             << " OBJ0=" << part_size(ShadowlandsADTPart::Obj0)
+             << " OBJ1=" << part_size(ShadowlandsADTPart::Obj1)
+             << " LOD=" << part_size(ShadowlandsADTPart::Lod) << " byte(s)." << std::endl;
 
     return backing;
   }

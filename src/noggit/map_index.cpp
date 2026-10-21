@@ -732,12 +732,12 @@ void MapIndex::saveTile(const TileIndex& tile, World* world, bool save_unloaded)
 	// save given tile
 	if (save_unloaded)
   {
-    auto filepath = std::filesystem::path (Noggit::Project::CurrentProject::get()->ProjectPath)
-                    / BlizzardArchive::ClientData::normalizeFilenameInternal (mTiles[tile.z][tile.x].tile->file_key().filepath());
-
-    QFile file(filepath.string().c_str());
-    file.open(QIODevice::WriteOnly);
-
+    // This used to open the project path with QIODevice::WriteOnly first, which
+    // truncates it to 0 bytes and closes it again without writing anything.
+    // MapTile::save() then reads that same path back as the "original" tile to
+    // merge into, so on a modern client it read the empty file it had just
+    // created and every save of that tile failed from then on. saveTile() writes
+    // the file itself; nothing needs to pre-create it.
     mTiles[tile.z][tile.x].tile->initEmptyChunks();
     mTiles[tile.z][tile.x].tile->saveTile(world);
     return;
@@ -808,9 +808,9 @@ void MapIndex::saveChanged (World* world, bool save_unloaded)
 
         if (mTiles[i][j].flags & 0x1)
         {
-          QFile file(filepath.string().c_str());
-          file.open(QIODevice::WriteOnly);
-
+          // No pre-creating the file here either: truncating the project override
+          // to 0 bytes first made MapTile::save() read that empty file back as the
+          // original tile, so the save could never succeed.
           mTiles[i][j].tile->initEmptyChunks();
           if (mTiles[i][j].tile->saveTile(world))
           {
