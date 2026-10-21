@@ -19,6 +19,11 @@ namespace Noggit::Formats::ADT
            | static_cast<std::uint32_t>(static_cast<unsigned char>(d));
     }
 
+    //! Bytes every chunk spends on its magic and size fields. Distinct from
+    //! AdtFormatProfile::chunk_header_size, which is the 128 byte MapChunkHeader
+    //! a ROOT MCNK carries inside its payload.
+    constexpr std::size_t chunk_tag_size = 8;
+
     constexpr std::uint32_t MCC_MVER = fourcc('M', 'V', 'E', 'R');
     constexpr std::uint32_t MCC_MHDR = fourcc('M', 'H', 'D', 'R');
     constexpr std::uint32_t MCC_MCIN = fourcc('M', 'C', 'I', 'N');
@@ -94,11 +99,19 @@ namespace Noggit::Formats::ADT
           throw ModernAdtWriterError(std::string(label) + " contains a truncated chunk.");
         result.push_back(chunk);
         pos = chunk.end();
-        if (legacy_mcnr_padding && chunk.magic == MCC_MCNR)
+        // Noggit's canonical serializer writes 13 raw bytes after MCNR. Retail
+        // files put the next subchunk's header there instead, so the padding is
+        // skipped only when nothing that could be a chunk tag follows: Noggit's
+        // padding is zero filled, a magic never is. Skipping it unconditionally
+        // cost a genuine retail MCNK 13 bytes and desynchronized the walk, which
+        // then reported a truncated chunk.
+        if (legacy_mcnr_padding && chunk.magic == MCC_MCNR
+            && legacy_mcnr_padding_size <= end - pos)
         {
-          if (legacy_mcnr_padding_size > end - pos)
-            throw ModernAdtWriterError(std::string(label) + " has truncated MCNR padding.");
-          pos += legacy_mcnr_padding_size;
+          std::uint32_t next_magic = 0;
+          std::memcpy(&next_magic, bytes.data() + pos, 4);
+          if (next_magic == 0)
+            pos += legacy_mcnr_padding_size;
         }
       }
       if (pos != end)
@@ -404,6 +417,14 @@ namespace Noggit::Formats::ADT
 
     // Shared MCIN/MHDR repair used by refreshRootBookkeeping and writeRoot's
     // backpatch. positions[i] = {chunk offset, payload size} of MCNK i.
+    //
+    // MCIN.size describes the whole MCNK chunk including its 8 byte tag, which
+    // is what Noggit's legacy serializer has always written
+    // (MapChunk::save stores lMCNK_Size + sizeof(sChunkHeader)) and what the
+    // conversion library both reads and writes: parseLegacyAdt bounds a chunk
+    // walk with entry.offset + entry.size, where offset is the chunk start.
+    // Storing the payload size alone left every natively written ROOT 8 bytes
+    // short per chunk and made the validator reject correctly built ones.
     void patch_root_bookkeeping(std::vector<std::uint8_t>& bytes,
                                 RootLayout const& layout,
                                 std::vector<std::pair<std::size_t, std::size_t>> const& mcnk_positions,
@@ -424,7 +445,7 @@ namespace Noggit::Formats::ADT
         write_u32(bytes, entry + offsetof(ENTRY_MCIN, offset),
                   static_cast<std::uint32_t>(mcnk_positions[i].first));
         write_u32(bytes, entry + offsetof(ENTRY_MCIN, size),
-                  static_cast<std::uint32_t>(mcnk_positions[i].second));
+                  static_cast<std::uint32_t>(mcnk_positions[i].second + chunk_tag_size));
       }
 
       write_u32(bytes, layout.mhdr->payload + offsetof(MHDR, mcin),
@@ -490,12 +511,13 @@ namespace Noggit::Formats::ADT
           auto const entry = layout.mcin->payload + i * sizeof(ENTRY_MCIN);
           std::uint32_t const offset = read_u32(bytes, entry + offsetof(ENTRY_MCIN, offset));
           std::uint32_t const size = read_u32(bytes, entry + offsetof(ENTRY_MCIN, size));
-          if (offset != layout.mcnks[i]->offset || size != layout.mcnks[i]->size)
+          std::size_t const expected_size = layout.mcnks[i]->size + chunk_tag_size;
+          if (offset != layout.mcnks[i]->offset || size != expected_size)
           {
             problems.emplace_back("MCIN entry " + std::to_string(i) + " (offset=" + std::to_string(offset)
                                   + ", size=" + std::to_string(size) + ") does not match the actual MCNK (offset="
                                   + std::to_string(layout.mcnks[i]->offset) + ", size="
-                                  + std::to_string(layout.mcnks[i]->size) + ").");
+                                  + std::to_string(expected_size) + ").");
             ++reported;
           }
         }

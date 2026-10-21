@@ -64,6 +64,7 @@ namespace Noggit::Formats::Conversion
     constexpr std::uint32_t FC_MCAL = (std::uint32_t('M') << 24) | (std::uint32_t('C') << 16) | (std::uint32_t('A') << 8) | std::uint32_t('L');
     constexpr std::uint32_t FC_MCLY = (std::uint32_t('M') << 24) | (std::uint32_t('C') << 16) | (std::uint32_t('L') << 8) | std::uint32_t('Y');
     constexpr std::uint32_t FC_MCLQ = (std::uint32_t('M') << 24) | (std::uint32_t('C') << 16) | (std::uint32_t('L') << 8) | std::uint32_t('Q');
+    constexpr std::uint32_t FC_MCRF = (std::uint32_t('M') << 24) | (std::uint32_t('C') << 16) | (std::uint32_t('R') << 8) | std::uint32_t('F');
     constexpr std::uint32_t FC_MCRD = (std::uint32_t('M') << 24) | (std::uint32_t('C') << 16) | (std::uint32_t('R') << 8) | std::uint32_t('D');
     constexpr std::uint32_t FC_MCRW = (std::uint32_t('M') << 24) | (std::uint32_t('C') << 16) | (std::uint32_t('R') << 8) | std::uint32_t('W');
     constexpr std::uint32_t FC_MCSE = (std::uint32_t('M') << 24) | (std::uint32_t('C') << 16) | (std::uint32_t('S') << 8) | std::uint32_t('E');
@@ -117,7 +118,8 @@ namespace Noggit::Formats::Conversion
                     std::size_t to,
                     std::vector<RawChunk>& out,
                     std::vector<ConversionIssue>& issues,
-                    char const* context)
+                    char const* context,
+                    bool legacy_mcnr_padding = false)
     {
       std::size_t pos = from;
       while (pos + 8 <= to)
@@ -136,6 +138,23 @@ namespace Noggit::Formats::Conversion
         }
         out.push_back(chunk);
         pos = chunk.payload + chunk.size;
+
+        // Noggit's canonical WotLK serializer writes 13 zero bytes after MCNR
+        // ("unknown MCNR bytes ... just to make the files more blizzlike").
+        // They are padding, not another sub-chunk header. Walking them as one
+        // consumes 8 of the 13 and leaves the next read starting 5 bytes early,
+        // inside the padding: the magic comes out zero and the size picks up the
+        // leading bytes of MCLY, which reports a truncated chunk and fails the
+        // whole tile. Every Noggit-saved ADT was therefore unconvertible.
+        //
+        // Retail files put the next chunk's magic here instead, so the padding is
+        // only skipped when no magic follows - that keeps genuine WotLK source
+        // files converting exactly as before.
+        if (legacy_mcnr_padding && chunk.magic == FC_MCNR
+            && pos + 13 <= to && readMagic(data + pos) == 0)
+        {
+          pos += 13;
+        }
       }
       return true;
     }
@@ -383,7 +402,8 @@ namespace Noggit::Formats::Conversion
       RawChunk mccv{};  bool has_mccv = false;
       RawChunk mcal{};  bool has_mcal = false;
       RawChunk mclq{};  bool has_mclq = false;
-      bool has_refs = false; // MCRD/MCRW seen (not carried across)
+      RawChunk mcrf{};  bool has_mcrf = false;
+      bool has_refs = false; // MCRF seen
     };
 
     struct LegacyAdtModel
@@ -617,7 +637,7 @@ namespace Noggit::Formats::Conversion
           entry.size ? static_cast<std::size_t>(entry.offset) + entry.size : bytes.size());
         std::vector<RawChunk> subs;
         walkChunks(bytes.data(), header_pos + sizeof(MapChunkHeader), chunk_end,
-                   subs, issues, "legacy MCNK");
+                   subs, issues, "legacy MCNK", true);
 
         for (RawChunk const& sub : subs)
         {
@@ -630,6 +650,11 @@ namespace Noggit::Formats::Conversion
             case FC_MCCV: chunk.mccv = sub; chunk.has_mccv = true; break;
             case FC_MCAL: chunk.mcal = sub; chunk.has_mcal = true; break;
             case FC_MCLQ: chunk.mclq = sub; chunk.has_mclq = true; break;
+            // Legacy MCNKs keep their object references in a single MCRF chunk:
+            // nDoodadRefs indices into MDDF followed by nMapObjRefs indices into
+            // MODF. MCRD/MCRW are the modern split names and never appear here,
+            // so matching on them meant has_refs was never set for a real file.
+            case FC_MCRF: chunk.mcrf = sub; chunk.has_mcrf = true; chunk.has_refs = true; break;
             case FC_MCRD: case FC_MCRW: chunk.has_refs = true; break;
             default: break;
           }
@@ -1227,7 +1252,8 @@ namespace Noggit::Formats::Conversion
       return out.bytes;
     }
 
-    std::vector<std::uint8_t> buildModernObj0(LegacyAdtModel const& model,
+    std::vector<std::uint8_t> buildModernObj0(std::vector<std::uint8_t> const& legacy_adt,
+                                              LegacyAdtModel const& model,
                                               FdidResolver& resolver,
                                               std::vector<ConversionIssue>& issues)
     {
@@ -1236,7 +1262,12 @@ namespace Noggit::Formats::Conversion
       out.chunkHeader(FC_MVER, 4);
       out.u32(18);
 
+      // An unresolvable placement is dropped, which shifts the index of every
+      // placement after it. The per-chunk references below are indices into
+      // these lists, so each one has to be remapped through the tables built
+      // here or it would point at the wrong object - or past the end.
       std::vector<ENTRY_MDDF> mddf_out;
+      std::vector<std::int32_t> mddf_remap(model.mddf.size(), -1);
       mddf_out.reserve(model.mddf.size());
       for (std::size_t i = 0; i < model.mddf.size(); ++i)
       {
@@ -1250,10 +1281,12 @@ namespace Noggit::Formats::Conversion
           continue;
         }
         entry.nameID = resolver.resolve(model.m2_names[entry.nameID], "m2");
+        mddf_remap[i] = static_cast<std::int32_t>(mddf_out.size());
         mddf_out.push_back(entry);
       }
 
       std::vector<ENTRY_MODF> modf_out;
+      std::vector<std::int32_t> modf_remap(model.modf.size(), -1);
       modf_out.reserve(model.modf.size());
       for (std::size_t i = 0; i < model.modf.size(); ++i)
       {
@@ -1268,6 +1301,7 @@ namespace Noggit::Formats::Conversion
         }
         entry.nameID = resolver.resolve(model.wmo_names[entry.nameID], "wmo");
         entry.flags |= MODF_FLAG_NAME_IS_FDID;
+        modf_remap[i] = static_cast<std::int32_t>(modf_out.size());
         modf_out.push_back(entry);
       }
 
@@ -1278,6 +1312,101 @@ namespace Noggit::Formats::Conversion
       out.chunkHeader(FC_MODF, static_cast<std::uint32_t>(modf_out.size() * sizeof(ENTRY_MODF)));
       for (ENTRY_MODF const& entry : modf_out)
         out.raw(&entry, sizeof(entry));
+
+      // 256 MCNK chunks, each carrying that map chunk's object references as
+      // MCRD (indices into MDDF) and MCRW (indices into MODF). A modern OBJ0
+      // without them has placements that belong to no chunk, and the client
+      // renders none of them - the objects silently vanish in game even though
+      // the file parses fine.
+      auto const remap_refs = [&issues](std::vector<std::uint32_t> const& source,
+                                        std::vector<std::int32_t> const& remap,
+                                        char const* what,
+                                        std::size_t chunk_index)
+      {
+        std::vector<std::uint32_t> kept;
+        kept.reserve(source.size());
+        for (std::uint32_t index : source)
+        {
+          if (index >= remap.size())
+          {
+            std::ostringstream message;
+            message << "chunk " << chunk_index << " has a " << what
+                    << " reference to placement " << index
+                    << ", which does not exist; reference dropped";
+            warn(issues, message.str());
+            continue;
+          }
+          if (remap[index] < 0)
+            continue; // its placement was dropped above
+          kept.push_back(static_cast<std::uint32_t>(remap[index]));
+        }
+        return kept;
+      };
+
+      for (std::size_t i = 0; i < 256; ++i)
+      {
+        LegacyChunkModel const& chunk = model.chunks[i];
+        std::vector<std::uint32_t> doodad_refs;
+        std::vector<std::uint32_t> wmo_refs;
+
+        std::uint32_t const n_doodad = chunk.present ? chunk.header.nDoodadRefs : 0;
+        std::uint32_t const n_wmo = chunk.present ? chunk.header.nMapObjRefs : 0;
+
+        if (n_doodad || n_wmo)
+        {
+          std::size_t const needed = static_cast<std::size_t>(n_doodad + n_wmo) * 4;
+          if (!chunk.has_mcrf)
+          {
+            std::ostringstream message;
+            message << "chunk " << i << " declares " << n_doodad << " doodad and " << n_wmo
+                    << " WMO reference(s) but has no MCRF chunk; references dropped";
+            warn(issues, message.str());
+          }
+          else if (chunk.mcrf.size < needed
+                   || chunk.mcrf.payload + needed > legacy_adt.size())
+          {
+            std::ostringstream message;
+            message << "chunk " << i << " MCRF holds " << chunk.mcrf.size
+                    << " byte(s), too few for its " << n_doodad << " doodad and " << n_wmo
+                    << " WMO reference(s); references dropped";
+            warn(issues, message.str());
+          }
+          else
+          {
+            auto read_ref = [&legacy_adt](std::size_t at)
+            {
+              std::uint32_t value;
+              std::memcpy(&value, legacy_adt.data() + at, 4);
+              return value;
+            };
+            for (std::uint32_t r = 0; r < n_doodad; ++r)
+              doodad_refs.push_back(read_ref(chunk.mcrf.payload + r * 4));
+            for (std::uint32_t r = 0; r < n_wmo; ++r)
+              wmo_refs.push_back(read_ref(chunk.mcrf.payload
+                                          + static_cast<std::size_t>(n_doodad + r) * 4));
+          }
+        }
+
+        doodad_refs = remap_refs(doodad_refs, mddf_remap, "doodad", i);
+        wmo_refs = remap_refs(wmo_refs, modf_remap, "WMO", i);
+
+        ByteSink subs;
+        if (!doodad_refs.empty())
+        {
+          subs.chunkHeader(FC_MCRD, static_cast<std::uint32_t>(doodad_refs.size() * 4));
+          for (std::uint32_t value : doodad_refs)
+            subs.u32(value);
+        }
+        if (!wmo_refs.empty())
+        {
+          subs.chunkHeader(FC_MCRW, static_cast<std::uint32_t>(wmo_refs.size() * 4));
+          for (std::uint32_t value : wmo_refs)
+            subs.u32(value);
+        }
+
+        out.chunkHeader(FC_MCNK, static_cast<std::uint32_t>(subs.position()));
+        out.raw(subs.bytes.data(), subs.bytes.size());
+      }
 
       return out.bytes;
     }
@@ -1731,7 +1860,7 @@ namespace Noggit::Formats::Conversion
     result.root = buildModernRoot(legacy_adt.data(), model, mh2o_payload, result.issues);
     result.tex0 = buildModernTex0(legacy_adt.data(), model, texture_fdids,
                                   options.big_alpha, result.issues);
-    result.obj0 = buildModernObj0(model, resolver, result.issues);
+    result.obj0 = buildModernObj0(legacy_adt, model, resolver, result.issues);
 
     // Self-check with the verified modern readers.
     Noggit::Formats::ADT::AdtScanOptions scan_options;
