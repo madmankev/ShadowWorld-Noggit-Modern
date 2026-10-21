@@ -3,7 +3,10 @@
 #include "Tool.hpp"
 #include <noggit/ActionManager.hpp>
 #include <noggit/BoolToggleProperty.hpp>
+#include <noggit/Log.h>
 #include <noggit/MapView.h>
+
+#include <string>
 
 #include <QAction>
 #include <QLabel>
@@ -210,10 +213,20 @@ namespace Noggit
         auto action(menu->addAction(title));
         action->setShortcut(shortcut);
         auto callback = onAction;
-        QObject::connect(action, &QAction::triggered, [this, callback]()
+        auto item_title = std::string(title);
+        QObject::connect(action, &QAction::triggered, [this, callback, item_title]()
             {
-                if (NOGGIT_CUR_ACTION) \
+                if (NOGGIT_CUR_ACTION)
+                {
+                    // Worth a line in the log: from the user's side this looks
+                    // exactly like "the menu item does nothing". If an operation
+                    // was interrupted and never ended, every item stays refused
+                    // until the action is closed (see
+                    // ActionManager::abandonCurrentAction).
+                    LogError << "Ignoring '" << item_title << "': an edit operation is"
+                                " still in progress." << std::endl;
                     return;
+                }
                 callback();
             });
     }
@@ -224,10 +237,20 @@ namespace Noggit
         action->setShortcut(shortcut);
         action->setEnabled(enabled);
         auto callback = onAction;
-        QObject::connect(action, &QAction::triggered, [this, callback]()
+        auto item_title = std::string(title);
+        QObject::connect(action, &QAction::triggered, [this, callback, item_title]()
             {
-                if (NOGGIT_CUR_ACTION) \
+                if (NOGGIT_CUR_ACTION)
+                {
+                    // Worth a line in the log: from the user's side this looks
+                    // exactly like "the menu item does nothing". If an operation
+                    // was interrupted and never ended, every item stays refused
+                    // until the action is closed (see
+                    // ActionManager::abandonCurrentAction).
+                    LogError << "Ignoring '" << item_title << "': an edit operation is"
+                                " still in progress." << std::endl;
                     return;
+                }
                 callback();
             });
     }
@@ -238,10 +261,20 @@ namespace Noggit
         action->setToolTip(tooltip);
         action->setEnabled(enabled);
         auto callback = onAction;
-        QObject::connect(action, &QAction::triggered, [this, callback]()
+        auto item_title = std::string(title);
+        QObject::connect(action, &QAction::triggered, [this, callback, item_title]()
             {
-                if (NOGGIT_CUR_ACTION) \
+                if (NOGGIT_CUR_ACTION)
+                {
+                    // Worth a line in the log: from the user's side this looks
+                    // exactly like "the menu item does nothing". If an operation
+                    // was interrupted and never ended, every item stays refused
+                    // until the action is closed (see
+                    // ActionManager::abandonCurrentAction).
+                    LogError << "Ignoring '" << item_title << "': an edit operation is"
+                                " still in progress." << std::endl;
                     return;
+                }
                 callback();
             });
     }

@@ -3854,14 +3854,32 @@ void MapView::keyPressEvent (QKeyEvent *event)
 
   for (auto&& hotkey : hotkeys)
   {
-    if (event->key() == hotkey.key && modifier == hotkey.modifiers && hotkey.condition())
-    {
-      makeCurrent();
-      OpenGL::context::scoped_setter const _ (::gl, context());
+    if (event->key() != hotkey.key || modifier != hotkey.modifiers)
+      continue;
 
-      hotkey.onPress();
-      return;
+    if (!hotkey.condition())
+    {
+      // A refused hotkey is indistinguishable from a dead keyboard for the user.
+      // By far the most common reason is an edit operation that was interrupted
+      // and never ended: the object tool hotkeys (copy, paste, duplicate) all
+      // require there to be no current action. Say so instead of staying silent.
+      if (NOGGIT_CUR_ACTION && !event->isAutoRepeat())
+      {
+        // Same expression shape as the QKeySequence(...) shortcuts built in
+        // setupEditMenu(), so it resolves identically under Qt5 and Qt6.
+        LogError << "Ignoring hotkey "
+                 << QKeySequence(event->modifiers() | static_cast<Qt::Key>(event->key()))
+                        .toString().toStdString()
+                 << ": an edit operation is still in progress." << std::endl;
+      }
+      continue;
     }
+
+    makeCurrent();
+    OpenGL::context::scoped_setter const _ (::gl, context());
+
+    hotkey.onPress();
+    return;
   }
 
   checkInputsSettings();
