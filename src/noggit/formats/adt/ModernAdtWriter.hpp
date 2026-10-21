@@ -50,6 +50,11 @@ namespace Noggit::Formats::ADT
   struct AdtFormatProfile
   {
     char const* name = "ADT v18 (Shadowlands 9.2.7)";
+    //! Client build this profile writes for. The writer stamps MVER with
+    //! `mver` and assumes this build's chunk shapes, so a project whose CASC
+    //! comes from a different build produces a file wearing one version's
+    //! version stamp around another version's contents and asset ids.
+    char const* target_build = "9.2.7";
     std::uint32_t mver = 18;
     std::size_t mcnk_count = 256;
     std::size_t chunk_header_size = sizeof(MapChunkHeader); // ROOT MCNKs carry one

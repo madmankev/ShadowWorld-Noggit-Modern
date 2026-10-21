@@ -29,6 +29,7 @@
 
 #include <cassert>
 #include <limits>
+#include <mutex>
 #include <map>
 #include <optional>
 #include <string>
@@ -1049,6 +1050,38 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
       // writers of their own. Every part is validated before anything is
       // written.
       auto const& profile = Noggit::Formats::ADT::adt_profile_v18();
+
+      // Say so once, at the moment it costs a tile, rather than leaving the
+      // mismatch to be diagnosed from a client crash.
+      //
+      // The writer stamps MVER and assumes one build's chunk shapes. When the
+      // project's CASC is a different build, the parts it writes carry that
+      // build's chunk contents and FileDataIDs inside a file claiming to be
+      // this profile's version, and the WDT copied into the project is the
+      // source build's original. A client of the profile's version then reads
+      // structures and asset ids it does not have, which fails while the world
+      // loads rather than showing up as a rendering glitch.
+      static std::once_flag build_mismatch_reported;
+      std::call_once(build_mismatch_reported, [&profile]
+      {
+        std::string const project_build = Noggit::Project::CurrentProject::get()->ClientBuild;
+        if (project_build.rfind(profile.target_build, 0) == 0)
+          return;
+
+        LogError << "[ModernADT][Save] This project's client data is build "
+                 << project_build << " but the ADT writer targets "
+                 << profile.target_build << " (" << profile.name << "). The tiles"
+                    " it writes hold " << project_build << " chunk contents and "
+                 << project_build << " FileDataIDs inside a file stamped as "
+                 << profile.target_build << ", and the WDT copied to the project"
+                    " is the " << project_build << " original. A "
+                 << profile.target_build << " client loading that meets structures"
+                    " and asset ids it does not have, which crashes while the"
+                    " world loads. Point the project at a "
+                 << profile.target_build << " CASC, or load the output in the"
+                    " build it came from." << std::endl;
+      });
+
       bool saved_natively = false;
       Noggit::Formats::ADT::ModernAdtSaveReport report;
       try
