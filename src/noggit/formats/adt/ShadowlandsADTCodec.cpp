@@ -95,8 +95,16 @@ namespace Noggit::Formats::ADT
       return "ADT";
     }
 
-    bool part_is_usable(std::vector<std::uint8_t> const& bytes, ShadowlandsADTPart part)
+    bool part_is_usable(std::vector<std::uint8_t> const& bytes, ShadowlandsADTPart part,
+                        std::string* reason = nullptr)
     {
+      auto const no = [reason](std::string text)
+      {
+        if (reason)
+          *reason = std::move(text);
+        return false;
+      };
+
       try
       {
         auto const chunks = parse_chunks(bytes, "backing part");
@@ -106,26 +114,75 @@ namespace Noggit::Formats::ADT
         };
 
         if (!has(fourcc('M', 'V', 'E', 'R')))
-          return false;
+          return no("it has no MVER chunk");
 
         switch (part)
         {
         case ShadowlandsADTPart::Root:
-          return has(fourcc('M', 'H', 'D', 'R')) && has(fourcc('M', 'C', 'I', 'N'))
-                 && !has(fourcc('M', 'T', 'E', 'X')) && !has(fourcc('M', 'M', 'D', 'X'));
+          if (!has(fourcc('M', 'H', 'D', 'R')))
+            return no("it has no MHDR chunk");
+          if (!has(fourcc('M', 'C', 'I', 'N')))
+            return no("it has no MCIN chunk");
+          if (has(fourcc('M', 'T', 'E', 'X')) || has(fourcc('M', 'M', 'D', 'X')))
+            return no("it carries MTEX/MMDX, i.e. a legacy monolithic ADT");
+          return true;
         case ShadowlandsADTPart::Tex0:
         case ShadowlandsADTPart::Obj0:
         case ShadowlandsADTPart::Obj1:
-          return has(fourcc('M', 'C', 'N', 'K'));
+          return has(fourcc('M', 'C', 'N', 'K')) ? true : no("it has no MCNK chunk");
         case ShadowlandsADTPart::Lod:
           return true;
         }
-        return false;
+        return no("the part role is unknown");
       }
-      catch (std::exception const&)
+      catch (std::exception const& error)
       {
-        return false;
+        return no(std::string("it does not parse: ") + error.what());
       }
+    }
+
+    //! The CASC original of a part, by whichever key resolves.
+    //!
+    //! A FileKey built from a path alone carries no FileDataID unless the
+    //! listfile resolved one at construction, and readFile on an unresolved key
+    //! fails without a word - which is how the first version of this fallback
+    //! silently did nothing at all. Try the deduced component key, the
+    //! listfile-resolved path key and the plain FileDataID, and report which one
+    //! worked so a failure can never be silent again.
+    std::vector<std::uint8_t> read_casc_original(std::string const& path,
+                                                 BlizzardArchive::ClientData* client_data,
+                                                 std::string* how)
+    {
+      auto attempt = [client_data, how](BlizzardArchive::Listfile::FileKey key,
+                                        char const* name)
+      {
+        std::vector<char> bytes;
+        if (client_data->readFile(key, bytes) && !bytes.empty())
+        {
+          if (how)
+            *how = name;
+          return std::vector<std::uint8_t>(bytes.begin(), bytes.end());
+        }
+        return std::vector<std::uint8_t>{};
+      };
+
+      BlizzardArchive::Listfile::FileKey deduced(path);
+      deduced.deduceOtherComponent(client_data->listfile());
+      if (auto bytes = attempt(deduced, "via the deduced component key"); !bytes.empty())
+        return bytes;
+
+      BlizzardArchive::Listfile::FileKey listed(path, client_data->listfile());
+      if (auto bytes = attempt(listed, "via the listfile path key"); !bytes.empty())
+        return bytes;
+
+      if (auto const fdid = client_data->listfile()->getFileDataID(path))
+      {
+        if (auto bytes = attempt(BlizzardArchive::Listfile::FileKey(fdid),
+                                 "via the listfile FileDataID"); !bytes.empty())
+          return bytes;
+      }
+
+      return {};
     }
 
     ShadowlandsADTRawPart read_part(std::string const& path, bool required,
@@ -180,25 +237,33 @@ namespace Noggit::Formats::ADT
         // is big enough but is not a usable part of this role (wrong build, wrong
         // shape, half-finished save) would fail the merge further down and push
         // the tile onto synthesis, whose output lacks everything only the retail
-        // file carries. Prefer the CASC original and say so.
-        if (!part_is_usable(result.bytes, part))
+        // file carries. Prefer the CASC original, and report every outcome: a
+        // fallback that fails quietly is indistinguishable from one that never
+        // ran, which is exactly how a stale override kept masking retail once
+        // already.
+        std::string unusable_reason;
+        if (!part_is_usable(result.bytes, part, &unusable_reason))
         {
-          BlizzardArchive::Listfile::FileKey casc_key(path);
-          casc_key.deduceOtherComponent(client_data->listfile());
+          LogError << "[ModernADT][Save] The project override for '" << path << "' is "
+                   << size << " byte(s) but is not a usable " << part_name(part)
+                   << " part, because " << unusable_reason << ". Reading the original"
+                      " from CASC instead." << std::endl;
 
-          std::vector<char> casc_bytes;
-          if (client_data->readFile(casc_key, casc_bytes))
+          std::string how;
+          auto casc_u8 = read_casc_original(path, client_data, &how);
+          if (part_is_usable(casc_u8, part))
           {
-            std::vector<std::uint8_t> casc_u8(casc_bytes.begin(), casc_bytes.end());
-            if (part_is_usable(casc_u8, part))
-            {
-              LogError << "[ModernADT][Save] The project override for '" << path
-                       << "' is " << size << " byte(s) but is not a usable "
-                       << part_name(part) << " part, so the original " << casc_u8.size()
-                       << " byte(s) were read from CASC instead. Delete that stale"
-                          " file if the override was not intentional." << std::endl;
-              result.bytes = std::move(casc_u8);
-            }
+            LogError << "[ModernADT][Save] Using the CASC original (" << casc_u8.size()
+                     << " byte(s), read " << how << ") for '" << path << "' in place of"
+                        " the stale override. Delete that file if the override was"
+                        " not intentional." << std::endl;
+            result.bytes = std::move(casc_u8);
+          }
+          else
+          {
+            LogError << "[ModernADT][Save] CASC has no usable " << part_name(part)
+                     << " for '" << path << "' either, so the override stays; this"
+                        " tile will synthesize if the merge refuses it." << std::endl;
           }
         }
 
