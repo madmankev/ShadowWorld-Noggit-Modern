@@ -51,6 +51,11 @@ namespace Noggit::Formats::ADT
     constexpr std::uint32_t owned_order[5] = {MCC_MCVT, MCC_MCNR, MCC_MCCV, MCC_MCSH, MCC_MCSE};
     constexpr std::size_t legacy_mcnr_padding_size = 13;
 
+    //! The MCNK flag bits that claim per-chunk liquid (river, ocean, magma,
+    //! slime). Meaningful only together with an MH2O chunk: a modern client
+    //! answers "does this chunk have liquid" from MH2O, not from MCLQ.
+    constexpr std::uint32_t legacy_liquid_flags = 0x4u | 0x8u | 0x10u | 0x20u;
+
     // MHDR offsets in Noggit's legacy convention are relative to
     // (MHDR chunk start + 0x14). Real files are self-calibrated instead (see
     // mhdr_offset_basis), so this is only the fallback.
@@ -412,6 +417,21 @@ namespace Noggit::Formats::ADT
         merged.ofsSndEmitters = placements[4].offset_in_payload + 8;
         merged.nSndEmitters = placements[4].size / mcse_entry_size;
       }
+      else
+      {
+        merged.ofsSndEmitters = 0;
+        merged.nSndEmitters = 0;
+      }
+
+      // The flags come from the edited header, but which subchunks exist is
+      // decided by the layout above. A bit claiming a subchunk that was not
+      // emitted sends the client to read a shadow map or vertex colours that are
+      // not there; reconcile the bits with what was actually written. (Liquid
+      // bits are reconciled against the tile's MH2O by the caller, which is the
+      // only place that knows whether an MH2O ended up in the file.)
+      merged.flags.flags.has_mcsh = placements[3].present ? 1u : 0u;
+      merged.flags.flags.has_mccv = placements[2].present ? 1u : 0u;
+
       std::memcpy(payload.data(), &merged, sizeof(merged));
 
       return make_chunk(MCC_MCNK, payload);
@@ -954,6 +974,21 @@ namespace Noggit::Formats::ADT
 
     if (mcnk_index != profile.mcnk_count)
       throw ModernAdtWriterError("Original ROOT MCNK count changed while writing.");
+
+    // When the result carries no MH2O - the original had none and the editor
+    // produced none - any liquid bit left in a chunk header points the client at
+    // a liquid table that is not there, which it dereferences. The flags are the
+    // header's first member, eight bytes into the chunk.
+    if (!input.has_mh2o && !mh2o_pos)
+    {
+      for (auto const& position : mcnk_positions)
+      {
+        std::uint32_t flags = 0;
+        std::memcpy(&flags, output.data() + position.first + 8, sizeof(flags));
+        flags &= ~legacy_liquid_flags;
+        std::memcpy(output.data() + position.first + 8, &flags, sizeof(flags));
+      }
+    }
 
     // Original files may legitimately lack MH2O/MFBO; append them when the
     // editor produced data for chunks the original did not carry.

@@ -57,6 +57,12 @@ namespace Noggit::Formats::Conversion
     constexpr std::uint32_t FC_MODF = (std::uint32_t('M') << 24) | (std::uint32_t('O') << 16) | (std::uint32_t('D') << 8) | std::uint32_t('F');
     constexpr std::uint32_t FC_MFBO = (std::uint32_t('M') << 24) | (std::uint32_t('F') << 16) | (std::uint32_t('B') << 8) | std::uint32_t('O');
     constexpr std::uint32_t FC_MH2O = (std::uint32_t('M') << 24) | (std::uint32_t('H') << 16) | (std::uint32_t('2') << 8) | std::uint32_t('O');
+
+    //! The MCNK flag bits that claim per-chunk liquid (river, ocean, magma,
+    //! slime). In the split format a modern client answers "does this chunk have
+    //! liquid" from the tile's MH2O, not from MCLQ, so these bits are only
+    //! meaningful together with an MH2O chunk.
+    constexpr std::uint32_t legacy_liquid_flags = 0x4u | 0x8u | 0x10u | 0x20u;
     constexpr std::uint32_t FC_MCNK = (std::uint32_t('M') << 24) | (std::uint32_t('C') << 16) | (std::uint32_t('N') << 8) | std::uint32_t('K');
     constexpr std::uint32_t FC_MCVT = (std::uint32_t('M') << 24) | (std::uint32_t('C') << 16) | (std::uint32_t('V') << 8) | std::uint32_t('T');
     constexpr std::uint32_t FC_MCNR = (std::uint32_t('M') << 24) | (std::uint32_t('C') << 16) | (std::uint32_t('N') << 8) | std::uint32_t('R');
@@ -1135,10 +1141,12 @@ namespace Noggit::Formats::Conversion
           emit_sub(FC_MCNR, chunk.mcnr, header.ofsNormal);
         if (chunk.has_mccv)
           emit_sub(FC_MCCV, chunk.mccv, header.ofsMCCV);
+        bool mcsh_emitted = false;
         if (chunk.has_mcsh && chunk.header.sizeShadow)
         {
           emit_sub(FC_MCSH, chunk.mcsh, header.ofsShadow);
           header.sizeShadow = chunk.mcsh.size;
+          mcsh_emitted = true;
         }
         if (chunk.has_mcse && chunk.header.nSndEmitters)
         {
@@ -1153,6 +1161,18 @@ namespace Noggit::Formats::Conversion
                      " carried into the modern ROOT (placements attach per tile)";
           warn(issues, message.str());
         }
+
+        // Legacy headers carry MCLQ-era liquid bits and a shadow bit, but this
+        // tile emits MH2O only when the legacy actually had MCLQ to convert
+        // (Noggit's exporter leaves it off by default) and MCSH only when the
+        // legacy carried one. A bit set for a chunk that is not emitted sends the
+        // client to a liquid or shadow table that does not exist, which it
+        // dereferences: an access violation on entering any area whose chunks
+        // claimed water. Clear the bits together with the chunk they describe.
+        if (mh2o_payload.empty())
+          header.flags.value &= ~legacy_liquid_flags;
+        if (!mcsh_emitted)
+          header.flags.flags.has_mcsh = 0;
 
         std::memcpy(out.bytes.data() + header_pos, &header, sizeof(header));
 

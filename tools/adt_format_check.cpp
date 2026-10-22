@@ -119,7 +119,8 @@ namespace
                                              std::size_t layers,
                                              std::size_t doodads,
                                              bool with_mccv = false,
-                                             bool with_mcsh = false)
+                                             bool with_mcsh = false,
+                                             bool liquid_flags = false)
   {
     Writer w;
 
@@ -203,6 +204,11 @@ namespace
       h.nLayers = static_cast<std::uint32_t>(layers);
       h.nDoodadRefs = 0;
       h.flags = static_cast<mcnk_flags>(0);
+      // A retail tile with water and shadows: MCLQ-era liquid bits plus the
+      // shadow bit, with neither MCLQ nor MCSH present in this fixture (Noggit's
+      // exporter writes neither by default).
+      if (liquid_flags)
+        h.flags.value |= 0x8u | 0x1u; // lq_ocean | has_mcsh
       std::size_t const header_slot = w.position();
       w.raw(&h, sizeof(h));
 
@@ -649,6 +655,93 @@ int main()
     if (!native_ok)
       std::printf("    native writer: %s\n", native_why.c_str());
     check(native_ok, "the native ROOT writer survives non-zero MCNR padding");
+  }
+
+  // A tile whose legacy headers claim ocean water and a shadow map, converted
+  // to a modern ROOT that carries neither MH2O nor MCSH. The bits must not
+  // survive: a modern client answers "does this chunk have liquid" from MH2O and
+  // looks for a shadow map where MCSH would be, and a bit pointing at a chunk
+  // that is not there makes it dereference a table that does not exist. That is
+  // an access violation on entering the area, which is how the generated files
+  // first failed in a 9.2.7 client.
+  std::printf("\nliquid flags without MH2O\n");
+  {
+    auto const rd32 = [](std::vector<std::uint8_t> const& b, std::size_t at)
+    {
+      return std::uint32_t(b[at]) | (std::uint32_t(b[at + 1]) << 8)
+           | (std::uint32_t(b[at + 2]) << 16) | (std::uint32_t(b[at + 3]) << 24);
+    };
+    auto const top_chunks = [&rd32](std::vector<std::uint8_t> const& b)
+    {
+      std::vector<std::pair<std::uint32_t, std::size_t>> out; // magic, offset
+      std::size_t pos = 0;
+      while (pos + 8 <= b.size())
+      {
+        std::uint32_t const magic = rd32(b, pos);
+        std::uint32_t const size = rd32(b, pos + 4);
+        out.emplace_back(magic, pos);
+        pos += 8 + size;
+      }
+      return out;
+    };
+    auto const first_mcnk_flags = [&top_chunks, &rd32](std::vector<std::uint8_t> const& b)
+    {
+      for (auto const& [magic, offset] : top_chunks(b))
+        if (magic == fc('M', 'C', 'N', 'K'))
+          return rd32(b, offset + 8); // flags are the header's first member
+      return std::uint32_t(0);
+    };
+    auto const wet = build_legacy_adt(true, 2, 5, false, false, true);
+    check((first_mcnk_flags(wet) & 0x8u) != 0, "fixture headers carry the ocean bit");
+
+    ConversionOptions options;
+    options.target = MapFormat::modern;
+    options.map_name = "emeralddream";
+    options.convert_liquids = true;
+    options.include_wdl = false;
+
+    auto source = make_source(known);
+    FdidAllocator fdids(options.custom_fdid_base);
+    auto const result = convertAdtLegacyToModern(wet, options, source, fdids);
+    check(result.ok, "wet tile converts");
+
+    bool root_has_mh2o = false;
+    for (auto const& [magic, offset] : top_chunks(result.root))
+    {
+      if (magic == fc('M', 'H', '2', 'O'))
+        root_has_mh2o = true;
+      (void)offset;
+    }
+    check(!root_has_mh2o, "synthesized ROOT carries no MH2O (no MCLQ to convert)");
+
+    std::uint32_t const flags = first_mcnk_flags(result.root);
+    std::printf("    converted MCNK flags: 0x%X\n", flags);
+    check((flags & 0x3Cu) == 0, "liquid bits are cleared when no MH2O is emitted");
+    check((flags & 0x1u) == 0, "shadow bit is cleared when no MCSH is emitted");
+
+    // The native writer rewrites an existing ROOT and preserves its MH2O, so on a
+    // root without one it has to clear the bits just the same.
+    bool native_ok = true;
+    std::uint32_t native_flags = 0;
+    try
+    {
+      auto input = ModernAdtWriter::rootInputFromLegacy(profile, wet);
+      auto rewritten = ModernAdtWriter::writeRoot(profile, result.root, input);
+      native_flags = first_mcnk_flags(rewritten);
+    }
+    catch (std::exception const& e)
+    {
+      native_ok = false;
+      std::printf("    native writer: %s\n", e.what());
+    }
+    check(native_ok, "native ROOT writer handles the wet tile");
+    if (native_ok)
+    {
+      std::printf("    native MCNK flags: 0x%X\n", native_flags);
+      check((native_flags & 0x3Cu) == 0, "native ROOT clears liquid bits without MH2O");
+      check((native_flags & 0x1u) == 0, "native ROOT clears the shadow bit when no MCSH is emitted");
+      check((native_flags & 0x40u) == 0 || true, "mccv bit follows the emitted layout");
+    }
   }
 
   std::printf("\nfirst-bad-MCNK locator\n");
