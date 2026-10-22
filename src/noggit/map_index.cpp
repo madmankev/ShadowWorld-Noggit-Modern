@@ -14,6 +14,7 @@
 #include <noggit/uid_storage.hpp>
 #include <noggit/application/NoggitApplication.hpp>
 #include <noggit/formats/adt/ModernAdtReader.hpp>
+#include <noggit/formats/wdt/WdtReader.hpp>
 #include <ClientFile.hpp>
 #include <Listfile.hpp>
 #include <noggit/database/SqlUIDStorage.h>
@@ -27,6 +28,8 @@
 #include <forward_list>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <map>
 #include <set>
@@ -277,6 +280,138 @@ MapIndex::MapIndex (const std::string &pBasename, int map_id, World* world,
   loadMinimapMD5translate();
 }
 
+namespace
+{
+  //! A modern WDT's MPHD is eight u32s: the flags word, then (8.1+) the
+  //! FileDataIDs of the files the client loads alongside the map - lgt, occ,
+  //! fogs, mpv, tex, wdl and pd4. Noggit edits none of them, but a project
+  //! folder that is dropped into a client as loose files has to carry them or
+  //! the client will not find them.
+  struct AuxiliaryWdtSlot
+  {
+    unsigned mphd_word;
+    char const* suffix;
+  };
+
+  //! Word 6 is the WDL, which Noggit writes itself, so it is not copied here.
+  constexpr AuxiliaryWdtSlot const auxiliary_wdt_slots[] = {
+    {1, "_lgt"}, {2, "_occ"}, {3, "_fogs"}, {4, "_mpv"}, {5, "_tex"}, {7, "_pd4"}
+  };
+
+  //! Copy the auxiliary WDTs that \a wdt_bytes' MPHD points at into the project.
+  //!\
+  //! These are per-map companions, not per-tile, so one pass per map is enough.
+  //! A zero FileDataID means the map genuinely has no such file and is skipped
+  //! silently; a non-zero one that cannot be read is reported, because the
+  //! client will go looking for it.
+  void ensureAuxiliaryWdtsInProject(BlizzardArchive::ClientData* client_data,
+                                    std::string const& basename,
+                                    std::filesystem::path const& project_root,
+                                    std::vector<char> const& wdt_bytes)
+  {
+    static_assert(sizeof(MPHD) == 8 * sizeof(std::uint32_t),
+                  "MPHD is the flags word plus seven FileDataIDs");
+
+    Noggit::Formats::WDT::ParsedWdt parsed;
+    try
+    {
+      parsed = Noggit::Formats::WDT::parseWdt(
+        std::vector<std::uint8_t>(wdt_bytes.begin(), wdt_bytes.end()), true);
+    }
+    catch (std::exception const& error)
+    {
+      LogError << "[WDT Save] Could not read the MPHD of " << basename
+               << ".wdt, so its auxiliary lgt/occ/fogs/mpv/tex/pd4 files were not"
+                  " copied: " << error.what() << std::endl;
+      return;
+    }
+
+    if (!parsed.mphd_present)
+    {
+      LogError << "[WDT Save] " << basename << ".wdt has no MPHD chunk, so the"
+                  " auxiliary files it points at could not be identified."
+               << std::endl;
+      return;
+    }
+
+    std::uint32_t words[8] = {};
+    std::memcpy(words, &parsed.mphd, sizeof(words));
+
+    std::size_t copied = 0;
+    std::size_t already_there = 0;
+    std::size_t absent = 0;
+    std::vector<std::string> copied_names;
+
+    for (auto const& slot : auxiliary_wdt_slots)
+    {
+      std::uint32_t const fdid = words[slot.mphd_word];
+      if (fdid == 0)
+      {
+        ++absent;
+        continue;
+      }
+
+      std::string const name =
+        "World\\Maps\\" + basename + "\\" + basename + slot.suffix + ".wdt";
+      auto const project_path = project_root
+        / BlizzardArchive::ClientData::normalizeFilenameInternal(name);
+
+      if (std::filesystem::exists(project_path))
+      {
+        ++already_there;
+        continue;
+      }
+
+      try
+      {
+        BlizzardArchive::ClientFile source(name, client_data);
+        std::vector<char> data(source.getBuffer(),
+                               source.getBuffer() + source.getSize());
+        BlizzardArchive::ClientFile target(name, client_data,
+                                           BlizzardArchive::ClientFile::NEW_FILE);
+        target.setBuffer(data);
+        target.save();
+        target.close();
+        ++copied;
+        copied_names.emplace_back(std::string(slot.suffix) + ".wdt");
+      }
+      catch (std::exception const& error)
+      {
+        LogError << "[WDT Save] The MPHD of " << basename << ".wdt points at "
+                 << name << " (FileDataID " << fdid << ") but it could not be"
+                    " copied to the project: " << error.what()
+                 << ". The client will look for that file and not find it."
+                 << std::endl;
+      }
+    }
+
+    if (copied)
+    {
+      std::string list;
+      for (auto const& n : copied_names)
+      {
+        if (!list.empty())
+          list += ", ";
+        list += basename + n;
+      }
+      Log << "[WDT Save] Copied " << copied << " auxiliary WDT(s) to the project"
+             " override: " << list << std::endl;
+    }
+    else if (!already_there && absent == std::size(auxiliary_wdt_slots))
+    {
+      // Nothing copied, nothing already present, and every MPHD slot is empty:
+      // this map's WDT does not point at any companion file. The expected output
+      // set is then incomplete for reasons Noggit cannot fix, so say so instead
+      // of staying quiet about it.
+      LogError << "[WDT Save] The MPHD of " << basename << ".wdt carries no"
+                  " FileDataID for any auxiliary file, so none of "
+                  "<map>_lgt/_occ/_fogs/_mpv/_tex/_pd4.wdt could be copied. A"
+                  " client loading this map as loose files will look for them."
+               << std::endl;
+    }
+  }
+}
+
 void MapIndex::ensureModernWdtInProject()
 {
   auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
@@ -288,12 +423,24 @@ void MapIndex::ensureModernWdtInProject()
   std::stringstream wdt_filename;
   wdt_filename << "World\\Maps\\" << basename << "\\" << basename << ".wdt";
 
-  auto const project_wdt_path =
-    std::filesystem::path(Noggit::Project::CurrentProject::get()->ProjectPath)
+  auto const project_root =
+    std::filesystem::path(Noggit::Project::CurrentProject::get()->ProjectPath);
+  auto const project_wdt_path = project_root
     / BlizzardArchive::ClientData::normalizeFilenameInternal(wdt_filename.str());
 
   if (std::filesystem::exists(project_wdt_path))
   {
+    // The main WDT is already overridden, but the companions its MPHD points at
+    // may not be - a project folder handed to the client as loose files has to
+    // carry all of them, and an override written by an earlier run of Noggit
+    // predates this step.
+    std::ifstream existing(project_wdt_path, std::ios::binary);
+    std::vector<char> existing_data((std::istreambuf_iterator<char>(existing)),
+                                    std::istreambuf_iterator<char>());
+    if (!existing_data.empty())
+    {
+      ensureAuxiliaryWdtsInProject(client_data, basename, project_root, existing_data);
+    }
     return;
   }
 
@@ -310,6 +457,8 @@ void MapIndex::ensureModernWdtInProject()
 
     Log << "[WDT Save] Copied the original modern WDT to the project override: "
         << wdt_filename.str() << std::endl;
+
+    ensureAuxiliaryWdtsInProject(client_data, basename, project_root, source_data);
   }
   catch (std::exception const& error)
   {
