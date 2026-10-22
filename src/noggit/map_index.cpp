@@ -282,6 +282,30 @@ MapIndex::MapIndex (const std::string &pBasename, int map_id, World* world,
 
 namespace
 {
+  //! The client's own copy of a file, read from CASC rather than through any
+  //! project override. Two keys, because a path-only FileKey can carry no
+  //! FileDataID and then reads nothing at all.
+  std::vector<char> readOriginalFromCasc(BlizzardArchive::ClientData* client_data,
+                                         std::string const& path)
+  {
+    auto attempt = [client_data](BlizzardArchive::Listfile::FileKey const& key)
+    {
+      std::vector<char> bytes;
+      if (client_data->readFile(key, bytes) && !bytes.empty())
+        return bytes;
+      return std::vector<char>{};
+    };
+
+    if (auto bytes = attempt(BlizzardArchive::Listfile::FileKey(path, client_data->listfile()));
+        !bytes.empty())
+      return bytes;
+
+    if (auto const fdid = client_data->listfile()->getFileDataID(path))
+      return attempt(BlizzardArchive::Listfile::FileKey(fdid));
+
+    return {};
+  }
+
   //! A modern WDT's MPHD is eight u32s: the flags word, then (8.1+) the
   //! FileDataIDs of the files the client loads alongside the map - lgt, occ,
   //! fogs, mpv, tex, wdl and pd4. Noggit edits none of them, but a project
@@ -439,6 +463,40 @@ void MapIndex::ensureModernWdtInProject()
                                     std::istreambuf_iterator<char>());
     if (!existing_data.empty())
     {
+      // A leftover WDT from another client build is not cosmetic: the WDT's MAID
+      // chunk carries the FileDataIDs the client loads every tile of the map by,
+      // so a WDT from another build sends the client to the wrong files for the
+      // whole map - edited tiles and untouched ones alike - no matter how correct
+      // the ADTs are. Noggit never edits the modern WDT, it only reads it, so the
+      // client's original is always the right project copy and anything differing
+      // is a stale file to be restored over.
+      auto const original = readOriginalFromCasc(client_data, wdt_filename.str());
+      if (!original.empty() && original != existing_data)
+      {
+        try
+        {
+          BlizzardArchive::ClientFile restored(wdt_filename.str(), client_data,
+                                               BlizzardArchive::ClientFile::NEW_FILE);
+          restored.setBuffer(original);
+          restored.save();
+          restored.close();
+
+          LogError << "[WDT Save] The project WDT for " << basename << " differed from"
+                      " the original in the current client (" << existing_data.size()
+                      << " byte(s) in the project versus " << original.size()
+                      << " in CASC). Noggit does not edit the modern WDT, and a WDT"
+                      " from another build carries FileDataIDs this client cannot"
+                      " resolve, so the original was restored to the project"
+                      " override." << std::endl;
+          existing_data = original;
+        }
+        catch (std::exception const& error)
+        {
+          LogError << "[WDT Save] Could not restore the original WDT over the stale"
+                      " project copy: " << error.what() << std::endl;
+        }
+      }
+
       ensureAuxiliaryWdtsInProject(client_data, basename, project_root, existing_data);
     }
     return;
