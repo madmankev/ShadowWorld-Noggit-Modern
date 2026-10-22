@@ -112,11 +112,14 @@ namespace
 
   //! A WotLK ADT built the way Noggit's own serializer builds it.
   //!
-  //! `mcnr_padding` toggles the 13 zero bytes Noggit writes after MCNR. Real
-  //! retail files do not have them, so both shapes have to convert.
+  //! `mcnr_padding` toggles the 13 bytes Noggit reserves after MCNR. Real retail
+  //! files do not have them, so both shapes have to convert. `with_mccv` and
+  //! `with_mcsh` toggle the two subchunks MapChunk::save emits conditionally.
   std::vector<std::uint8_t> build_legacy_adt(bool mcnr_padding,
                                              std::size_t layers,
-                                             std::size_t doodads)
+                                             std::size_t doodads,
+                                             bool with_mccv = false,
+                                             bool with_mcsh = false)
   {
     Writer w;
 
@@ -203,16 +206,33 @@ namespace
       std::size_t const header_slot = w.position();
       w.raw(&h, sizeof(h));
 
+      // MapChunk::save writes MCVT, MCCV, MCNR + 13 reserved bytes, MCLY, MCRF,
+      // MCSH, MCAL, MCLQ, MCSE - in that order. Mirroring it matters: a fixture
+      // that invents its own order cannot catch a bug that depends on the real
+      // one. MCLQ is left out because Noggit only writes it when the
+      // use_mclq_liquids_export setting is on, which it is not by default.
+
       // MCVT: 9*9 + 8*8 = 145 heights
       h.ofsHeight = static_cast<std::uint32_t>(w.position() - chunk_start);
       w.tag(fc('M', 'C', 'V', 'T')); w.u32(145 * 4);
       for (int v = 0; v < 145; ++v)
         w.f32(static_cast<float>(v));
 
-      // MCNR: 144 normals, then Noggit's 13 unknown bytes
+      // MCCV: 145 packed vertex colours, only when the tile has them
+      if (with_mccv)
+      {
+        h.ofsMCCV = static_cast<std::uint32_t>(w.position() - chunk_start);
+        w.tag(fc('M', 'C', 'C', 'V')); w.u32(145 * 4);
+        for (int v = 0; v < 145; ++v)
+          w.u32(0x007F7F7Fu);
+      }
+
+      // MCNR: mapbufsize (9*9 + 8*8 = 145) normals, then the 13 bytes Noggit
+      // reserves. Retail 9.2.7 carries the same 435 byte MCNR with no padding,
+      // which the FormatProbe confirmed on a real file.
       h.ofsNormal = static_cast<std::uint32_t>(w.position() - chunk_start);
-      w.tag(fc('M', 'C', 'N', 'R')); w.u32(144 * 3);
-      w.zeros(144 * 3);
+      w.tag(fc('M', 'C', 'N', 'R')); w.u32(145 * 3);
+      w.zeros(145 * 3);
       if (mcnr_padding)
         w.zeros(13);
 
@@ -231,14 +251,6 @@ namespace
         w.raw(&c, sizeof(c));
       }
 
-      // MCAL: 64x64 uncompressed bytes per non-first layer
-      std::uint32_t const mcal_size =
-        static_cast<std::uint32_t>(layers > 1 ? (layers - 1) * 4096 : 0);
-      h.ofsAlpha = static_cast<std::uint32_t>(w.position() - chunk_start);
-      h.sizeAlpha = mcal_size;
-      w.tag(fc('M', 'C', 'A', 'L')); w.u32(mcal_size);
-      w.zeros(mcal_size);
-
       // MCRF: nDoodadRefs indices into MDDF, then nMapObjRefs into MODF.
       // Chunks 0..doodads-1 each reference one doodad; chunk `doodads`
       // references the entry the converter has to drop.
@@ -247,9 +259,27 @@ namespace
         n_refs = 1;
       h.nDoodadRefs = n_refs;
       h.nMapObjRefs = 0;
+      h.ofsRefs = static_cast<std::uint32_t>(w.position() - chunk_start);
       w.tag(fc('M', 'C', 'R', 'F')); w.u32(n_refs * 4);
       if (n_refs)
         w.u32(static_cast<std::uint32_t>(i)); // chunk i -> doodad i (or the dropped one)
+
+      // MCSH: a fixed 0x200 byte shadow map, only when the tile has shadows
+      if (with_mcsh)
+      {
+        h.ofsShadow = static_cast<std::uint32_t>(w.position() - chunk_start);
+        h.sizeShadow = 0x200;
+        w.tag(fc('M', 'C', 'S', 'H')); w.u32(0x200);
+        w.zeros(0x200);
+      }
+
+      // MCAL: 64x64 uncompressed bytes per non-first layer
+      std::uint32_t const mcal_size =
+        static_cast<std::uint32_t>(layers > 1 ? (layers - 1) * 4096 : 0);
+      h.ofsAlpha = static_cast<std::uint32_t>(w.position() - chunk_start);
+      h.sizeAlpha = mcal_size;
+      w.tag(fc('M', 'C', 'A', 'L')); w.u32(mcal_size);
+      w.zeros(mcal_size);
 
       // MCSE: Noggit always writes the chunk; empty means a zero payload.
       w.tag(fc('M', 'C', 'S', 'E')); w.u32(0);
@@ -407,16 +437,20 @@ int main()
     bool padding;
     std::size_t layers;
     std::size_t doodads;
+    bool mccv;
+    bool mcsh;
   };
 
   for (auto const& v : {variant{"Noggit-serialized (13 padding bytes), 2 layers, 5 doodads",
-                                true, 2, 5},
-                        variant{"Noggit-serialized, 1 layer, 0 doodads", true, 1, 0},
+                                true, 2, 5, false, false},
+                        variant{"Noggit-serialized, 1 layer, 0 doodads", true, 1, 0, false, false},
+                        variant{"Noggit-serialized with MCCV and MCSH, 2 layers, 5 doodads",
+                                true, 2, 5, true, true},
                         variant{"retail-shaped (no padding), 2 layers, 5 doodads",
-                                false, 2, 5}})
+                                false, 2, 5, false, false}})
   {
     std::printf("\n%s\n", v.name);
-    auto const legacy = build_legacy_adt(v.padding, v.layers, v.doodads);
+    auto const legacy = build_legacy_adt(v.padding, v.layers, v.doodads, v.mccv, v.mcsh);
     check(legacy.size() > 1000, "fixture is a plausible size");
 
     ConversionOptions options;
@@ -516,6 +550,185 @@ int main()
       std::printf("    refreshRootBookkeeping: %s\n", e.what());
     }
     check(bookkeeping_ok, "refreshRootBookkeeping accepts the synthesized ROOT");
+  }
+
+  // The bad-MCNK locator, against a file that is clean and one broken on
+  // purpose. Without this the diagnostic could report "all clean" no matter
+  // what it was given.
+  // A Noggit-shaped MCNK whose reserved padding is not zero filled.
+  //
+  // MapChunk::save reserves 13 bytes after MCNR and counts them in the MCNK's
+  // size, but whether those bytes are zero depends on the buffer having to grow
+  // to hold them. Telling Noggit's shape from retail's by testing them for zero
+  // therefore guesses - and guessing wrong desynchronizes the walk, which then
+  // reads payload as a tag and reports a truncated chunk whose "declared size"
+  // is nonsense. That is exactly how 59 of 70 tiles failed to save: the sizes
+  // decoded to 0x44444444 and to float bit patterns, i.e. bytes from inside a
+  // payload. 0x44 is the fill used here.
+  std::printf("\nnon-zero MCNR padding\n");
+  {
+    auto dirty = build_legacy_adt(true, 2, 5);
+    auto const rd = [&dirty](std::size_t at)
+    {
+      return std::uint32_t(dirty[at]) | (std::uint32_t(dirty[at + 1]) << 8)
+           | (std::uint32_t(dirty[at + 2]) << 16) | (std::uint32_t(dirty[at + 3]) << 24);
+    };
+
+    std::size_t pos = 0, filled = 0;
+    while (pos + 8 <= dirty.size())
+    {
+      std::uint32_t const magic = rd(pos);
+      std::uint32_t const size = rd(pos + 4);
+      if (magic != fc('M', 'C', 'N', 'K'))
+      {
+        pos += 8 + size;
+        continue;
+      }
+      std::size_t const mcnk_end = pos + 8 + size;
+      std::size_t sub = pos + 8 + sizeof(MapChunkHeader);
+      while (sub + 8 <= mcnk_end)
+      {
+        std::uint32_t const sub_magic = rd(sub);
+        std::uint32_t const sub_size = rd(sub + 4);
+        if (sub_magic == fc('M', 'C', 'N', 'R'))
+        {
+          std::size_t const pad = sub + 8 + sub_size;
+          if (pad + 13 <= mcnk_end)
+          {
+            for (std::size_t i = 0; i < 13; ++i)
+              dirty[pad + i] = 0x44;
+            ++filled;
+          }
+          break;
+        }
+        sub += 8 + sub_size;
+      }
+      pos = mcnk_end;
+    }
+    std::printf("    dirtied %zu MCNR padding run(s)\n", filled);
+    check(filled == 256, "every MCNK's reserved padding was filled with non-zero bytes");
+
+    // The locator still has to account for all 256, and has to say the padding
+    // convention was the one that fit - that is what distinguishes "recognized
+    // as Noggit-shaped" from "happened to parse".
+    std::string const described = describeFirstBadMcnk(dirty, true);
+    std::printf("    %s\n", described.c_str());
+    check(described.find("256 needing the 13 byte padding skipped") != std::string::npos,
+          "all 256 MCNKs are recognized as padded despite the non-zero fill");
+
+    // And both consumers of the legacy serialization still have to work, since a
+    // tile that cannot be parsed writes nothing at all.
+    ConversionOptions options;
+    options.target = MapFormat::modern;
+    options.map_name = "emeralddream";
+    options.convert_liquids = true;
+    options.include_wdl = false;
+
+    auto source = make_source(known);
+    FdidAllocator fdids(options.custom_fdid_base);
+    auto const result = convertAdtLegacyToModern(dirty, options, source, fdids);
+    if (!result.ok)
+      std::printf("    conversion issues:%s\n", issues_text(result.issues).c_str());
+    check(result.ok, "conversion survives non-zero MCNR padding");
+    check(!result.root.empty() && !result.tex0.empty() && !result.obj0.empty(),
+          "all three parts produced from a dirty-padding tile");
+
+    bool native_ok = true;
+    std::string native_why;
+    try
+    {
+      auto input = ModernAdtWriter::rootInputFromLegacy(profile, dirty);
+      auto rewritten = ModernAdtWriter::writeRoot(profile, result.root, input);
+      ModernAdtWriter::validatePartOrThrow(profile, rewritten, AdtPartExpectation::Root, "ROOT part");
+    }
+    catch (std::exception const& e)
+    {
+      native_ok = false;
+      native_why = e.what();
+    }
+    if (!native_ok)
+      std::printf("    native writer: %s\n", native_why.c_str());
+    check(native_ok, "the native ROOT writer survives non-zero MCNR padding");
+  }
+
+  std::printf("\nfirst-bad-MCNK locator\n");
+  {
+    auto const legacy = build_legacy_adt(true, 2, 5);
+    std::string const clean = describeFirstBadMcnk(legacy, true);
+    std::printf("    clean: %s\n", clean.c_str());
+    check(clean.find("consumed their payload exactly") != std::string::npos,
+          "a well-formed legacy ADT reports every MCNK clean");
+
+    // Find the second MCNK and lie about its size, the way a serializer that
+    // miscounts one subchunk would. The walk must break inside that MCNK and
+    // name it, not the first one.
+    auto broken = legacy;
+    auto const rd32 = [&broken](std::size_t at)
+    {
+      return std::uint32_t(broken[at]) | (std::uint32_t(broken[at + 1]) << 8)
+           | (std::uint32_t(broken[at + 2]) << 16) | (std::uint32_t(broken[at + 3]) << 24);
+    };
+    auto const wr32 = [&broken](std::size_t at, std::uint32_t v)
+    {
+      for (int i = 0; i < 4; ++i)
+        broken[at + i] = static_cast<std::uint8_t>((v >> (8 * i)) & 0xFF);
+    };
+    std::size_t pos = 0, seen = 0, second_mcnk = 0;
+    while (pos + 8 <= broken.size())
+    {
+      std::uint32_t const magic = rd32(pos);
+      std::uint32_t const size = rd32(pos + 4);
+      if (magic == fc('M', 'C', 'N', 'K'))
+      {
+        if (++seen == 2)
+        {
+          second_mcnk = pos;
+          break;
+        }
+      }
+      pos += 8 + size;
+    }
+    check(second_mcnk != 0, "fixture has a second MCNK to corrupt");
+    if (second_mcnk)
+    {
+      // Miscount one subchunk the way a serializer with an accounting bug does,
+      // rather than shrinking the MCNK: shrinking by exactly one tag still ends
+      // on a chunk boundary and is genuinely well formed. Bumping MCNR's size by
+      // 3 pushes the walk 3 bytes into the next tag, which is how the real
+      // failure presents - a truncated chunk whose size is float garbage read
+      // from inside a payload.
+      std::size_t sub = second_mcnk + 8 + 128; // skip tag and MapChunkHeader
+      std::size_t mcnr_at = 0;
+      while (sub + 8 <= broken.size())
+      {
+        if (rd32(sub) == fc('M', 'C', 'N', 'R'))
+        {
+          mcnr_at = sub;
+          break;
+        }
+        sub += 8 + rd32(sub + 4);
+      }
+      check(mcnr_at != 0, "found MCNR inside the second MCNK");
+      wr32(mcnr_at + 4, rd32(mcnr_at + 4) + 3);
+      std::string const report = describeFirstBadMcnk(broken, true);
+      std::printf("    broken: %s\n", report.c_str());
+      check(report.find("MCNK 1 ") != std::string::npos,
+            "the broken MCNK is identified by index, not the first one");
+      check(report.find("broke at offset") != std::string::npos,
+            "the report names the offset the walk broke at");
+      check(report.find("MCVT") != std::string::npos,
+            "the report lists what parsed before the break");
+    }
+
+    // A file whose top level is itself broken must say so rather than claim
+    // every MCNK is clean.
+    std::vector<std::uint8_t> const truncated(legacy.begin(), legacy.begin() + 5000);
+    std::string const top_report = describeFirstBadMcnk(truncated, true);
+    check(top_report.find("top-level walk broke") != std::string::npos
+          || top_report.find("MCNK") != std::string::npos,
+          "a file truncated mid-MCNK is reported, not called clean");
+    std::vector<std::uint8_t> const empty;
+    check(!describeFirstBadMcnk(empty, true).empty(), "an empty file is described safely");
   }
 
   // The MCIN convention probe, against files whose convention is known.

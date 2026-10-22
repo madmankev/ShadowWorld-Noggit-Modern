@@ -78,13 +78,14 @@ namespace Noggit::Formats::ADT
       std::memcpy(bytes.data() + pos, &value, 4);
     }
 
-    // Strict chunk walk. `legacy_mcnr_padding` skips the 13 raw bytes Noggit's
-    // legacy serializer emits after MCNR (padding, not a subchunk).
-    std::vector<ChunkView> parse_chunks(std::vector<std::uint8_t> const& bytes,
-                                        std::size_t begin,
-                                        std::size_t end,
-                                        char const* label,
-                                        bool legacy_mcnr_padding = false)
+    //! Strict chunk walk over [begin, end).
+    //! \param skip_mcnr_padding skip the 13 raw bytes Noggit's legacy serializer
+    //!        emits after MCNR. They are padding, not a subchunk.
+    std::vector<ChunkView> parse_chunks_strict(std::vector<std::uint8_t> const& bytes,
+                                               std::size_t begin,
+                                               std::size_t end,
+                                               char const* label,
+                                               bool skip_mcnr_padding)
     {
       std::vector<ChunkView> result;
       std::size_t pos = begin;
@@ -99,24 +100,56 @@ namespace Noggit::Formats::ADT
           throw ModernAdtWriterError(std::string(label) + " contains a truncated chunk.");
         result.push_back(chunk);
         pos = chunk.end();
-        // Noggit's canonical serializer writes 13 raw bytes after MCNR. Retail
-        // files put the next subchunk's header there instead, so the padding is
-        // skipped only when nothing that could be a chunk tag follows: Noggit's
-        // padding is zero filled, a magic never is. Skipping it unconditionally
-        // cost a genuine retail MCNK 13 bytes and desynchronized the walk, which
-        // then reported a truncated chunk.
-        if (legacy_mcnr_padding && chunk.magic == MCC_MCNR
+        if (skip_mcnr_padding && chunk.magic == MCC_MCNR
             && legacy_mcnr_padding_size <= end - pos)
-        {
-          std::uint32_t next_magic = 0;
-          std::memcpy(&next_magic, bytes.data() + pos, 4);
-          if (next_magic == 0)
-            pos += legacy_mcnr_padding_size;
-        }
+          pos += legacy_mcnr_padding_size;
       }
       if (pos != end)
         throw ModernAdtWriterError(std::string(label) + " does not end on a chunk boundary.");
       return result;
+    }
+
+    std::vector<ChunkView> parse_chunks(std::vector<std::uint8_t> const& bytes,
+                                        std::size_t begin,
+                                        std::size_t end,
+                                        char const* label,
+                                        bool legacy_mcnr_padding = false)
+    {
+      if (!legacy_mcnr_padding)
+        return parse_chunks_strict(bytes, begin, end, label, false);
+
+      // Two MCNK shapes are in the wild: retail puts the next subchunk's header
+      // straight after MCNR, Noggit's canonical serializer puts 13 padding bytes
+      // there first. They cannot be told apart by inspecting those bytes. The
+      // padding is only recognisable while it is zero filled, and nothing
+      // guarantees a serializer leaves zeros in a gap it merely reserved, so a
+      // content test guesses - and guessing wrong desynchronizes the walk, which
+      // then reads payload bytes as a tag and reports a truncated chunk with a
+      // nonsense size.
+      //
+      // Decide by which shape consumes the payload exactly instead. At most one
+      // can: skipping 13 bytes in a retail MCNK lands mid-chunk, and not
+      // skipping them in a Noggit MCNK walks the padding as a zero sized chunk
+      // and then reads five stray bytes plus the next tag as a size. When MCNR is
+      // the last subchunk neither skip applies and both agree.
+      try
+      {
+        return parse_chunks_strict(bytes, begin, end, label, false);
+      }
+      catch (ModernAdtWriterError const& without_padding)
+      {
+        try
+        {
+          return parse_chunks_strict(bytes, begin, end, label, true);
+        }
+        catch (ModernAdtWriterError const& with_padding)
+        {
+          throw ModernAdtWriterError(std::string(label) + " is malformed under both MCNR"
+                                     " padding conventions. Without padding: "
+                                     + without_padding.what() + " With padding: "
+                                     + with_padding.what());
+        }
+      }
     }
 
     std::vector<ChunkView> parse_chunks(std::vector<std::uint8_t> const& bytes, char const* label)

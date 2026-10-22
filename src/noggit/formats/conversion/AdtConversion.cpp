@@ -113,14 +113,37 @@ namespace Noggit::Formats::Conversion
       std::size_t start() const { return payload - 8; }
     };
 
-    bool walkChunks(std::uint8_t const* data,
-                    std::size_t from,
-                    std::size_t to,
-                    std::vector<RawChunk>& out,
-                    std::vector<ConversionIssue>& issues,
-                    char const* context,
-                    bool legacy_mcnr_padding = false)
+    //! Walk [from, to) as a sequence of chunks.
+    //! \param skip_mcnr_padding skip the 13 raw bytes Noggit's canonical
+    //!        serializer emits after MCNR ("unknown MCNR bytes ... just to make
+    //!        the files more blizzlike"). They are padding, not a sub-chunk
+    //!        header: walking them as one consumes 8 of the 13 and leaves the
+    //!        next read starting 5 bytes early, inside the padding, so the magic
+    //!        comes out zero and the size picks up the leading bytes of the next
+    //!        chunk - which reports a truncated chunk and fails the whole tile.
+    //! \param require_exact also fail when the walk stops short of \a to, rather
+    //!        than accepting whatever it managed to read.
+    //! On failure an issue is appended when \a issues is given, and \a failure
+    //! receives the description.
+    bool walkChunksCore(std::uint8_t const* data,
+                        std::size_t from,
+                        std::size_t to,
+                        std::vector<RawChunk>& out,
+                        std::vector<ConversionIssue>* issues,
+                        char const* context,
+                        bool skip_mcnr_padding,
+                        bool require_exact,
+                        std::string* failure)
     {
+      auto const fail = [&](std::string message)
+      {
+        if (issues)
+          issues->push_back({ConversionIssue::Severity::error, context + message});
+        if (failure)
+          *failure = message;
+        return false;
+      };
+
       std::size_t pos = from;
       while (pos + 8 <= to)
       {
@@ -131,32 +154,63 @@ namespace Noggit::Formats::Conversion
         if (chunk.size > to - chunk.payload)
         {
           std::ostringstream message;
-          message << context << ": truncated chunk at offset " << pos
+          message << ": truncated chunk at offset " << pos
                   << " (declared size " << chunk.size << ")";
-          issues.push_back({ConversionIssue::Severity::error, message.str()});
-          return false;
+          return fail(message.str());
         }
         out.push_back(chunk);
         pos = chunk.payload + chunk.size;
 
-        // Noggit's canonical WotLK serializer writes 13 zero bytes after MCNR
-        // ("unknown MCNR bytes ... just to make the files more blizzlike").
-        // They are padding, not another sub-chunk header. Walking them as one
-        // consumes 8 of the 13 and leaves the next read starting 5 bytes early,
-        // inside the padding: the magic comes out zero and the size picks up the
-        // leading bytes of MCLY, which reports a truncated chunk and fails the
-        // whole tile. Every Noggit-saved ADT was therefore unconvertible.
-        //
-        // Retail files put the next chunk's magic here instead, so the padding is
-        // only skipped when no magic follows - that keeps genuine WotLK source
-        // files converting exactly as before.
-        if (legacy_mcnr_padding && chunk.magic == FC_MCNR
-            && pos + 13 <= to && readMagic(data + pos) == 0)
-        {
+        if (skip_mcnr_padding && chunk.magic == FC_MCNR && pos + 13 <= to)
           pos += 13;
-        }
+      }
+      if (require_exact && pos != to)
+      {
+        std::ostringstream message;
+        message << ": walk stopped at offset " << pos << ", " << to
+                << " expected (does not end on a chunk boundary)";
+        return fail(message.str());
       }
       return true;
+    }
+
+    bool walkChunks(std::uint8_t const* data,
+                    std::size_t from,
+                    std::size_t to,
+                    std::vector<RawChunk>& out,
+                    std::vector<ConversionIssue>& issues,
+                    char const* context,
+                    bool legacy_mcnr_padding = false)
+    {
+      if (!legacy_mcnr_padding)
+        return walkChunksCore(data, from, to, out, &issues, context, false, false, nullptr);
+
+      // Retail MCNKs put the next sub-chunk's header straight after MCNR,
+      // Noggit's put 13 padding bytes there first, and the two cannot be told
+      // apart by inspecting those bytes: the padding is only recognisable while
+      // it is zero filled, and nothing guarantees a serializer leaves zeros in a
+      // gap it merely reserved. Pick by which convention consumes the payload
+      // exactly - at most one can, since skipping in a retail MCNK lands
+      // mid-chunk and not skipping in a Noggit MCNK desynchronizes the walk.
+      std::vector<RawChunk> attempt;
+      std::string without_padding;
+      if (walkChunksCore(data, from, to, attempt, nullptr, context, false, true, &without_padding))
+      {
+        out = std::move(attempt);
+        return true;
+      }
+      attempt.clear();
+      std::string with_padding;
+      if (walkChunksCore(data, from, to, attempt, nullptr, context, true, true, &with_padding))
+      {
+        out = std::move(attempt);
+        return true;
+      }
+
+      // Neither convention accounts for the payload. Report the permissive walk
+      // as before rather than the stricter one, so a file that only ever
+      // partially parsed keeps behaving the way it did.
+      return walkChunksCore(data, from, to, out, &issues, context, false, false, nullptr);
     }
 
     RawChunk const* findChunk(std::vector<RawChunk> const& chunks, std::uint32_t magic)

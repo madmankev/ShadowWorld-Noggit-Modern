@@ -35,6 +35,7 @@ namespace Noggit::Formats::ADT
     constexpr std::uint32_t FOURCC_MFBO = fourccOf('M', 'F', 'B', 'O');
     constexpr std::uint32_t FOURCC_MTXF = fourccOf('M', 'T', 'X', 'F');
 
+    constexpr std::uint32_t FOURCC_MCNR = fourccOf('M', 'C', 'N', 'R');
     constexpr std::uint32_t FOURCC_MDID = fourccOf('M', 'D', 'I', 'D');
     constexpr std::uint32_t FOURCC_MHID = fourccOf('M', 'H', 'I', 'D');
     constexpr std::uint32_t FOURCC_MTXP = fourccOf('M', 'T', 'X', 'P');
@@ -65,10 +66,15 @@ namespace Noggit::Formats::ADT
     //! the walk and the return value says whether the range was consumed exactly.
     //! Whatever was parsed before that point is still in `out`, because a file
     //! that disagrees with our assumptions is precisely the one worth describing.
+    //! Set to the offset the walk broke at when it returns false.
     bool diag_walk(char const* data, std::size_t size,
                    std::size_t from, std::size_t to,
-                   std::vector<DiagChunk>& out)
+                   std::vector<DiagChunk>& out,
+                   bool skip_mcnr_padding = false,
+                   std::size_t* broke_at = nullptr)
     {
+      if (broke_at)
+        *broke_at = from;
       if (to > size || from > to)
         return false;
       std::size_t pos = from;
@@ -80,11 +86,40 @@ namespace Noggit::Formats::ADT
         chunk.offset = pos;
         chunk.payload = pos + chunk_tag_size;
         if (chunk.size > to - chunk.payload)
+        {
+          if (broke_at)
+            *broke_at = pos;
           return false;
+        }
         out.push_back(chunk);
         pos = chunk.payload + chunk.size;
+
+        // The same unconditional skip the strict walkers try: Noggit's
+        // serializer reserves 13 bytes after MCNR, retail puts the next chunk's
+        // tag there.
+        constexpr std::size_t padding = 13;
+        if (skip_mcnr_padding && chunk.magic == FOURCC_MCNR && padding <= to - pos)
+          pos += padding;
       }
+      if (pos != to && broke_at)
+        *broke_at = pos;
       return pos == to;
+    }
+
+    std::string hex_bytes(char const* data, std::size_t size,
+                          std::size_t at, std::size_t count)
+    {
+      static char const* const digits = "0123456789ABCDEF";
+      std::string out;
+      for (std::size_t i = at; i < size && i < at + count; ++i)
+      {
+        if (i != at)
+          out += ' ';
+        auto const byte = static_cast<unsigned char>(data[i]);
+        out += digits[byte >> 4];
+        out += digits[byte & 0xF];
+      }
+      return out;
     }
 
     bool isKnownTopLevelChunk(std::uint32_t fourcc)
@@ -309,6 +344,99 @@ namespace Noggit::Formats::ADT
     if (!walked)
       out << ", top-level walk did not end on a chunk boundary";
 
+    return out.str();
+  }
+
+  std::string describeFirstBadMcnk(char const* data, std::size_t size,
+                                   bool mcnk_has_header)
+  {
+    std::ostringstream out;
+
+    std::vector<DiagChunk> top;
+    std::size_t top_break = 0;
+    bool const top_ok = diag_walk(data, size, 0, size, top, false, &top_break);
+    if (!top_ok)
+    {
+      out << "top-level walk broke at offset " << top_break << " (bytes "
+          << hex_bytes(data, size, top_break, 16) << "), after "
+          << top.size() << " chunk(s); no MCNK could be examined";
+      return out.str();
+    }
+
+    std::size_t index = 0;
+    std::size_t examined = 0;
+    std::size_t without_padding = 0;
+    std::size_t with_padding = 0;
+    for (auto const& chunk : top)
+    {
+      if (chunk.magic != FOURCC_MCNK)
+        continue;
+
+      std::size_t const current = index++;
+      std::size_t const sub_from =
+        chunk.payload + (mcnk_has_header ? mcnk_header_size : 0);
+      std::size_t const sub_to = chunk.payload + chunk.size;
+
+      if (sub_from > sub_to)
+      {
+        out << "MCNK " << current << " at offset " << chunk.offset << " declares size "
+            << chunk.size << ", too small to hold its "
+            << (mcnk_has_header ? "128 byte header" : "subchunks");
+        return out.str();
+      }
+
+      ++examined;
+
+      // The two shapes cannot be told apart by inspecting the bytes after MCNR,
+      // so try both and keep whichever consumes the payload exactly. Reporting
+      // the tally is the point: a file that needs the padding skipped in every
+      // MCNK is Noggit-serialized, one that never needs it is retail, and one
+      // that needs it in some and not others is neither - which is worth knowing
+      // before trusting anything downstream of it.
+      std::vector<DiagChunk> subs;
+      std::size_t broke_at = 0;
+      bool const fits_without = diag_walk(data, size, sub_from, sub_to, subs, false, &broke_at);
+      if (fits_without)
+      {
+        ++without_padding;
+        continue;
+      }
+
+      std::vector<DiagChunk> padded;
+      std::size_t padded_break = 0;
+      if (diag_walk(data, size, sub_from, sub_to, padded, true, &padded_break))
+      {
+        ++with_padding;
+        continue;
+      }
+
+      out << "MCNK " << current << " at offset " << chunk.offset << " (declared size "
+          << chunk.size << ", subchunks span " << sub_from << ".." << sub_to
+          << ") is malformed under both MCNR padding conventions. Without padding"
+             " it broke at offset " << broke_at << ", bytes there: "
+          << hex_bytes(data, size, broke_at, 16) << ", having parsed:";
+      if (subs.empty())
+        out << " none";
+      for (auto const& sub : subs)
+      {
+        out << " " << adtChunkName(sub.magic) << "(offset " << sub.offset
+            << ", size " << sub.size << ")";
+      }
+      out << ". With padding it broke at offset " << padded_break << ", bytes there: "
+          << hex_bytes(data, size, padded_break, 16) << ", having parsed:";
+      if (padded.empty())
+        out << " none";
+      for (auto const& sub : padded)
+      {
+        out << " " << adtChunkName(sub.magic) << "(offset " << sub.offset
+            << ", size " << sub.size << ")";
+      }
+      return out.str();
+    }
+
+    out << "all " << examined << " MCNK subchunk walk(s) consumed their payload exactly ("
+        << without_padding << " with no MCNR padding, " << with_padding
+        << " needing the 13 byte padding skipped)";
     return out.str();
   }
 

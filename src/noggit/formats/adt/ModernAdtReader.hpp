@@ -212,7 +212,8 @@ namespace Noggit::Formats::ADT
   // ---- helpers ---------------------------------------------------------------
 
   //! How a file counts MCIN.size.
-  //!  //! The two candidate conventions differ by the 8 bytes of magic and size every
+  //!
+  //! The two candidate conventions differ by the 8 bytes of magic and size every
   //! chunk carries. A client that reads MCIN.size to bound an MCNK walks 8 bytes
   //! too far or stops 8 bytes short when the file disagrees with it, so which one
   //! a real retail file uses is worth measuring rather than assuming.
@@ -238,7 +239,8 @@ namespace Noggit::Formats::ADT
   //! One-line inventory of an ADT part: byte count, MVER, every top-level chunk
   //! with its payload size (the 256 MCNKs collapsed to one entry) and the
   //! subchunk inventory of the first MCNK.
-  //!  //! For comparing what a real client file contains against what the writer
+  //!
+  //! For comparing what a real client file contains against what the writer
   //! assumes. Reports rather than throws, so a malformed file still yields
   //! whatever parsed. `mcnk_has_header` is true for ROOT, whose MCNKs carry the
   //! 128 byte MapChunkHeader before their subchunks, and false for TEX0/OBJ0.
@@ -249,6 +251,29 @@ namespace Noggit::Formats::ADT
   {
     return describeAdtPart(reinterpret_cast<char const*>(data.data()), data.size(),
                            label, mcnk_has_header);
+  }
+
+  //! Locate the first MCNK whose subchunk walk does not consume its payload
+  //! exactly, and describe it.
+  //!
+  //! A serializer whose declared chunk sizes disagree with the bytes it wrote
+  //! desynchronizes the walk: every later chunk is then read from inside an
+  //! earlier one's payload, and the error surfaces far from the mistake as a
+  //! truncated chunk with a nonsense size. Naming the chunk where it breaks,
+  //! listing what parsed before that and dumping the bytes at the break turns a
+  //! guess into a fixable accounting bug.
+  //!
+  //! Returns a report saying every MCNK walked cleanly when none is broken.
+  //! `mcnk_has_header` is true for ROOT and for a legacy monolithic ADT, whose
+  //! MCNKs carry the 128 byte MapChunkHeader before their subchunks, and false
+  //! for TEX0/OBJ0.
+  std::string describeFirstBadMcnk(char const* data, std::size_t size,
+                                   bool mcnk_has_header);
+  inline std::string describeFirstBadMcnk(std::vector<std::uint8_t> const& data,
+                                          bool mcnk_has_header)
+  {
+    return describeFirstBadMcnk(reinterpret_cast<char const*>(data.data()), data.size(),
+                                mcnk_has_header);
   }
 
   //! Render a chunk fourcc (canonical MSB-first value as compared against the

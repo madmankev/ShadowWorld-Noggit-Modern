@@ -1152,6 +1152,24 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
     {
       LogError << "[ModernADT][Save] Split ADT save failed for \""
                << _file_key.stringRepr() << "\": " << error.what() << std::endl;
+
+      // The native writer and the conversion path parse the same legacy
+      // serialization, so when both fail the serializer's own bytes are the
+      // suspect - not either parser. Both failures above name a nonsense
+      // "declared size" because a walk that desyncs reads payload bytes as a
+      // tag, and that reports the symptom rather than where it started.
+      //
+      // Say instead which MCNK the walk breaks inside, what parsed cleanly
+      // before that, and the bytes at the break. That names the one chunk whose
+      // declared size disagrees with what was written.
+      LogError << "[ModernADT][Save] legacy serialization of \""
+               << _file_key.stringRepr() << "\": "
+               << Noggit::Formats::ADT::describeAdtPart(serialized, "legacy", true)
+               << std::endl;
+      LogError << "[ModernADT][Save] first broken MCNK in \""
+               << _file_key.stringRepr() << "\": "
+               << Noggit::Formats::ADT::describeFirstBadMcnk(serialized, true)
+               << std::endl;
     }
 
     if (!wrote_split_tile)
