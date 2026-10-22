@@ -1205,7 +1205,7 @@ namespace Noggit::Formats::ADT
     //! a modern client and Noggit's split-ADT gate both read it as a modern
     //! split tile. What cannot be recovered is data Noggit never had - chunks
     //! with no legacy equivalent are simply absent.
-    ConvertedParts synthesize_parts(std::string const& root_path,
+    ConvertedParts synthesize_parts(ShadowlandsADTBackingStore const& backing,
                                     std::vector<std::uint8_t> const& legacy_adt,
                                     ModernAdtFdidHints const& fdid_hints,
                                     ModernAdtSaveReport* report)
@@ -1236,7 +1236,7 @@ namespace Noggit::Formats::ADT
 
       Conversion::ConversionOptions options;
       options.target = Conversion::MapFormat::modern;
-      options.map_name = map_name_from_root_path(root_path);
+      options.map_name = map_name_from_root_path(backing.source.root_path);
       options.convert_liquids = true;
       options.include_wdl = false;
 
@@ -1288,6 +1288,19 @@ namespace Noggit::Formats::ADT
       parts.root = std::move(result.root);
       parts.tex0 = std::move(result.tex0);
       parts.obj0 = std::move(result.obj0);
+
+      // _obj1 and _lod have no legacy equivalent to re-derive from: OBJ1 holds
+      // the LOD object placements and LOD is the low resolution tile. The merge
+      // path rewrites OBJ1 against its new OBJ0 indices, but synthesis has no
+      // original OBJ0 to diff against, so pass both through untouched. They can
+      // then be stale relative to the edited tile - a LOD object may sit where
+      // it was before the edit - but a stale companion beats a missing one: the
+      // client expects the full per-tile file set, and dropping these leaves a
+      // hole in it with no LOD objects at all.
+      parts.write_obj1 = backing.has(ShadowlandsADTPart::Obj1);
+      if (parts.write_obj1)
+        parts.obj1 = backing.part(ShadowlandsADTPart::Obj1).bytes;
+      parts.write_lod = backing.has(ShadowlandsADTPart::Lod);
       return parts;
     }
 
@@ -1305,7 +1318,7 @@ namespace Noggit::Formats::ADT
                  << merge_blocker << "), so the modern parts were synthesized from"
                     " the edited tile instead of the save being abandoned. The"
                     " output is still a modern split ADT." << std::endl;
-        return synthesize_parts(backing.source.root_path, legacy_adt, fdid_hints, report);
+        return synthesize_parts(backing, legacy_adt, fdid_hints, report);
       }
 
       ConvertedParts parts;
@@ -1398,8 +1411,29 @@ namespace Noggit::Formats::ADT
         save_part(backing.source.paths[part_index(ShadowlandsADTPart::Lod)],
                   backing.part(ShadowlandsADTPart::Lod).bytes);
 
-      Log << "[ModernADT][Save] Saved split tile ROOT/TEX0/OBJ0/OBJ1/LOD to the project override: "
-          << backing.source.root_path << std::endl;
+      // Name what actually reached disk. Claiming parts that were skipped makes
+      // the log contradict the project folder, which is what gets checked
+      // against it.
+      std::string skipped;
+      if (!parts.write_obj1)
+        skipped += "_obj1";
+      if (!parts.write_lod)
+      {
+        if (!skipped.empty())
+          skipped += " and ";
+        skipped += "_lod";
+      }
+
+      Log << "[ModernADT][Save] Saved split tile ROOT/TEX0/OBJ0"
+          << (parts.write_obj1 ? "/OBJ1" : "")
+          << (parts.write_lod ? "/LOD" : "")
+          << " to the project override: " << backing.source.root_path
+          << (skipped.empty()
+                ? std::string()
+                : " (the original tile had no " + skipped + " to carry over, so "
+                  + (skipped.find(" and ") == std::string::npos ? "it was" : "they were")
+                  + " not written)")
+          << std::endl;
     }
   }
 
