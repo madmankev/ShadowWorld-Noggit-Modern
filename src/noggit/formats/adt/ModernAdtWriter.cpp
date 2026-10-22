@@ -55,6 +55,7 @@ namespace Noggit::Formats::ADT
     //! slime). Meaningful only together with an MH2O chunk: a modern client
     //! answers "does this chunk have liquid" from MH2O, not from MCLQ.
     constexpr std::uint32_t legacy_liquid_flags = 0x4u | 0x8u | 0x10u | 0x20u;
+    constexpr std::uint32_t MCC_MCLQ = fourcc('M', 'C', 'L', 'Q');
 
     // MHDR offsets in Noggit's legacy convention are relative to
     // (MHDR chunk start + 0x14). Real files are self-calibrated instead (see
@@ -93,6 +94,17 @@ namespace Noggit::Formats::ADT
                                                bool skip_mcnr_padding)
     {
       std::vector<ChunkView> result;
+      // A legacy MCNK walk starts right after the 128 byte MapChunkHeader, so
+      // the header is readable back from `begin` and can vouch for a size-0
+      // MCLQ: Noggit's serializer wrote that size field as zero for years while
+      // writing the full payload after it, and a walk trusting it reads liquid
+      // payload as chunk headers. sizeLiquid is 8 + payload, ofsLiquid points at
+      // the chunk.
+      std::size_t const mcnk_header =
+        skip_mcnr_padding && begin >= sizeof(MapChunkHeader)
+          ? begin - sizeof(MapChunkHeader)
+          : static_cast<std::size_t>(-1);
+
       std::size_t pos = begin;
       while (pos + 8 <= end)
       {
@@ -101,6 +113,16 @@ namespace Noggit::Formats::ADT
         chunk.payload = pos + 8;
         std::memcpy(&chunk.magic, bytes.data() + pos, 4);
         std::memcpy(&chunk.size, bytes.data() + pos + 4, 4);
+        if (chunk.magic == MCC_MCLQ && chunk.size == 0
+            && mcnk_header != static_cast<std::size_t>(-1))
+        {
+          std::uint32_t ofs_liquid = 0, size_liquid = 0;
+          std::memcpy(&ofs_liquid, bytes.data() + mcnk_header + offsetof(MapChunkHeader, ofsLiquid), 4);
+          std::memcpy(&size_liquid, bytes.data() + mcnk_header + offsetof(MapChunkHeader, sizeLiquid), 4);
+          if (ofs_liquid == pos - mcnk_header + 8 && size_liquid > 8
+              && size_liquid - 8 <= end - chunk.payload)
+            chunk.size = size_liquid - 8;
+        }
         if (chunk.size > end - chunk.payload)
           throw ModernAdtWriterError(std::string(label) + " contains a truncated chunk.");
         result.push_back(chunk);

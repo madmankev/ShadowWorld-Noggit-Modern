@@ -175,8 +175,16 @@ void ChunkWater::save_mclq(util::sExtendableArray& adt, int mcnk_pos, int& curre
   if (hasData(0))
   {
     adt.Extend(sizeof(mclq) * _layer_count + 8);
-    // size seems to be 0 in vanilla adts in the mclq chunk's header and set right in the mcnk header (layer_size * n_layer + 8)
-    SetChunkHeader(adt, current_pos, 'MCLQ', 0);
+    // The chunk's own size field describes the payload that follows it. Noggit
+    // wrote 0 here for years on the strength of a claim about vanilla files,
+    // keeping the real extent only in the MCNK header's sizeLiquid. Noggit's own
+    // loader never noticed because it reaches MCLQ through ofsLiquid, but
+    // anything that walks chunks by their declared size - every modern reader,
+    // including this project's - desynchronizes at the first water chunk and
+    // then reads the liquid payload as chunk headers. The MCNK header still
+    // receives 8 + payload through sizeLiquid, exactly as before.
+    SetChunkHeader(adt, current_pos, 'MCLQ',
+                   static_cast<int>(sizeof(mclq) * _layer_count));
 
     current_pos += 8;
 

@@ -129,6 +129,8 @@ namespace Noggit::Formats::Conversion
     //!        chunk - which reports a truncated chunk and fails the whole tile.
     //! \param require_exact also fail when the walk stops short of \a to, rather
     //!        than accepting whatever it managed to read.
+    //!        A size-0 MCLQ is repaired from the MCNK header when \a
+    //!        skip_mcnr_padding marks the walk as a legacy MCNK walk.
     //! On failure an issue is appended when \a issues is given, and \a failure
     //! receives the description.
     bool walkChunksCore(std::uint8_t const* data,
@@ -150,6 +152,13 @@ namespace Noggit::Formats::Conversion
         return false;
       };
 
+      // Legacy MCNK walks start right after the 128 byte MapChunkHeader, so the
+      // header is readable back from `from` and can vouch for a size-0 MCLQ.
+      std::size_t const mcnk_header =
+        skip_mcnr_padding && from >= sizeof(MapChunkHeader)
+          ? from - sizeof(MapChunkHeader)
+          : static_cast<std::size_t>(-1);
+
       std::size_t pos = from;
       while (pos + 8 <= to)
       {
@@ -157,6 +166,15 @@ namespace Noggit::Formats::Conversion
         chunk.magic = readMagic(data + pos);
         chunk.size = readU32(data + pos + 4);
         chunk.payload = pos + 8;
+        if (chunk.magic == FC_MCLQ && chunk.size == 0 && mcnk_header != static_cast<std::size_t>(-1))
+        {
+          std::uint32_t ofs_liquid = 0, size_liquid = 0;
+          std::memcpy(&ofs_liquid, data + mcnk_header + offsetof(MapChunkHeader, ofsLiquid), 4);
+          std::memcpy(&size_liquid, data + mcnk_header + offsetof(MapChunkHeader, sizeLiquid), 4);
+          if (ofs_liquid == pos - mcnk_header + 8 && size_liquid > 8
+              && size_liquid - 8 <= to - chunk.payload)
+            chunk.size = size_liquid - 8;
+        }
         if (chunk.size > to - chunk.payload)
         {
           std::ostringstream message;

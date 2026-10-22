@@ -35,6 +35,7 @@ namespace Noggit::Formats::ADT
     constexpr std::uint32_t FOURCC_MFBO = fourccOf('M', 'F', 'B', 'O');
     constexpr std::uint32_t FOURCC_MTXF = fourccOf('M', 'T', 'X', 'F');
 
+    constexpr std::uint32_t FOURCC_MCLQ = fourccOf('M', 'C', 'L', 'Q');
     constexpr std::uint32_t FOURCC_MCNR = fourccOf('M', 'C', 'N', 'R');
     constexpr std::uint32_t FOURCC_MDID = fourccOf('M', 'D', 'I', 'D');
     constexpr std::uint32_t FOURCC_MHID = fourccOf('M', 'H', 'I', 'D');
@@ -77,6 +78,10 @@ namespace Noggit::Formats::ADT
         *broke_at = from;
       if (to > size || from > to)
         return false;
+      std::size_t const mcnk_header =
+        skip_mcnr_padding && from >= mcnk_header_size
+          ? from - mcnk_header_size
+          : static_cast<std::size_t>(-1);
       std::size_t pos = from;
       while (pos + chunk_tag_size <= to)
       {
@@ -85,6 +90,16 @@ namespace Noggit::Formats::ADT
         chunk.size = readU32(data + pos + 4);
         chunk.offset = pos;
         chunk.payload = pos + chunk_tag_size;
+        if (chunk.magic == FOURCC_MCLQ && chunk.size == 0
+            && mcnk_header != static_cast<std::size_t>(-1))
+        {
+          std::uint32_t ofs_liquid = 0, size_liquid = 0;
+          std::memcpy(&ofs_liquid, data + mcnk_header + 96, 4);
+          std::memcpy(&size_liquid, data + mcnk_header + 100, 4);
+          if (ofs_liquid == pos - mcnk_header + 8 && size_liquid > 8
+              && size_liquid - 8 <= to - chunk.payload)
+            chunk.size = size_liquid - 8;
+        }
         if (chunk.size > to - chunk.payload)
         {
           if (broke_at)

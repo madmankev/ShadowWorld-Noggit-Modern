@@ -120,7 +120,8 @@ namespace
                                              std::size_t doodads,
                                              bool with_mccv = false,
                                              bool with_mcsh = false,
-                                             bool liquid_flags = false)
+                                             bool liquid_flags = false,
+                                             int mclq_shape = 0)
   {
     Writer w;
 
@@ -286,6 +287,22 @@ namespace
       h.sizeAlpha = mcal_size;
       w.tag(fc('M', 'C', 'A', 'L')); w.u32(mcal_size);
       w.zeros(mcal_size);
+
+      // MCLQ: Noggit's serializer writes this only when the (off by default)
+      // use_mclq_liquids_export setting is on. Shape 1 is the historical bug - a
+      // zero size field with the full payload written after it - shape 2 is the
+      // fixed writer. The payload is 0x44 so that any walk which trusts the zero
+      // reads a tag-shaped lie and fails loudly.
+      if (mclq_shape)
+      {
+        h.ofsLiquid = static_cast<std::uint32_t>(w.position() - chunk_start);
+        h.sizeLiquid = 8 + static_cast<std::uint32_t>(sizeof(mclq));
+        h.flags.value |= 0x4u; // lq_river
+        w.tag(fc('M', 'C', 'L', 'Q'));
+        w.u32(mclq_shape == 1 ? 0u : static_cast<std::uint32_t>(sizeof(mclq)));
+        std::vector<std::uint8_t> const payload(sizeof(mclq), 0x44);
+        w.raw(payload.data(), payload.size());
+      }
 
       // MCSE: Noggit always writes the chunk; empty means a zero payload.
       w.tag(fc('M', 'C', 'S', 'E')); w.u32(0);
@@ -742,6 +759,56 @@ int main()
       check((native_flags & 0x1u) == 0, "native ROOT clears the shadow bit when no MCSH is emitted");
       check((native_flags & 0x40u) == 0 || true, "mccv bit follows the emitted layout");
     }
+  }
+
+  // The header offsets the MCLQ repair reads, pinned so a layout change cannot
+  // silently break it.
+  static_assert(offsetof(MapChunkHeader, ofsLiquid) == 96, "ofsLiquid offset");
+  static_assert(offsetof(MapChunkHeader, sizeLiquid) == 100, "sizeLiquid offset");
+
+  // A tile with water, in both MCLQ shapes: the historical size-0 header Noggit
+  // wrote for years, and the fixed writer's real size. Both have to convert and
+  // both have to survive the native ROOT writer, or every wet tile on a project
+  // with use_mclq_liquids_export enabled is unsavable.
+  for (int shape : {1, 2})
+  {
+    std::printf("\nMCLQ shape %d (%s)\n", shape,
+                shape == 1 ? "size-0 header, historical Noggit" : "sized header, fixed writer");
+    auto const watery = build_legacy_adt(true, 2, 5, false, false, false, shape);
+
+    std::string const described = describeFirstBadMcnk(watery, true);
+    check(described.find("consumed their payload exactly") != std::string::npos,
+          "every MCNK walks cleanly despite the MCLQ shape");
+    if (described.find("consumed their payload exactly") == std::string::npos)
+      std::printf("    %s\n", described.c_str());
+
+    ConversionOptions options;
+    options.target = MapFormat::modern;
+    options.map_name = "emeralddream";
+    options.convert_liquids = true;
+    options.include_wdl = false;
+
+    auto source = make_source(known);
+    FdidAllocator fdids(options.custom_fdid_base);
+    auto const result = convertAdtLegacyToModern(watery, options, source, fdids);
+    if (!result.ok)
+      std::printf("    conversion issues:%s\n", issues_text(result.issues).c_str());
+    check(result.ok, "wet tile converts");
+    check(!result.root.empty(), "ROOT produced");
+
+    bool native_ok = true;
+    try
+    {
+      auto input = ModernAdtWriter::rootInputFromLegacy(profile, watery);
+      auto rewritten = ModernAdtWriter::writeRoot(profile, result.root, input);
+      ModernAdtWriter::validatePartOrThrow(profile, rewritten, AdtPartExpectation::Root, "ROOT part");
+    }
+    catch (std::exception const& e)
+    {
+      native_ok = false;
+      std::printf("    native writer: %s\n", e.what());
+    }
+    check(native_ok, "native ROOT writer handles the wet tile");
   }
 
   std::printf("\nfirst-bad-MCNK locator\n");
