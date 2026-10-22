@@ -441,6 +441,59 @@ namespace
   }
 }
 
+//! The subchunks of a modern part's first MCNK, walked strictly (modern parts
+//! carry no MCNR padding), and its header flags.
+std::uint32_t rd32_at(std::vector<std::uint8_t> const& b, std::size_t at)
+{
+  return std::uint32_t(b[at]) | (std::uint32_t(b[at + 1]) << 8)
+       | (std::uint32_t(b[at + 2]) << 16) | (std::uint32_t(b[at + 3]) << 24);
+}
+
+bool part_first_mcnk_has_sub(std::vector<std::uint8_t> const& part, std::uint32_t magic,
+                               bool mcnk_has_header)
+{
+  std::size_t pos = 0, mcnk = 0;
+  while (pos + 8 <= part.size())
+  {
+    std::uint32_t const m = rd32_at(part, pos);
+    std::uint32_t const sz = rd32_at(part, pos + 4);
+    if (m == fc('M', 'C', 'N', 'K'))
+    {
+      mcnk = pos;
+      break;
+    }
+    pos += 8 + sz;
+  }
+  if (!mcnk)
+    return false;
+  std::size_t sub = mcnk + 8 + (mcnk_has_header ? sizeof(MapChunkHeader) : 0);
+  std::size_t const sub_end = mcnk + 8 + rd32_at(part, mcnk + 4);
+  while (sub + 8 <= sub_end)
+  {
+    std::uint32_t const m = rd32_at(part, sub);
+    std::uint32_t const sz = rd32_at(part, sub + 4);
+    if (m == magic)
+      return true;
+    sub += 8 + sz;
+  }
+  return false;
+}
+
+std::uint32_t part_first_mcnk_flags(std::vector<std::uint8_t> const& part)
+{
+  std::size_t pos = 0;
+  while (pos + 8 <= part.size())
+  {
+    std::uint32_t const m = rd32_at(part, pos);
+    std::uint32_t const sz = rd32_at(part, pos + 4);
+    if (m == fc('M', 'C', 'N', 'K'))
+      return rd32_at(part, pos + 8);
+    pos += 8 + sz;
+  }
+  return 0;
+}
+
+
 int main()
 {
   using namespace Noggit::Formats::ADT;
@@ -492,6 +545,20 @@ int main()
     check(!result.root.empty(), "ROOT part produced");
     check(!result.tex0.empty(), "TEX0 part produced");
     check(!result.obj0.empty(), "OBJ0 part produced");
+
+    // The split format keeps the shadow map in TEX0, and the ROOT's has_mcsh bit
+    // has to agree with what TEX0 actually carries: set with the chunk present,
+    // clear without it. A bit pointing at nothing is a client-side read through
+    // a table that is not there.
+    if (v.mcsh)
+    {
+      check(!part_first_mcnk_has_sub(result.root, fc('M', 'C', 'S', 'H'), true),
+            "ROOT carries no MCSH; the split format keeps it in TEX0");
+      check(part_first_mcnk_has_sub(result.tex0, fc('M', 'C', 'S', 'H'), false),
+            "TEX0 carries the chunk's MCSH");
+      check((part_first_mcnk_flags(result.root) & 0x1u) != 0,
+            "has_mcsh is set while TEX0 carries the map");
+    }
     if (!result.ok)
       continue;
 

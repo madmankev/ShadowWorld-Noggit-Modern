@@ -72,7 +72,64 @@ namespace Noggit::Formats::ADT
     //! with: an 8 byte header plus its 4 byte payload.
     constexpr std::size_t minimum_adt_part_size = 12;
 
-    ShadowlandsADTRawPart read_part(std::string const& path, bool required)
+    //! Whether bytes can serve as the part they claim to be.
+    //!
+    //! A project override left over from another client build, or from an older
+    //! Noggit that wrote a different shape, still "reads" perfectly well and then
+    //! either fails every save of the tile or, worse, is carried into the output
+    //! verbatim. The checks are structural and cheap: the part has to walk as
+    //! chunks at all, carry MVER, and look like its split-format role. A legacy
+    //! monolithic ADT parked at the ROOT path is told apart by the chunks that
+    //! only exist before the split format - MTEX and MMDX moved into TEX0 and
+    //! OBJ0, so a modern ROOT never has them.
+    char const* part_name(ShadowlandsADTPart part)
+    {
+      switch (part)
+      {
+      case ShadowlandsADTPart::Root: return "ROOT";
+      case ShadowlandsADTPart::Tex0: return "TEX0";
+      case ShadowlandsADTPart::Obj0: return "OBJ0";
+      case ShadowlandsADTPart::Obj1: return "OBJ1";
+      case ShadowlandsADTPart::Lod: return "LOD";
+      }
+      return "ADT";
+    }
+
+    bool part_is_usable(std::vector<std::uint8_t> const& bytes, ShadowlandsADTPart part)
+    {
+      try
+      {
+        auto const chunks = parse_chunks(bytes, "backing part");
+        auto const has = [&chunks](std::uint32_t magic)
+        {
+          return find_chunk(chunks, magic) != nullptr;
+        };
+
+        if (!has(fourcc('M', 'V', 'E', 'R')))
+          return false;
+
+        switch (part)
+        {
+        case ShadowlandsADTPart::Root:
+          return has(fourcc('M', 'H', 'D', 'R')) && has(fourcc('M', 'C', 'I', 'N'))
+                 && !has(fourcc('M', 'T', 'E', 'X')) && !has(fourcc('M', 'M', 'D', 'X'));
+        case ShadowlandsADTPart::Tex0:
+        case ShadowlandsADTPart::Obj0:
+        case ShadowlandsADTPart::Obj1:
+          return has(fourcc('M', 'C', 'N', 'K'));
+        case ShadowlandsADTPart::Lod:
+          return true;
+        }
+        return false;
+      }
+      catch (std::exception const&)
+      {
+        return false;
+      }
+    }
+
+    ShadowlandsADTRawPart read_part(std::string const& path, bool required,
+                                    ShadowlandsADTPart part)
     {
       auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
 
@@ -118,6 +175,33 @@ namespace Noggit::Formats::ADT
         result.present = true;
         auto const* buffer = reinterpret_cast<std::uint8_t const*>(file.getBuffer());
         result.bytes.assign(buffer, buffer + size);
+
+        // Same masking problem as the size gate, one level up: an override that
+        // is big enough but is not a usable part of this role (wrong build, wrong
+        // shape, half-finished save) would fail the merge further down and push
+        // the tile onto synthesis, whose output lacks everything only the retail
+        // file carries. Prefer the CASC original and say so.
+        if (!part_is_usable(result.bytes, part))
+        {
+          BlizzardArchive::Listfile::FileKey casc_key(path);
+          casc_key.deduceOtherComponent(client_data->listfile());
+
+          std::vector<char> casc_bytes;
+          if (client_data->readFile(casc_key, casc_bytes))
+          {
+            std::vector<std::uint8_t> casc_u8(casc_bytes.begin(), casc_bytes.end());
+            if (part_is_usable(casc_u8, part))
+            {
+              LogError << "[ModernADT][Save] The project override for '" << path
+                       << "' is " << size << " byte(s) but is not a usable "
+                       << part_name(part) << " part, so the original " << casc_u8.size()
+                       << " byte(s) were read from CASC instead. Delete that stale"
+                          " file if the override was not intentional." << std::endl;
+              result.bytes = std::move(casc_u8);
+            }
+          }
+        }
+
         return result;
       }
       catch (...)
@@ -1470,18 +1554,23 @@ namespace Noggit::Formats::ADT
     backing.source = makeSource(root_path);
 
     backing.parts[part_index(ShadowlandsADTPart::Root)] =
-      read_part(backing.source.paths[part_index(ShadowlandsADTPart::Root)], true);
+      read_part(backing.source.paths[part_index(ShadowlandsADTPart::Root)], true,
+                ShadowlandsADTPart::Root);
     backing.parts[part_index(ShadowlandsADTPart::Tex0)] =
-      read_part(backing.source.paths[part_index(ShadowlandsADTPart::Tex0)], true);
+      read_part(backing.source.paths[part_index(ShadowlandsADTPart::Tex0)], true,
+                ShadowlandsADTPart::Tex0);
     backing.parts[part_index(ShadowlandsADTPart::Obj0)] =
-      read_part(backing.source.paths[part_index(ShadowlandsADTPart::Obj0)], true);
+      read_part(backing.source.paths[part_index(ShadowlandsADTPart::Obj0)], true,
+                ShadowlandsADTPart::Obj0);
 
     // These are not required by every map/tile.  They are nevertheless loaded
     // when available so future native writers can preserve their contents.
     backing.parts[part_index(ShadowlandsADTPart::Obj1)] =
-      read_part(backing.source.paths[part_index(ShadowlandsADTPart::Obj1)], false);
+      read_part(backing.source.paths[part_index(ShadowlandsADTPart::Obj1)], false,
+                ShadowlandsADTPart::Obj1);
     backing.parts[part_index(ShadowlandsADTPart::Lod)] =
-      read_part(backing.source.paths[part_index(ShadowlandsADTPart::Lod)], false);
+      read_part(backing.source.paths[part_index(ShadowlandsADTPart::Lod)], false,
+                ShadowlandsADTPart::Lod);
 
     // Sizes, not contents: when a part turns out to be unusable further down,
     // "0 bytes" and "the wrong file" need to be tellable apart in the log.

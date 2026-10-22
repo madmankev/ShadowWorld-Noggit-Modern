@@ -1159,13 +1159,14 @@ namespace Noggit::Formats::Conversion
           emit_sub(FC_MCNR, chunk.mcnr, header.ofsNormal);
         if (chunk.has_mccv)
           emit_sub(FC_MCCV, chunk.mccv, header.ofsMCCV);
-        bool mcsh_emitted = false;
-        if (chunk.has_mcsh && chunk.header.sizeShadow)
-        {
-          emit_sub(FC_MCSH, chunk.mcsh, header.ofsShadow);
-          header.sizeShadow = chunk.mcsh.size;
-          mcsh_emitted = true;
-        }
+        // The shadow map belongs to TEX0 in the split format: a retail 9.2.7
+        // ROOT MCNK carries MCVT, MCNR and MCSE only, and MCSH sits in the
+        // matching TEX0 chunk. Emitting it into ROOT while setting has_mcsh
+        // sent the client looking for a shadow map in a TEX0 that never got
+        // one, which is a read through a table that is not there. The bit
+        // follows the legacy chunk's presence; TEX0 receives the chunk itself.
+        header.flags.flags.has_mcsh =
+          (chunk.has_mcsh && chunk.header.sizeShadow != 0) ? 1u : 0u;
         if (chunk.has_mcse && chunk.header.nSndEmitters)
         {
           emit_sub(FC_MCSE, chunk.mcse, header.ofsSndEmitters);
@@ -1189,8 +1190,6 @@ namespace Noggit::Formats::Conversion
         // claimed water. Clear the bits together with the chunk they describe.
         if (mh2o_payload.empty())
           header.flags.value &= ~legacy_liquid_flags;
-        if (!mcsh_emitted)
-          header.flags.flags.has_mcsh = 0;
 
         std::memcpy(out.bytes.data() + header_pos, &header, sizeof(header));
 
@@ -1336,6 +1335,11 @@ namespace Noggit::Formats::Conversion
 
         out.chunkHeader(FC_MCAL, static_cast<std::uint32_t>(mcal.bytes.size()));
         out.raw(mcal.bytes.data(), mcal.bytes.size());
+
+        // The shadow map of this chunk, where the split format and retail keep
+        // it. The ROOT's has_mcsh bit is set exactly when this is emitted.
+        if (chunk.has_mcsh && chunk.header.sizeShadow)
+          out.chunkFrom(FC_MCSH, source_bytes + chunk.mcsh.payload, chunk.mcsh.size);
 
         out.patchU32(chunk_start + 4,
                      static_cast<std::uint32_t>(out.position() - chunk_start - 8));
