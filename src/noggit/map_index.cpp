@@ -220,7 +220,13 @@ MapIndex::MapIndex (const std::string &pBasename, int map_id, World* world,
   mphd = _parsedWdt.mphd;
 
   mHasAGlobalWMO = mphd.flags & FLAG_GLOBAL_OBJECT;
-  mBigAlpha = mphd.flags & FLAG_BIG_ALPHA;
+  // Alpha bit depth follows the client's own table: uncompressed alpha maps
+  // are 8-bit when EITHER big alpha (0x4) OR height texturing (0x80) is set
+  // in the MPHD, and 4-bit only when neither is. Every Shadowlands map
+  // carries 0x80, so testing 0x4 alone made tile saves emit 4-bit MCAL into
+  // an 8-bit map - the client streams such a tile in and dies with ERROR
+  // #134 "CMapChunk::UnpackAlphaShadowBits(): Bad genformat".
+  mBigAlpha = (mphd.flags & (FLAG_BIG_ALPHA | FLAG_HEIGHT_TEXTURING)) != 0;
   _sort_models_by_size_class = mphd.flags & FLAG_DOODADS_SORT;
 
   if (!modern_client && !(mphd.flags & FLAG_SHADING))
@@ -922,11 +928,16 @@ void MapIndex::save()
   // other chunk is preserved byte for byte.
   if (modern_client && !_rawWdt.empty())
   {
+    // The WDT's own big-alpha bit must not be derived from mBigAlpha: that
+    // member now also covers height texturing (0x80) for the tile alpha
+    // depth, and setting 0x4 here would add a flag to the client's WDT that
+    // the retail file does not carry. The bit round-trips untouched.
+    bool const wdt_big_alpha = (mphd.flags & FLAG_BIG_ALPHA) != 0;
     std::uint32_t flags = mphd.flags;
     flags &= ~(FLAG_GLOBAL_OBJECT | FLAG_BIG_ALPHA | FLAG_DOODADS_SORT | FLAG_SHADING);
     if (mHasAGlobalWMO)
       flags |= FLAG_GLOBAL_OBJECT;
-    if (mBigAlpha)
+    if (wdt_big_alpha)
       flags |= FLAG_BIG_ALPHA;
     if (_sort_models_by_size_class)
       flags |= FLAG_DOODADS_SORT;

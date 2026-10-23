@@ -397,7 +397,16 @@ namespace Noggit::Formats::ADT
         MapChunkHeader legacy_header{};
         std::memcpy(&modern_header, payload.data(), sizeof(modern_header));
         std::memcpy(&legacy_header, legacy.data() + legacy_chunk.payload, sizeof(legacy_header));
-        modern_header.flags = legacy_header.flags;
+        // The same owner-split flag policy as ModernAdtWriter::
+        // merge_chunk_header (see the bit-owner commentary there): bits 1-6
+        // from the edited header, everything else from the retail original,
+        // do_not_fix_alpha_map (bit 15, 0x8000) forced set. A cleared
+        // do_not_fix next to full-size alpha/shadow data is the ERROR #134
+        // "Bad genformat" crash.
+        modern_header.flags.value =
+          (legacy_header.flags.value & 0x7Eu)
+          | (modern_header.flags.value & ~0x7Eu);
+        modern_header.flags.flags.do_not_fix_alpha_map = 1;
         modern_header.ix = legacy_header.ix;
         modern_header.iy = legacy_header.iy;
         modern_header.areaid = legacy_header.areaid;

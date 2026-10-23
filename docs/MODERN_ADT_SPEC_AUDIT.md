@@ -20,7 +20,7 @@ Ground truth used throughout:
 
 * wowdev.wiki ADT v18 / WDT / WDL.
 * `tools/adt_format_check.cpp`, a Qt-free harness that links the real writer,
-  reader and converter and asserts the conventions below (238 checks).
+  reader and converter and asserts the conventions below (243 checks).
 
 ## 1. Split-ADT architecture — implemented
 
@@ -139,6 +139,22 @@ when the source carries them.
 * The save reports, per tile, which path ran, which parts reached disk, and
   every loss (unresolved textures, dropped placements, invented IDs), so a
   client-side crash can be attributed from the log alone.
+* Alpha bit depth follows the client's own table (wowdev ADT/v18, MCAL):
+  uncompressed alpha is 8-bit when **either** MPHD big-alpha (0x4) **or**
+  height texturing (0x80) is set, and 4-bit only when neither is. Every
+  Shadowlands map carries 0x80, so `mBigAlpha` deriving from 0x4 alone made
+  tile saves emit 4-bit MCAL into an 8-bit map - the client streams such a
+  tile in and dies with **ERROR #134 (0x85100086),
+  `CMapChunk::UnpackAlphaShadowBits(): Bad genformat`** (the field crash of
+  2026-10-23, player inside Burning Steppes). The WDT's own 0x4 bit
+  round-trips untouched; only the tile alpha depth changed.
+* MCNK flag bits merge by owner: Noggit owns impass/liquid/MCCV (bits 1-6);
+  `has_mcsh` is reconciled against the chunks actually emitted; reserved
+  bits, `unknown_0x80` and `high_res_holes` (bit 16) come from the retail
+  original; `do_not_fix_alpha_map` (bit 15, 0x8000) is **forced set** -
+  Noggit always writes full-size 64x64 alpha and 512-byte shadow maps, and a
+  cleared bit tells the client to expect the 63x63 "fixed" layout, which is
+  the same #134 assert. Harness-covered.
 * The GUID scan (`searchMaxUID`) reads each tile by the WDT's MAID
   FileDataIDs first, falling back to path resolution: a modded or partial
   listfile can map tile paths to stale ids whose content CASC does not hold

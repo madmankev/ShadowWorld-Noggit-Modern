@@ -296,7 +296,23 @@ namespace Noggit::Formats::ADT
                        | (static_cast<std::uint64_t>(original.ofsNormal) << 32);
       }
 
-      merged.flags = edited.flags;
+      // The flag bits split by owner. Noggit edits impassability, the liquid
+      // kinds and MCCV presence (bits 1-6); everything else describes data
+      // this writer preserves from the retail original and must not change:
+      // has_mcsh (bit 0 - reconciled against the emitted MCSH below), the
+      // reserved bits 8-14, unknown_0x80 (bit 7) and high_res_holes (bit 16,
+      // 0x10000: the layout of the hole mask in ofsHeight/ofsNormal).
+      // do_not_fix_alpha_map (bit 15, 0x8000) is forced set: this writer
+      // always emits full-size 64x64 alpha and 512-byte shadow data, and a
+      // cleared bit tells the client to expect the 63x63 "fixed" layout,
+      // which it avenges with ERROR #134
+      // "CMapChunk::UnpackAlphaShadowBits(): Bad genformat". Retail sets the
+      // bit on most chunks (at 8-bit depth it also enables the shadow x0.7
+      // alpha modification the client expects).
+      constexpr std::uint32_t editor_owned_flag_bits = 0x7E;
+      merged.flags.value = (edited.flags.value & editor_owned_flag_bits)
+                         | (original.flags.value & ~editor_owned_flag_bits);
+      merged.flags.flags.do_not_fix_alpha_map = 1;
       merged.ix = edited.ix;
       merged.iy = edited.iy;
       merged.areaid = edited.areaid;

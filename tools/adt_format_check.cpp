@@ -1250,6 +1250,103 @@ int main()
     check(!small_result.ok, "a malformed MAOF refuses the rebuild rather than lose tiles");
   }
 
+  std::printf("\nMCNK flag ownership on merge\n");
+  {
+    // Retail MCNK headers carry bits Noggit does not model: reserved bits,
+    // high_res_holes (bit 16, the hole-mask layout) and
+    // do_not_fix_alpha_map (bit 15, 0x8000) describing the 64x64-vs-63x63
+    // alpha/shadow layout. A merge that copies the editor's flags wholesale
+    // erases them - and a cleared do_not_fix next to full-size alpha data is
+    // the client-side ERROR #134
+    // "CMapChunk::UnpackAlphaShadowBits(): Bad genformat" that killed the
+    // first in-game test of the merged tiles.
+    ConversionOptions options;
+    options.target = MapFormat::modern;
+    options.map_name = "emeralddream";
+    options.convert_liquids = true;
+    options.include_wdl = false;
+
+    auto source = make_source(known);
+    FdidAllocator fdids(options.custom_fdid_base);
+    auto const legacy = build_legacy_adt(true, 2, 5);
+    auto const result = convertAdtLegacyToModern(legacy, options, source, fdids);
+    check(result.ok && !result.root.empty(), "fixture: modern ROOT for the flag test");
+
+    auto rd32 = [](std::vector<std::uint8_t> const& b, std::size_t at)
+    {
+      return std::uint32_t(b[at]) | (std::uint32_t(b[at + 1]) << 8)
+           | (std::uint32_t(b[at + 2]) << 16) | (std::uint32_t(b[at + 3]) << 24);
+    };
+    auto wr32 = [](std::vector<std::uint8_t>& b, std::size_t at, std::uint32_t v)
+    {
+      b[at] = std::uint8_t(v); b[at + 1] = std::uint8_t(v >> 8);
+      b[at + 2] = std::uint8_t(v >> 16); b[at + 3] = std::uint8_t(v >> 24);
+    };
+
+    // Make the original's first MCNK header retail-flavored: a reserved bit
+    // set, do_not_fix_alpha_map (0x8000) cleared.
+    auto root = result.root;
+    std::size_t first_mcnk_header = 0;
+    {
+      std::size_t pos = 0;
+      while (pos + 8 <= root.size())
+      {
+        std::uint32_t const magic = rd32(root, pos);
+        std::uint32_t const size = rd32(root, pos + 4);
+        if (magic == fc('M', 'C', 'N', 'K'))
+        {
+          first_mcnk_header = pos + 8;
+          break;
+        }
+        pos += 8 + size;
+      }
+    }
+    check(first_mcnk_header != 0, "fixture: the ROOT has an MCNK to patch");
+    std::uint32_t flags = rd32(root, first_mcnk_header);
+    flags |= 0x200u;              // a reserved bit (bits 8-14)
+    flags &= ~0x8000u;            // do_not_fix_alpha_map cleared
+    wr32(root, first_mcnk_header, flags);
+
+    bool ok = true;
+    std::string why;
+    std::uint32_t out_flags = 0;
+    try
+    {
+      auto input = ModernAdtWriter::rootInputFromLegacy(profile, legacy);
+      auto rewritten = ModernAdtWriter::writeRoot(profile, root, input);
+      std::size_t pos = 0;
+      while (pos + 8 <= rewritten.size())
+      {
+        std::uint32_t const magic = rd32(rewritten, pos);
+        std::uint32_t const size = rd32(rewritten, pos + 4);
+        if (magic == fc('M', 'C', 'N', 'K'))
+        {
+          out_flags = rd32(rewritten, pos + 8);
+          break;
+        }
+        pos += 8 + size;
+      }
+      ModernAdtWriter::validatePartOrThrow(profile, rewritten, AdtPartExpectation::Root,
+                                           "ROOT part");
+    }
+    catch (std::exception const& e)
+    {
+      ok = false;
+      why = e.what();
+    }
+    if (!ok)
+      std::printf("    flag-merge writeRoot: %s\n", why.c_str());
+    check(ok, "the merge survives retail-only MCNK flag bits");
+    if (ok)
+    {
+      check((out_flags & 0x200u) != 0,
+            "a reserved retail flag bit survives the merge");
+      check((out_flags & 0x8000u) != 0,
+            "do_not_fix_alpha_map (0x8000) is forced on: full-size alpha data"
+            " must not meet a cleared bit (ERROR #134 Bad genformat)");
+    }
+  }
+
   std::printf("\nROOT without MCIN (retail variant)\n");
   {
     // Retail ROOT files may omit MCIN entirely (observed on azeroth tiles:
