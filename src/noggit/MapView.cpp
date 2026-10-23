@@ -908,6 +908,12 @@ void MapView::setupFileMenu()
       }
   );
 
+  ADD_ACTION (file_menu, "Export map for client...", "", [this]
+      {
+        _world->mapIndex.exportMapForClient();
+      }
+  );
+
   ADD_ACTION ( file_menu
   , "Reload tile"
   , "Shift+J"

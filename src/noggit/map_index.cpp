@@ -14,7 +14,9 @@
 #include <noggit/uid_storage.hpp>
 #include <noggit/application/NoggitApplication.hpp>
 #include <noggit/formats/adt/ModernAdtReader.hpp>
+#include <noggit/formats/export/MapExport.hpp>
 #include <noggit/formats/wdt/WdtReader.hpp>
+#include <noggit/project/ModernMapRegistrations.h>
 #include <ClientFile.hpp>
 #include <Listfile.hpp>
 #include <noggit/database/SqlUIDStorage.h>
@@ -522,6 +524,232 @@ void MapIndex::ensureModernWdtInProject()
   {
     LogError << "[WDT Save] Failed to copy the original modern WDT to the project override: "
              << error.what() << std::endl;
+  }
+}
+
+void MapIndex::exportMapForClient()
+{
+  auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
+  if (!client_data)
+  {
+    LogError << "[Map Export] No client data is loaded; nothing to export." << std::endl;
+    return;
+  }
+
+  try
+  {
+    namespace Export = Noggit::Formats::Export;
+
+    auto const project_root =
+      std::filesystem::path(Noggit::Project::CurrentProject::get()->ProjectPath);
+    std::error_code ec;
+
+    Export::ExportOptions options;
+    options.map_directory = basename;
+    options.map_display_name = basename;
+    options.map_id = _map_id;
+
+    std::string const base = "World\\Maps\\" + basename + "\\" + basename;
+
+    // Every file a client expects for this map. The five split parts are
+    // candidates per tile; which of them are required is the exporter's
+    // call, not this loop's.
+    std::vector<std::string> candidates;
+    candidates.push_back(base + ".wdt");
+    candidates.push_back(base + ".wdl");
+    for (char const* suffix : {"_lgt", "_occ", "_fogs", "_mpv", "_tex", "_pd4"})
+      candidates.push_back(base + suffix + ".wdt");
+    for (int y = 0; y < 64; ++y)
+    {
+      for (int x = 0; x < 64; ++x)
+      {
+        if (!hasTile(TileIndex(x, y)))
+          continue;
+        std::string const tile_base =
+          base + "_" + std::to_string(x) + "_" + std::to_string(y);
+        for (char const* suffix : {"", "_tex0", "_obj0", "_obj1", "_lod"})
+          candidates.push_back(tile_base + suffix + ".adt");
+      }
+    }
+
+    Export::ExportInput input;
+    input.path_to_fdid = [client_data](std::string const& normalized_path)
+    {
+      std::string windows_path = normalized_path;
+      for (char& c : windows_path)
+        if (c == '/')
+          c = '\\';
+      auto const* listfile = client_data->listfile();
+      return listfile
+        ? listfile->getFileDataID(
+            BlizzardArchive::ClientData::normalizeFilenameInternal(windows_path))
+        : 0u;
+    };
+
+    // Project-first reads: the saved loose files are what has to be
+    // exported; the client's own copy fills in every part the project does
+    // not override.
+    for (auto const& path : candidates)
+    {
+      std::vector<std::uint8_t> bytes;
+      auto const local = project_root
+        / BlizzardArchive::ClientData::normalizeFilenameInternal(path);
+      if (std::filesystem::exists(local, ec))
+      {
+        std::ifstream in(local, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(in),
+                     std::istreambuf_iterator<char>());
+      }
+      else if (client_data->exists(path))
+      {
+        BlizzardArchive::ClientFile file(path, client_data);
+        if (file.getSize())
+          bytes.assign(file.getBuffer(), file.getBuffer() + file.getSize());
+      }
+
+      if (bytes.empty())
+        continue;
+
+      Export::ExportFile exported;
+      exported.relative_path = path;
+      exported.bytes = std::move(bytes);
+      input.files.push_back(std::move(exported));
+    }
+
+    auto const result = Export::exportModernMap(options, input);
+
+    // ---- the deployable tree ----
+    auto const out_root = project_root / "export" / basename;
+    std::filesystem::create_directories(out_root, ec);
+    if (ec)
+    {
+      LogError << "[Map Export] Cannot create " << out_root.string() << ": "
+               << ec.message() << std::endl;
+      return;
+    }
+
+    std::size_t files_written = 0;
+    for (auto const& file : result.files)
+    {
+      std::string relative = file.relative_path;
+      for (char& c : relative)
+        if (c == '\\')
+          c = '/';
+      auto const full = out_root / relative;
+      std::filesystem::create_directories(full.parent_path(), ec);
+      if (ec)
+      {
+        LogError << "[Map Export] Cannot create " << full.parent_path().string()
+                 << ": " << ec.message() << std::endl;
+        continue;
+      }
+      std::ofstream out(full, std::ios::binary | std::ios::trunc);
+      if (!out)
+      {
+        LogError << "[Map Export] Cannot write " << full.string() << std::endl;
+        continue;
+      }
+      out.write(reinterpret_cast<char const*>(file.bytes.data()),
+                static_cast<std::streamsize>(file.bytes.size()));
+      if (out)
+        ++files_written;
+      else
+        LogError << "[Map Export] Write failed for " << full.string() << std::endl;
+    }
+
+    auto write_artifact = [&](char const* name, std::string const& content)
+    {
+      std::ofstream out(out_root / name, std::ios::binary | std::ios::trunc);
+      if (!out)
+      {
+        LogError << "[Map Export] Cannot write " << (out_root / name).string()
+                 << std::endl;
+        return;
+      }
+      out << content;
+    };
+
+    std::size_t new_ids = 0;
+    for (auto const& assignment : result.fdid_assignments)
+      if (!assignment.existed_in_client)
+        ++new_ids;
+
+    write_artifact("export-manifest.json", result.manifest_json());
+    write_artifact("listfile-additions.csv", result.listfile_csv());
+
+    {
+      auto const fields = result.registration_fields();
+      std::ostringstream registration;
+      registration << "{\n  \"version\": 1,\n  \"registrations\": [\n    {\n";
+      registration << "      \"id\": " << options.map_id << ",\n";
+      registration << "      \"target_build\": \"" << options.target_build << "\",\n";
+      registration << "      \"fields\": {\n";
+      std::size_t n = 0;
+      for (auto const& field : fields)
+      {
+        registration << "        \"" << field.first << "\": \"" << field.second
+                     << "\"" << (++n < fields.size() ? "," : "") << "\n";
+      }
+      registration << "      }\n    }\n  ]\n}\n";
+      write_artifact("map-registration.json", registration.str());
+    }
+
+    // Housekeeping: an existing registration row for this map gains the WDT
+    // FileDataID the export settled on (Map.db2's WdtFileDataID column).
+    if (_map_id >= 0 && result.wdt_fdid)
+    {
+      auto registrations = Noggit::Project::ModernMapRegistrations::load(project_root);
+      bool changed = false;
+      for (auto& registration : registrations)
+      {
+        if (registration.id != _map_id)
+          continue;
+        auto const value = std::to_string(result.wdt_fdid);
+        auto const existing = registration.fields.find("WdtFileDataID");
+        if (existing == registration.fields.end() || existing->second != value)
+        {
+          registration.fields["WdtFileDataID"] = value;
+          changed = true;
+        }
+      }
+      if (changed
+          && Noggit::Project::ModernMapRegistrations::save(project_root, registrations))
+        Log << "[Map Export] WdtFileDataID " << result.wdt_fdid
+            << " recorded in the map's registration." << std::endl;
+    }
+
+    Log << "[Map Export] " << files_written << " of " << result.files.size()
+        << " file(s) exported to " << out_root.string() << "; tiles "
+        << result.tiles_complete << "/" << result.tiles_total << " complete; "
+        << new_ids << " new FileDataID(s) in listfile-additions.csv."
+        << std::endl;
+
+    std::size_t shown = 0;
+    for (auto const& warning : result.warnings)
+    {
+      if (shown < 20)
+        Log << "[Map Export] warning: " << warning << std::endl;
+      ++shown;
+    }
+    if (shown > 20)
+      Log << "[Map Export] " << (shown - 20)
+          << " further warning(s) in export-manifest.json." << std::endl;
+
+    shown = 0;
+    for (auto const& error : result.errors)
+    {
+      if (shown < 20)
+        LogError << "[Map Export] " << error << std::endl;
+      ++shown;
+    }
+    if (!result.ok)
+      LogError << "[Map Export] The exported set is NOT deployable: "
+               << result.errors.size() << " error(s); the full list is in "
+               << (out_root / "export-manifest.json").string() << std::endl;
+  }
+  catch (std::exception const& error)
+  {
+    LogError << "[Map Export] " << error.what() << std::endl;
   }
 }
 

@@ -90,6 +90,16 @@ Version-specific readers and writers handle the differences between clients.
 -   Modern split ADT saving writes terrain/texture and M2/WMO placement parts
     in the selected modern format, including `_obj1.adt` and `_lod.adt` where
     applicable. WotLK retains its existing ADT save path.
+-   Modern WDL files are written **natively** in the modern format
+    (`MVER 18` + `MAOF` + `MARE`/`MAHO` tiles + `MLMD`/`MLMX` horizon WMOs
+    with FileDataIDs) when a map has no source WDL, and rebuilt without
+    losing chunks when tiles lack `MARE` slots.
+-   **Editor → Export map for client...** packages a saved map for
+    deployment: the validated file set, MAID/MPHD FileDataID assignments for
+    tiles and files the client does not know, plus
+    `listfile-additions.csv`, `map-registration.json` and
+    `export-manifest.json` under `<project>/export/<map>/`
+    ([docs/MODERN_EXPORT.md](docs/MODERN_EXPORT.md)).
 -   The project selector uses a Shadow-World themed, animated Qt interface.
 
 ### Compatibility Notes
@@ -140,14 +150,22 @@ Converted modern maps must be registered with the target client (listfile /
 server-side FileDataIDs, Map.db2 row) before the game can load them; the
 manifest lists exactly which ids are new.
 
+Post-WotLK **generations** are distinct formats in the converter
+(`MapGeneration`: WotLK 3.3.5, Shadowlands 9.2.7, retail 12.x): conversion
+between the modern generations strips the chunks the target family does not
+carry (WDT `MAI2`, WDL `MSSF`) and reports - never fabricates - the ones that
+cannot be authored offline; ADT parts cross generations verbatim after
+validation, because both families are MVER 18. See
+[docs/MAP_CONVERSION.md](docs/MAP_CONVERSION.md).
+
 ### Outside the Current Scope
 
 -   Automatic creation of every database file needed by a completely new
-    modern map.
--   Conversion between post-WotLK generations (e.g. Shadowlands → Retail
-    12.x): the converter targets the two families the editor saves in,
-    WotLK and Shadowlands 9.2.7, as distinct formats - not one generic
-    "modern" format.
+    modern map. The export pipeline
+    ([docs/MODERN_EXPORT.md](docs/MODERN_EXPORT.md)) produces the
+    registration data (`map-registration.json` with `WdtFileDataID`,
+    `listfile-additions.csv`); applying it to a binary `Map.db2`/CASC stays
+    with the mod packer or server tooling.
 
 ## Version Direction
 

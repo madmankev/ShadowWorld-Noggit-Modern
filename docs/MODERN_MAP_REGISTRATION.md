@@ -136,14 +136,18 @@ bootstrap.
 
 ## What is deliberately out of scope (follow-ups)
 
-* **Writing a real `Map.db2`**: Noggit edits against a read-only CASC client;
-  there is no packaging/export pipeline in this tree to receive one. The
-  registration format keeps modern column values so an exporter can be added
-  later without changing stored data.
-* **`WdtFileDataID` / `ZmpFileDataID`**: 9.2.7 references WDT/ZMP by file
-  data id. The editor resolves WDT by `Directory` path (project files first),
-  so registration works editor-side; producing CASC-visible fds for new maps
-  belongs to a future export step.
+* **Writing a real `Map.db2`**: Noggit edits against a read-only CASC client,
+  so applying registrations to a binary `Map.db2` stays with the mod
+  packer/server tooling. The packaging/export pipeline that feeds it now
+  exists: **Editor → Export map for client...** writes a mergeable
+  `map-registration.json` next to the deployable file set - see
+  [`MODERN_EXPORT.md`](MODERN_EXPORT.md). The registration format kept its
+  modern column values, so no stored data changed.
+* ~~**`WdtFileDataID`**~~: **implemented by the export step** - the export
+  resolves the WDT's FileDataID through the client listfile (or allocates a
+  fresh one), writes it into the exported registration artifact and into the
+  project's own registration row for that map id. `ZmpFileDataID` remains
+  out of scope: Noggit neither reads nor writes ZMP files.
 * **AreaTable registration** for zones on new maps (the wizard only registers
   the map row itself).
 

@@ -223,6 +223,16 @@ public:
   void loadMinimapMD5translate();
   void saveMinimapMD5translate();
 
+  //! Package this map's saved files for deployment into a game client:
+  //! the validated file set (every ADT part structurally checked), the
+  //! FileDataID assignments a client needs (MAID entries for tiles created
+  //! in the editor, MPHD columns, the WDT's own id for Map.db2's
+  //! WdtFileDataID), plus listfile-additions.csv, map-registration.json and
+  //! export-manifest.json - written to <project>/export/<basename>/. The
+  //! project's own files (WDT included) are never modified: the patched WDT
+  //! only exists in the export tree.
+  void exportMapForClient();
+
 private:
 	void ensureModernWdtInProject();
 	// When read_failures is provided, per-tile read failures are collected

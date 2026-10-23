@@ -13,6 +13,7 @@
 #include <opengl/context.inl>
 #include <noggit/Misc.h>
 #include <noggit/formats/wdl/WdlObjects.hpp>
+#include <noggit/formats/wdl/ModernWdlWriter.hpp>
 
 #include <algorithm>
 #include <bitset>
@@ -734,21 +735,59 @@ void map_horizon::save_wdl(World* world, bool regenerate)
                  << " MARE tile(s) in the modern WDL \"" << filename.str()
                  << "\"; all other chunks preserved byte for byte." << std::endl;
 
+        std::vector<char> final_bytes = std::move(patched);
+
         if (missing_slots > 0)
         {
-            Log << "[WDL Save] " << missing_slots
-                << " horizon tile(s) have no MARE slot in the source WDL \""
-                << filename.str() << "\"; their horizon heights are not persisted."
-                << std::endl;
+            // Tiles the source WDL has no MARE slot for cannot be patched in
+            // place. Rebuild the file natively instead: fresh MARE/MAHO for
+            // every tile in memory, every other chunk (and every tile not in
+            // memory) copied from the original image byte for byte.
+            Noggit::Formats::WDL::WdlRewriteInput rewrite;
+            rewrite.original.assign(_raw_wdl.begin(), _raw_wdl.end());
+            for (std::size_t y = 0; y < 64; ++y)
+            {
+                for (std::size_t x = 0; x < 64; ++x)
+                {
+                    if (!_tiles[y][x])
+                        continue;
+                    Noggit::Formats::WDL::ModernWdlTile tile{};
+                    std::memcpy(tile.height_17, _tiles[y][x]->height_17, sizeof(tile.height_17));
+                    std::memcpy(tile.height_16, _tiles[y][x]->height_16, sizeof(tile.height_16));
+                    std::memcpy(tile.holes, _tiles[y][x]->holes, sizeof(tile.holes));
+                    rewrite.tiles[y * 64 + x] = tile;
+                }
+            }
+
+            auto const rebuilt = Noggit::Formats::WDL::rewriteModernWdl(rewrite);
+            if (rebuilt.ok)
+            {
+                final_bytes.assign(rebuilt.bytes.begin(), rebuilt.bytes.end());
+                Log << "[WDL Save] " << missing_slots
+                    << " horizon tile(s) had no MARE slot in the source WDL \""
+                    << filename.str() << "\"; rebuilt the file natively so"
+                       " their heights are persisted too." << std::endl;
+                for (auto const& note : rebuilt.notes)
+                    LogDebug << "[WDL Save] " << note << std::endl;
+            }
+            else
+            {
+                for (auto const& note : rebuilt.notes)
+                    LogError << "[WDL Save] " << note << std::endl;
+                Log << "[WDL Save] " << missing_slots
+                    << " horizon tile(s) have no MARE slot in the source WDL \""
+                    << filename.str() << "\"; the native rebuild failed, so"
+                       " their horizon heights are not persisted." << std::endl;
+            }
         }
 
         BlizzardArchive::ClientFile f(filename.str(), client_data,
                                       BlizzardArchive::ClientFile::NEW_FILE);
-        f.setBuffer(patched);
+        f.setBuffer(final_bytes);
         f.save();
         f.close();
 
-        _raw_wdl.assign(patched.begin(), patched.end());
+        _raw_wdl.assign(final_bytes.begin(), final_bytes.end());
 
         set_minimap(&world->mapIndex);
         return;
@@ -756,9 +795,105 @@ void map_horizon::save_wdl(World* world, bool regenerate)
 
     if (modern_client && !_wdl_loaded_from_disk)
     {
-        Log << "[WDL Save] No source WDL was loaded for \"" << filename.str()
-            << "\"; writing a legacy-format WDL. Modern clients additionally "
-               "expect ML*/sky scene chunks in this file." << std::endl;
+        // No source WDL: write one natively in the modern format instead of
+        // the legacy one below. A Legion+ client does not read MWMO/MWID/MODF
+        // and resolves horizon WMOs by FileDataID (MLMD/MLMX).
+        for (int y = 0; y < 64; ++y)
+        {
+            for (int x = 0; x < 64; ++x)
+            {
+                TileIndex index(x, y);
+                if (!world->mapIndex.hasTile(index))
+                    continue;
+                if (_tiles[y][x] && !regenerate)
+                    continue;
+
+                bool unload = !world->mapIndex.tileLoaded(index)
+                   && !world->mapIndex.tileAwaitingLoading(index);
+                MapTile* mTile = world->mapIndex.loadTile(index, false, false, false);
+                if (!mTile)
+                    continue;
+
+                mTile->wait_until_loaded();
+                update_horizon_tile(mTile);
+                if (unload)
+                    world->mapIndex.unloadTile(index);
+            }
+        }
+
+        Noggit::Formats::WDL::ModernWdlInput wdl_input;
+        for (std::size_t y = 0; y < 64; ++y)
+        {
+            for (std::size_t x = 0; x < 64; ++x)
+            {
+                if (!_tiles[y][x])
+                    continue;
+                Noggit::Formats::WDL::ModernWdlTile tile{};
+                std::memcpy(tile.height_17, _tiles[y][x]->height_17, sizeof(tile.height_17));
+                std::memcpy(tile.height_16, _tiles[y][x]->height_16, sizeof(tile.height_16));
+                std::memcpy(tile.holes, _tiles[y][x]->holes, sizeof(tile.holes));
+                wdl_input.tiles[y * 64 + x] = tile;
+            }
+        }
+
+        // Horizon WMOs become MLMD/MLMX, which reference models by
+        // FileDataID. Names the client listfile cannot resolve are dropped
+        // and reported: an id invented offline would dangle in the client.
+        BlizzardArchive::Listfile::Listfile const* listfile = client_data->listfile();
+        unsigned int dropped_objects = 0;
+        for (auto const& instance : lWMOInstances)
+        {
+            if (static_cast<std::size_t>(instance.nameID) >= mWMOFilenames.size())
+            {
+                ++dropped_objects;
+                continue;
+            }
+            auto const normalized = BlizzardArchive::ClientData::normalizeFilenameInternal(
+                misc::normalize_adt_filename(mWMOFilenames[instance.nameID]));
+            std::uint32_t const fdid =
+                listfile ? listfile->getFileDataID(normalized) : 0u;
+            if (!fdid)
+            {
+                ++dropped_objects;
+                continue;
+            }
+            Noggit::Formats::WDL::ModernWdlObject object;
+            object.fdid = fdid;
+            object.placement = instance;
+            wdl_input.objects.push_back(object);
+        }
+
+        auto const written = Noggit::Formats::WDL::writeModernWdl(wdl_input);
+        if (written.ok)
+        {
+            for (auto const& note : written.notes)
+                Log << "[WDL Save] " << note << std::endl;
+            if (dropped_objects)
+                Log << "[WDL Save] " << dropped_objects
+                    << " horizon WMO placement(s) dropped: no FileDataID the"
+                       " client could resolve." << std::endl;
+
+            BlizzardArchive::ClientFile f(filename.str(), client_data,
+                                          BlizzardArchive::ClientFile::NEW_FILE);
+            std::vector<char> buffer(written.bytes.begin(), written.bytes.end());
+            f.setBuffer(buffer);
+            f.save();
+            f.close();
+
+            Log << "[WDL Save] No source WDL was loaded for \"" << filename.str()
+                << "\"; wrote a native modern WDL (" << written.bytes.size()
+                << " bytes)." << std::endl;
+
+            set_minimap(&world->mapIndex);
+            return;
+        }
+
+        for (auto const& note : written.notes)
+            LogError << "[WDL Save] " << note << std::endl;
+        LogError << "[WDL Save] Native modern WDL writing failed for \""
+                 << filename.str() << "\"; falling back to the legacy-format"
+                    " writer. Modern clients additionally expect ML*/sky scene"
+                    " chunks in this file." << std::endl;
     }
 
     util::sExtendableArray wdlFile;

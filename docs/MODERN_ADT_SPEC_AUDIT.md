@@ -127,6 +127,15 @@ companions a client expects next to the WDT: the WDT itself, the WDL, and the
 MPHD-referenced `_lgt`/`_occ`/`_fogs`/`_mpv`/`_tex`/`_pd4` WDTs
 (`map_index.cpp: ensureModernWdtInProject`, `ensureAuxiliaryWdtsInProject`).
 
+On top of that, **Editor → Export map for client...** packages the whole map
+for deployment: inventory against `MAIN`, structural validation of every
+part, MAID/MPHD FileDataID assignments for tiles and files the client does
+not know, and the `listfile-additions.csv` / `map-registration.json` /
+`export-manifest.json` artifacts — see
+[`MODERN_EXPORT.md`](MODERN_EXPORT.md). The WDL save path writes the modern
+format natively (`WDL::writeModernWdl` / `rewriteModernWdl`) — see
+[`MODERN_WDT_WDL.md`](MODERN_WDT_WDL.md).
+
 ## Verifying any of the above
 
     mkdir -p /tmp/synth && g++ -std=c++20 -I src -I src/external \
@@ -134,6 +143,8 @@ MPHD-referenced `_lgt`/`_occ`/`_fogs`/`_mpv`/`_tex`/`_pd4` WDTs
       src/noggit/formats/adt/ModernAdtWriter.cpp \
       src/noggit/formats/adt/ModernAdtReader.cpp \
       src/noggit/formats/wdt/WdtReader.cpp \
+      src/noggit/formats/wdl/ModernWdlWriter.cpp \
+      src/noggit/formats/export/MapExport.cpp \
       src/noggit/formats/conversion/AdtConversion.cpp \
       src/noggit/formats/conversion/MapConversion.cpp
     /tmp/synth/harness        # exit 0 = every convention above holds

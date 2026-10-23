@@ -42,6 +42,8 @@
 #include <noggit/formats/adt/ModernAdtReader.hpp>
 #include <noggit/formats/adt/ModernAdtWriter.hpp>
 #include <noggit/formats/conversion/MapConversion.hpp>
+#include <noggit/formats/export/MapExport.hpp>
+#include <noggit/formats/wdl/ModernWdlWriter.hpp>
 #include <noggit/MapHeaders.h>
 
 #include <cmath>
@@ -1039,6 +1041,399 @@ int main()
     ConversionOptions gen_defaults;
     check(gen_defaults.target_generation == MapGeneration::shadowlands_9_2_7,
           "conversions default to the family the editor saves in");
+  }
+
+  std::printf("\nnative modern WDL writer\n");
+  {
+    namespace WDL = Noggit::Formats::WDL;
+
+    struct ChunkView { std::uint32_t magic; std::size_t offset; std::size_t size; };
+    auto walk = [](std::vector<std::uint8_t> const& b, std::vector<ChunkView>& out) -> bool
+    {
+      std::size_t pos = 0;
+      while (pos + 8 <= b.size())
+      {
+        ChunkView c{};
+        std::memcpy(&c.magic, b.data() + pos, 4);
+        std::memcpy(&c.size, b.data() + pos + 4, 4);
+        c.offset = pos;
+        if (c.size > b.size() - pos - 8) return false;
+        out.push_back(c);
+        pos += 8 + c.size;
+      }
+      return pos == b.size();
+    };
+    auto read_u32 = [](std::vector<std::uint8_t> const& b, std::size_t at)
+    {
+      std::uint32_t v = 0; std::memcpy(&v, b.data() + at, 4); return v;
+    };
+
+    WDL::ModernWdlInput in{};
+    WDL::ModernWdlTile tile_a{};
+    for (int i = 0; i < 17 * 17; ++i)
+      (&tile_a.height_17[0][0])[i] = static_cast<std::int16_t>(100 + i);
+    for (int i = 0; i < 16 * 16; ++i)
+      (&tile_a.height_16[0][0])[i] = static_cast<std::int16_t>(200 + i);
+    tile_a.holes[3] = 0x0F00;
+    in.tiles[0] = tile_a;
+    std::size_t const tile_b = 2 * 64 + 1; // (x=1, y=2)
+    WDL::ModernWdlTile tile_b_data{};
+    (&tile_b_data.height_17[0][0])[0] = 777;
+    in.tiles[tile_b] = tile_b_data;
+
+    WDL::ModernWdlObject object{};
+    object.fdid = 314159;
+    object.placement.uniqueID = 42;
+    object.placement.pos[0] = 1.0f; object.placement.pos[1] = 2.0f; object.placement.pos[2] = 3.0f;
+    object.placement.flags = 0x8 | 0x2; // the fdid flag must be cleared in MLMD
+    object.placement.scale = 1024;
+    float* ext = reinterpret_cast<float*>(&object.placement.extents);
+    ext[0] = 8.0f; ext[1] = 8.0f; ext[2] = 8.0f;   // upper
+    ext[3] = -8.0f; ext[4] = -8.0f; ext[5] = -8.0f; // lower
+    in.objects.push_back(object);
+    WDL::ModernWdlObject unresolved{}; // fdid 0 -> skipped with a note
+    in.objects.push_back(unresolved);
+
+    auto const written = WDL::writeModernWdl(in);
+    check(written.ok, "writeModernWdl succeeds");
+    std::vector<ChunkView> chunks;
+    check(walk(written.bytes, chunks), "the written WDL walks exactly");
+    check(chunks.size() == 8, "chunk set: MVER MAOF MARE MAHO MARE MAHO MLMD MLMX");
+    check(chunks[0].magic == fc('M','V','E','R') && read_u32(written.bytes, 8) == 18,
+          "MVER is 18");
+    check(chunks[1].magic == fc('M','A','O','F') && chunks[1].size == 4096 * 4,
+          "MAOF is the full 4096 entry table");
+    std::size_t const maof = chunks[1].offset + 8;
+    check(read_u32(written.bytes, maof) == chunks[2].offset,
+          "MAOF[0] points at tile A's MARE tag");
+    check(read_u32(written.bytes, maof + tile_b * 4) == chunks[4].offset,
+          "MAOF[129] points at tile B's MARE tag");
+    check(read_u32(written.bytes, maof + 4) == 0, "an absent tile keeps offset 0");
+    check(chunks[2].size == 1090 && chunks[3].size == 32, "MARE is 1090, MAHO is 32 bytes");
+    check(std::memcmp(written.bytes.data() + chunks[2].offset + 8,
+                      tile_a.height_17, 17 * 17 * 2) == 0
+          && std::memcmp(written.bytes.data() + chunks[2].offset + 8 + 17 * 17 * 2,
+                         tile_a.height_16, 16 * 16 * 2) == 0,
+          "the MARE payload is height_17 followed by height_16, verbatim");
+    check(std::memcmp(written.bytes.data() + chunks[3].offset + 8,
+                      tile_a.holes, 32) == 0,
+          "the MAHO payload is the hole masks, verbatim");
+    check(chunks[6].magic == fc('M','L','M','D') && chunks[6].size == 40,
+          "MLMD holds the one resolved placement (40 bytes)");
+    check(read_u32(written.bytes, chunks[6].offset + 8) == 314159,
+          "the MLMD nameID is the FileDataID");
+    std::uint16_t mlmd_flags = 0;
+    std::memcpy(&mlmd_flags, written.bytes.data() + chunks[6].offset + 8 + 32, 2);
+    check(mlmd_flags == 0x2, "the 0x8 name-is-fdid flag is cleared in MLMD");
+    check(chunks[7].magic == fc('M','L','M','X') && chunks[7].size == 28,
+          "MLMX holds the matching bounds (28 bytes)");
+    float mlmx[7];
+    std::memcpy(mlmx, written.bytes.data() + chunks[7].offset + 8, 28);
+    check(mlmx[0] == -8.0f && mlmx[3] == 8.0f,
+          "MLMX min/max come from the MODF extents (lower first)");
+    check(std::fabs(mlmx[6] - 0.5f * std::sqrt(3.0f * 16.0f * 16.0f)) < 1e-3f,
+          "the MLMX radius is half the box diagonal");
+    bool noted_skip = false;
+    for (auto const& n : written.notes)
+      if (n.find("skipped") != std::string::npos) noted_skip = true;
+    check(noted_skip, "an unresolved placement is reported as skipped");
+
+    // rewriteModernWdl: MSSN appended as a chunk the writer must not touch
+    std::vector<std::uint8_t> original = written.bytes;
+    {
+      Writer mssn;
+      mssn.tag(fc('M','S','S','N')); mssn.u32(8);
+      std::uint8_t payload[8] = {9, 8, 7, 6, 5, 4, 3, 2};
+      mssn.raw(payload, 8);
+      original.insert(original.end(), mssn.b.begin(), mssn.b.end());
+    }
+
+    WDL::WdlRewriteInput rewrite;
+    rewrite.original = original;
+    WDL::ModernWdlTile new_a = tile_a;
+    (&new_a.height_17[0][0])[0] = -32000;
+    rewrite.tiles[0] = new_a;
+    WDL::ModernWdlTile fresh{};
+    (&fresh.height_17[0][0])[0] = 555;
+    std::size_t const tile_c = 5 * 64 + 5;
+    rewrite.tiles[tile_c] = fresh;
+
+    auto const rebuilt = WDL::rewriteModernWdl(rewrite);
+    check(rebuilt.ok, "rewriteModernWdl succeeds");
+    std::vector<ChunkView> rchunks;
+    check(walk(rebuilt.bytes, rchunks), "the rebuilt WDL walks exactly");
+    std::size_t rmaof = 0;
+    for (auto const& c : rchunks)
+      if (c.magic == fc('M','A','O','F')) rmaof = c.offset + 8;
+    check(rmaof != 0, "the rebuilt WDL has a MAOF table");
+    check(read_u32(rebuilt.bytes, rmaof) != 0 && read_u32(rebuilt.bytes, rmaof + tile_b * 4) != 0
+          && read_u32(rebuilt.bytes, rmaof + tile_c * 4) != 0,
+          "updated, kept and added tiles all have MAOF entries");
+    // tile A MARE payload carries the new height
+    std::int16_t first_height = 0;
+    std::memcpy(&first_height, rebuilt.bytes.data() + read_u32(rebuilt.bytes, rmaof) + 8, 2);
+    check(first_height == -32000, "the updated tile carries the new heights");
+    // tile B kept verbatim: compare its MARE payload with the original file's
+    {
+      std::uint32_t const old_off = read_u32(original, maof + tile_b * 4);
+      std::uint32_t const new_off = read_u32(rebuilt.bytes, rmaof + tile_b * 4);
+      check(std::memcmp(original.data() + old_off + 8, rebuilt.bytes.data() + new_off + 8,
+                        1090) == 0,
+            "a tile without a replacement is copied byte for byte");
+    }
+    // MSSN and MLMD/MLMX preserved
+    bool mssn_kept = false, mlmd_kept = false;
+    for (auto const& c : rchunks)
+    {
+      if (c.magic == fc('M','S','S','N'))
+        mssn_kept = c.size == 8 && rebuilt.bytes[c.offset + 8] == 9
+                    && rebuilt.bytes[c.offset + 15] == 2;
+      if (c.magic == fc('M','L','M','D'))
+        mlmd_kept = c.size == 40;
+    }
+    check(mssn_kept, "the MSSN chunk survives the rewrite byte for byte");
+    check(mlmd_kept, "the MLMD chunk survives the rewrite");
+    bool noted_preserved = false;
+    for (auto const& n : rebuilt.notes)
+      if (n.find("preserved") != std::string::npos && n.find("MSSN") != std::string::npos)
+        noted_preserved = true;
+    check(noted_preserved, "preserved chunks are named in the notes");
+
+    WDL::WdlRewriteInput junk;
+    junk.original = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    check(!WDL::rewriteModernWdl(junk).ok, "a file that does not walk is not rebuilt");
+
+    WDL::WdlRewriteInput small_maof;
+    {
+      Writer wsm;
+      wsm.tag(fc('M','V','E','R')); wsm.u32(4); wsm.u32(18);
+      wsm.tag(fc('M','A','O','F')); wsm.u32(8); wsm.u32(0); wsm.u32(0);
+      small_maof.original = wsm.b;
+    }
+    auto const small_result = WDL::rewriteModernWdl(small_maof);
+    check(!small_result.ok, "a malformed MAOF refuses the rebuild rather than lose tiles");
+  }
+
+  std::printf("\nmap export pipeline\n");
+  {
+    namespace Export = Noggit::Formats::Export;
+
+    struct ChunkView { std::uint32_t magic; std::size_t offset; std::size_t size; };
+    auto walk = [](std::vector<std::uint8_t> const& b, std::vector<ChunkView>& out) -> bool
+    {
+      std::size_t pos = 0;
+      while (pos + 8 <= b.size())
+      {
+        ChunkView c{};
+        std::memcpy(&c.magic, b.data() + pos, 4);
+        std::memcpy(&c.size, b.data() + pos + 4, 4);
+        c.offset = pos;
+        if (c.size > b.size() - pos - 8) return false;
+        out.push_back(c);
+        pos += 8 + c.size;
+      }
+      return pos == b.size();
+    };
+    auto read_u32 = [](std::vector<std::uint8_t> const& b, std::size_t at)
+    {
+      std::uint32_t v = 0; std::memcpy(&v, b.data() + at, 4); return v;
+    };
+
+    // Real modern parts from the real converter, for a tile at (12, 34).
+    ConversionOptions exp_options;
+    exp_options.target = MapFormat::modern;
+    exp_options.map_name = "test";
+    exp_options.convert_liquids = true;
+    exp_options.include_wdl = false;
+    auto exp_source = make_source(known);
+    FdidAllocator exp_fdids(exp_options.custom_fdid_base);
+    std::printf("[step] before convert\n");
+    auto const parts =
+      convertAdtLegacyToModern(build_legacy_adt(true, 1, 0), exp_options, exp_source, exp_fdids);
+    std::printf("[step] after convert\n");
+    check(parts.ok && !parts.root.empty() && !parts.tex0.empty() && !parts.obj0.empty(),
+          "modern parts for the export fixture");
+
+    std::size_t const tile_i = 34 * 64 + 12;
+    auto build_wdt = [&](bool second_tile)
+    {
+      Writer w;
+      w.tag(fc('M','V','E','R')); w.u32(4); w.u32(18);
+      w.tag(fc('M','P','H','D')); w.u32(32);
+      w.u32(0x200);       // wdt_has_maid
+      w.u32(0);           // [1] lgt  - zero, but the set contains the file
+      w.u32(888);         // [2] occ  - referenced, but the set lacks the file
+      w.zeros(20);        // [3..7]
+      w.tag(fc('M','A','I','N')); w.u32(4096 * 8);
+      std::size_t const main_at = w.position();
+      w.zeros(4096 * 8);
+      w.patch_u32(main_at + tile_i * 8, 1);
+      if (second_tile)
+        w.patch_u32(main_at + (34 * 64 + 13) * 8, 1);
+      w.tag(fc('M','A','I','D')); w.u32(4096 * 32);
+      w.zeros(4096 * 32);
+      return w.b;
+    };
+
+    Export::ExportOptions options;
+    options.map_directory = "test";
+    options.map_display_name = "Test Map";
+    options.map_id = 1234;
+
+    auto make_input = [&](bool second_tile, bool with_wdl, bool corrupt_root)
+    {
+      Export::ExportInput in;
+      in.files.push_back({"World/Maps/Test/Test.wdt", build_wdt(second_tile)});
+      std::vector<std::uint8_t> root = parts.root;
+      if (corrupt_root)
+        root.resize(12);
+      in.files.push_back({"World/Maps/Test/Test_12_34.adt", root});
+      in.files.push_back({"World/Maps/Test/Test_12_34_tex0.adt", parts.tex0});
+      in.files.push_back({"World/Maps/Test/Test_12_34_obj0.adt", parts.obj0});
+      in.files.push_back({"World/Maps/Test/Test_lgt.wdt", std::vector<std::uint8_t>{7, 7, 7, 7}});
+      if (with_wdl)
+      {
+        Noggit::Formats::WDL::ModernWdlInput wdl_in{};
+        wdl_in.tiles[tile_i] = Noggit::Formats::WDL::ModernWdlTile{};
+        in.files.push_back({"World/Maps/Test/Test.wdl",
+                            Noggit::Formats::WDL::writeModernWdl(wdl_in).bytes});
+      }
+      in.path_to_fdid = [](std::string const& path) -> std::uint32_t
+      {
+        return path == "world\\maps\\test\\test.wdt" ? 555u : 0u;
+      };
+      return in;
+    };
+
+    std::printf("[step] before export\n");
+    auto const exported = Export::exportModernMap(options, make_input(false, false, false));
+    std::printf("[step] after export\n");
+    check(exported.ok, "a complete map exports cleanly");
+    check(exported.tiles_total == 1 && exported.tiles_complete == 1,
+          "one tile, complete");
+    for (auto const& e : exported.errors)
+      std::printf("    export error: %s\n", e.c_str());
+
+    // the exported WDT: MAID filled for the three parts that exist
+    Export::ExportFile const* out_wdt = nullptr;
+    for (auto const& f : exported.files)
+      if (f.relative_path.find(".wdt") != std::string::npos
+          && f.relative_path.find("_lgt") == std::string::npos)
+        out_wdt = &f;
+    check(out_wdt != nullptr, "the export set carries the WDT");
+    if (out_wdt)
+    {
+      std::vector<ChunkView> wc;
+      check(walk(out_wdt->bytes, wc), "the exported WDT walks");
+      std::size_t maid_at = 0, mphd_at = 0;
+      for (auto const& c : wc)
+      {
+        if (c.magic == fc('M','A','I','D')) maid_at = c.offset + 8;
+        if (c.magic == fc('M','P','H','D')) mphd_at = c.offset + 8;
+      }
+      auto slot = [&](int s) { return read_u32(out_wdt->bytes, maid_at + tile_i * 32 + s * 4); };
+      check(slot(0) >= 900000000u && slot(3) >= 900000000u && slot(1) >= 900000000u,
+            "MAID root/tex0/obj0 are assigned for the new tile");
+      check(slot(0) != slot(3) && slot(0) != slot(1) && slot(3) != slot(1),
+            "the assigned ids are distinct");
+      check(slot(2) == 0 && slot(4) == 0,
+            "obj1/lod slots stay zero when those parts do not exist");
+      check(read_u32(out_wdt->bytes, mphd_at + 4) != 0,
+            "the MPHD lgt column is assigned for the exported aux WDT");
+      check(read_u32(out_wdt->bytes, mphd_at + 8) == 888,
+            "an existing MPHD column is left alone");
+    }
+
+    bool has_root_assignment = false, has_wdt_known = false;
+    for (auto const& a : exported.fdid_assignments)
+    {
+      if (a.role == "adt_root" && !a.existed_in_client && a.fdid == 900000000u
+          && a.path == "world/maps/test/test_12_34.adt")
+        has_root_assignment = true;
+      if (a.role == "wdt_file" && a.existed_in_client && a.fdid == 555u)
+        has_wdt_known = true;
+    }
+    std::printf("[step] after wdt checks\n");
+    check(has_root_assignment, "the new root id is reported for registration");
+    check(has_wdt_known, "the client-known WDT id is reported as existing");
+
+    std::printf("[step] before listfile\n");
+    check(exported.listfile_csv() ==
+            "900000000;world/maps/test/test_12_34.adt\n"
+            "900000001;world/maps/test/test_12_34_tex0.adt\n"
+            "900000002;world/maps/test/test_12_34_obj0.adt\n"
+            "900000003;world/maps/test/test_lgt.wdt\n",
+          "the listfile additions are exactly the fresh ids, sorted, fdid;path");
+
+    std::printf("[step] before fields\n");
+    auto const fields = exported.registration_fields();
+    check(fields.at("Directory") == "test" && fields.at("MapName_lang") == "Test Map",
+          "the registration fragment names the map");
+    check(fields.at("WdtFileDataID") == "555",
+          "the registration carries the WDT FileDataID");
+
+    check(exported.manifest_json().find("\"kind\": \"map_export\"") != std::string::npos
+          && exported.manifest_json().find("\"new_fdids\": 4") != std::string::npos
+          && exported.manifest_json().find("fnv1a64") != std::string::npos,
+          "the manifest follows the conversion-manifest conventions");
+
+    bool warned_occ = false, warned_wdl = false, warned_baked = false;
+    for (auto const& w : exported.warnings)
+    {
+      if (w.find("_occ") != std::string::npos) warned_occ = true;
+      if (w.find("no WDL") != std::string::npos) warned_wdl = true;
+      if (w.find("baked") != std::string::npos) warned_baked = true;
+    }
+    check(warned_occ, "a referenced-but-absent aux WDT is warned about");
+    check(warned_wdl, "a missing WDL is warned about");
+    check(warned_baked, "new tiles keeping zero baked-texture ids are reported");
+
+    std::printf("[step] before wdl run\n");
+    // with a WDL: MPHD word 6 gets assigned
+    {
+      auto const with_wdl = Export::exportModernMap(options, make_input(false, true, false));
+      check(with_wdl.ok, "the export stays clean with a WDL present");
+      bool wdl_assigned = false;
+      for (auto const& a : with_wdl.fdid_assignments)
+        if (a.role == "wdl" && !a.existed_in_client && a.fdid >= 900000000u)
+          wdl_assigned = true;
+      check(wdl_assigned, "the WDL gets a FileDataID in MPHD word 6");
+    }
+
+    std::printf("[step] before missing run\n");
+    // a second tile MAIN claims but the set lacks -> hard error
+    {
+      auto const missing = Export::exportModernMap(options, make_input(true, false, false));
+      check(!missing.ok, "a tile without its parts fails the export");
+      bool named = false;
+      for (auto const& e : missing.errors)
+        if (e.find("13,34") != std::string::npos && e.find("missing") != std::string::npos)
+          named = true;
+      check(named, "the error names the tile and the missing file");
+      check(missing.tiles_total == 2 && missing.tiles_complete == 1,
+            "the complete tile is still counted as complete");
+    }
+
+    std::printf("[step] before corrupt run\n");
+    // a corrupt part -> validation error, nothing deployable claimed
+    {
+      auto const corrupt = Export::exportModernMap(options, make_input(false, false, true));
+      check(!corrupt.ok, "a corrupt ROOT part fails the export");
+      bool validated = false;
+      for (auto const& e : corrupt.errors)
+        if (e.find("failed validation") != std::string::npos)
+          validated = true;
+      check(validated, "the failure comes from the structural validation");
+    }
+
+    std::printf("[step] before no-wdt run\n");
+    // no WDT at all
+    {
+      Export::ExportInput no_wdt;
+      no_wdt.files.push_back({"World/Maps/Test/Test_12_34.adt", parts.root});
+      auto const r = Export::exportModernMap(options, no_wdt);
+      check(!r.ok && !r.errors.empty(), "an export without a WDT is refused");
+    }
   }
 
   std::printf("\nfirst-bad-MCNK locator\n");

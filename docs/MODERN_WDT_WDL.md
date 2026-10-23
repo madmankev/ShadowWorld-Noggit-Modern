@@ -157,12 +157,21 @@ Noggit starts to *use* the data.
   in-memory `map_horizon_tile`. All other chunks (`MLDD/MLDX/MLMD/MLMX`,
   sky scenes, ocean, ...) survive byte for byte. `regenerate = true` runs
   the same load-every-tile pre-pass the legacy writer used before patching.
-  Tiles that have horizon data but no `MARE` slot in the source file are
-  counted and reported once (persisting them would require rebuilding the
-  file, which would destroy the modern chunks).
-- **Modern + no source WDL:** the legacy writer runs (loudly logged) - a
-  legacy-format WDL is still better than none for Noggit's own minimap, but
-  modern clients additionally expect the ML*/sky-scene chunks.
+  Tiles that have horizon data but no `MARE` slot in the source file are no
+  longer lost: the file is rebuilt natively through
+  `WDL::rewriteModernWdl` - fresh `MARE`/`MAHO` for every in-memory tile,
+  every other chunk (and every tile not in memory) copied from the original
+  image byte for byte, `MAOF` recomputed. A rebuild that cannot account for
+  the original file falls back to the plain in-place patch, loudly logged.
+- **Modern + no source WDL:** the **native modern writer**
+  (`WDL::writeModernWdl`, `src/noggit/formats/wdl/ModernWdlWriter.cpp`)
+  runs: `MVER 18` + `MAOF` + per-tile `MARE`/`MAHO` from the horizon data,
+  and horizon WMOs as `MLMD`/`MLMX` with FileDataIDs resolved through the
+  client listfile (unresolvable placements are dropped and counted - an id
+  invented offline would dangle in the client). Sky scenes and other
+  client-authored optional chunks are left out rather than fabricated. The
+  legacy writer remains only as the fallback if the native write fails, and
+  for legacy clients.
 - **Legacy client:** unchanged.
 
 ## 3. Behavior matrix
@@ -173,7 +182,7 @@ Noggit starts to *use* the data.
 | Modern client, retail WDT       | chunk walker; MAID parsed; no forced 0x2 | in-place patch of MPHD flags + MAIN     |
 | Modern WMO-only map (MODF fdid) | name resolved via listfile             | MODF/MAID preserved byte for byte         |
 | Modern WDL with MLMD/MLMX       | horizon WMOs loaded + listfile-resolved | MARE/MAHO patched in place                |
-| Modern, new map (`create_empty`) | n/a                                    | legacy writer, subset-valid, no forced 0x2 |
+| Modern, new map (`create_empty`) | n/a                                    | native modern WDL writer (MAOF/MARE/MAHO + MLMD/MLMX) |
 | Corrupt file                    | error diagnostics, partial recovery    | patch refused -> legacy fallback + errors |
 
 ## 4. Format facts the code relies on
@@ -206,18 +215,23 @@ and adds `MSSN/MSSC/MSSO/MSSF` sky scenes, `MSLD/MSLI`, `MAID`, `MWAT`,
 
 ## 5. Known limitations / follow-ups
 
-- **New tiles have no MAID FileDataIDs.** Tiles created inside Noggit are
-  flagged in `MAIN` and saved as loose project ADTs, but a modern retail
-  client locates ADTs through `MAID`. The load path now *reports* this
-  (`N tile(s) ... have no root ADT FileDataID in MAID`); allocating ids and
-  writing them belongs to the map-registration/export pipeline
-  ([`MODERN_MAP_REGISTRATION.md`](MODERN_MAP_REGISTRATION.md)).
+- ~~**New tiles have no MAID FileDataIDs.**~~ **Implemented** by the export
+  pipeline: tiles created inside Noggit are still saved as loose project
+  ADTs with zeroed `MAID` entries (the project WDT stays the client
+  original), but **Editor → Export map for client...** allocates the ids -
+  listfile-known first, fresh from `fdid_base` otherwise - writes them into
+  the exported WDT's `MAID`, and lists them in `listfile-additions.csv`.
+  See [`MODERN_EXPORT.md`](MODERN_EXPORT.md).
 - **Horizon M2s (`MLDD/MLDX`) are still skipped** - parity with legacy,
   which never rendered horizon M2s. The capture pattern for MLMD makes
   adding them straightforward.
-- **No native modern WDL writer.** Maps that never had a source WDL get a
-  legacy-format file; a full modern writer (ML* chunks, sky scenes) would be
-  new-code territory like the ADT writer in issue #3.
+- ~~**No native modern WDL writer.**~~ **Implemented:**
+  `WDL::writeModernWdl` / `WDL::rewriteModernWdl`
+  (`src/noggit/formats/wdl/ModernWdlWriter.{hpp,cpp}`, Qt-free,
+  harness-proven). Maps that never had a source WDL now get a modern-format
+  file instead of a legacy one. Sky scenes (`MSSN`/`MSSC`/`MSSO`) remain
+  client-authored data the writer does not fabricate; a rewrite preserves
+  them from the original image.
 - **The UID-fix pass** (`MapIndex`, "fix UIDs" action) still reads ADTs
   with legacy MHDR-relative seeks; on modern split files it should route
   through the codec / `getHighestGUIDFromFile` (which is already
