@@ -134,6 +134,10 @@ namespace Noggit::Formats::Conversion
     //! FileDataID -> path from the source client's listfile; empty string
     //! when unknown.
     std::function<std::string(std::uint32_t)> fdid_to_path;
+    //! Read a source file directly by FileDataID; nullopt when unavailable or
+    //! not found. Optional - used as the last resort for split ADT parts when
+    //! neither listfile path resolves (partial/custom listfiles).
+    std::function<std::optional<std::vector<std::uint8_t>>(std::uint32_t)> read_fdid;
   };
 
   struct ConversionOptions

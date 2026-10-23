@@ -904,26 +904,63 @@ namespace Noggit::Formats::ADT
     return input;
   }
 
+    //! A ROOT without MCIN leaves mhdr_offset_basis nothing to calibrate
+    //! against, and the legacy fallback is a guess. If the original carries
+    //! MH2O or MFBO, the header's stored offsets reveal the basis the file was
+    //! actually written with; reuse it so the rewritten header keeps pointing
+    //! the client at the same chunks.
+    std::uint32_t calibrate_basis_without_mcin(std::vector<std::uint8_t> const& bytes,
+                                               RootLayout const& layout,
+                                               std::uint32_t fallback)
+    {
+      if (!layout.mhdr || layout.mhdr->size < mhdr_payload_size)
+        return fallback;
+
+      struct basis_probe { std::uint32_t magic; std::size_t field; };
+      for (auto const& probe
+           : {basis_probe{MCC_MH2O, static_cast<std::size_t>(offsetof(MHDR, mh2o))},
+              basis_probe{MCC_MFBO, static_cast<std::size_t>(offsetof(MHDR, mfbo))}})
+      {
+        for (auto const& chunk : layout.chunks)
+        {
+          if (chunk.magic != probe.magic)
+            continue;
+          std::uint32_t const stored = read_u32(bytes, layout.mhdr->payload + probe.field);
+          if (stored == 0 || chunk.offset < stored)
+            continue;
+          auto const candidate = static_cast<std::uint32_t>(chunk.offset - stored);
+          if (candidate >= layout.mhdr->offset && candidate <= chunk.offset)
+            return candidate;
+        }
+      }
+      return fallback;
+    }
+
   std::vector<std::uint8_t> ModernAdtWriter::writeRoot(
       AdtFormatProfile const& profile,
       std::vector<std::uint8_t> const& original_root,
       NativeRootInput const& input)
   {
     auto const original_layout = collect_root_layout(original_root, "original ROOT");
-    if (!original_layout.mver || !original_layout.mhdr || !original_layout.mcin)
-      throw ModernAdtWriterError("Original ROOT lacks MVER/MHDR/MCIN; cannot rewrite natively.");
+    // MCIN is optional: retail ROOT files may omit it (probe: azeroth tiles
+    // whose ROOT walks MVER MHDR MH2O MFBO MCNK... with no MCIN at all), and
+    // refusing those forced whole tiles down the lossy synthesized path.
+    if (!original_layout.mver || !original_layout.mhdr)
+      throw ModernAdtWriterError("Original ROOT lacks MVER/MHDR; cannot rewrite natively.");
     if (original_layout.mhdr->size < mhdr_payload_size)
       throw ModernAdtWriterError("Original ROOT MHDR is truncated.");
     if (original_layout.mcnks.size() != profile.mcnk_count)
       throw ModernAdtWriterError("Original ROOT does not contain exactly "
                                  + std::to_string(profile.mcnk_count) + " MCNK chunks.");
 
-    std::uint32_t const basis = mhdr_offset_basis(original_root, original_layout.mhdr,
-                                                  original_layout.mcin);
+    std::uint32_t basis = mhdr_offset_basis(original_root, original_layout.mhdr,
+                                            original_layout.mcin);
+    if (!original_layout.mcin)
+      basis = calibrate_basis_without_mcin(original_root, original_layout, basis);
 
     // MCIN entry template: keep flags/asyncID of the original entries.
     std::vector<std::uint8_t> mcin_template(mcin_payload_size, 0);
-    if (original_layout.mcin->size == mcin_payload_size)
+    if (original_layout.mcin && original_layout.mcin->size == mcin_payload_size)
       mcin_template = payload_bytes(original_root, *original_layout.mcin);
 
     std::vector<std::uint8_t> output;
@@ -950,6 +987,15 @@ namespace Noggit::Formats::ADT
         write_u32(payload, offsetof(MHDR, flags), input.mhdr_flags);
         auto bytes = make_chunk(MCC_MHDR, payload);
         output.insert(output.end(), bytes.begin(), bytes.end());
+        if (!original_layout.mcin)
+        {
+          // The output contract - validatePart and Noggit's split-ADT gate -
+          // wants MCIN even when the retail original had none; the client
+          // accepts either form. Emit a zeroed MCIN right after MHDR (retail's
+          // own position for it); patch_root_bookkeeping fills in real indices.
+          auto mcin_bytes = make_chunk(MCC_MCIN, mcin_template);
+          output.insert(output.end(), mcin_bytes.begin(), mcin_bytes.end());
+        }
         break;
       }
       case MCC_MCIN:

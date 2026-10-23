@@ -258,7 +258,12 @@ namespace Noggit
 
     if (!unsafe_uid_is_used(uid))
     {
-      LogError << "Trying to unload an instance that wasn't stored" << std::endl;
+      // Expected churn, not a fault: a model instance spanning several ADTs
+      // is enumerated by every tile referencing it, and tile unload order is
+      // arbitrary (worst at teardown), so an already-removed uid arriving
+      // here is normal. The guard below keeps it harmless.
+      LogDebug << "Skipping unload of model instance uid " << uid
+               << ": already unloaded (or never stored)." << std::endl;
       return;
     }
 

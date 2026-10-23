@@ -20,7 +20,7 @@ Ground truth used throughout:
 
 * wowdev.wiki ADT v18 / WDT / WDL.
 * `tools/adt_format_check.cpp`, a Qt-free harness that links the real writer,
-  reader and converter and asserts the conventions below (115 checks).
+  reader and converter and asserts the conventions below (238 checks).
 
 ## 1. Split-ADT architecture — implemented
 
@@ -79,13 +79,34 @@ when the source carries them.
   MCIN(4096); stripping it would diverge from retail. This fork keeps it and
   uses the retail size convention (payload + 8 byte tag), which the harness
   pins.
+* MCIN is not universal, though: field logs (azeroth, 9.2.7 client) show
+  retail ROOTs that legitimately omit MCIN - the client evidently walks MCNK
+  sequentially as well. The native writer accepts a MCIN-less original,
+  synthesizes the MCIN right after MHDR (retail's own position for it) and
+  calibrates the MHDR offset basis from the original's MH2O/MFBO anchors
+  instead of the legacy guess. The usability and merge gates no longer
+  require MCIN. Before this, 62 azeroth tiles had both the project override
+  and the CASC original refused and fell to the lossy synthesized path on
+  every save. Harness-covered.
 * Spec error: `MCLV` does not exist in ADT v18 (the WDT's MCLV flag is
   forbidden since 8.x). Nothing to implement.
 * Spec error: `MMDX`/`MWMO`/`MTEX`/`MMID`/`MWID` do not belong in a modern
   `_obj0.adt` (probe above). They are legacy monolithic or OBJ1/LOD tables.
+* The satellite parts are not uniform either: a tile without matching
+  references can carry an OBJ1 (or OBJ0) with no per-chunk MCNK sections at
+  all, and an OBJ1 without LOD placements carries none of
+  MLDD/MLDX/MLDL/MDLI/MLMD/MLMX/MLFD. The usability gate accepts these
+  (MVER suffices for TEX0/OBJ0/OBJ1; ROOT needs MHDR + MCNK), and
+  `rewrite_obj1` passes a zero-LOD-chunk OBJ1 through byte for byte - there
+  is nothing to remap - while still refusing genuinely partial LOD layouts.
+  Before this, 89 retail OBJ1 parts were judged unusable and 27 tiles failed
+  **both** save paths ("OBJ1 has an unsupported LOD placement layout"),
+  leaving those tiles with none of their edits on disk.
 * Spec error: `MFBO` is not mandatory; it is gated by MHDR flag bit 0 and
   absent from some retail maps. Merge preserves it; synthesis omits it with
-  the flag clear, which is what retail does for maps without it.
+  the flag clear, which is what retail does for maps without it. A loaded
+  tile that announces MFBO but carries none logs informationally (a retail
+  data quirk, not a Noggit failure) and keeps empty bounds.
 
 ## 4. Binary alignment and offsets — implemented, one spec correction
 
@@ -118,6 +139,15 @@ when the source carries them.
 * The save reports, per tile, which path ran, which parts reached disk, and
   every loss (unresolved textures, dropped placements, invented IDs), so a
   client-side crash can be attributed from the log alone.
+* The GUID scan (`searchMaxUID`) reads each tile by the WDT's MAID
+  FileDataIDs first, falling back to path resolution: a modded or partial
+  listfile can map tile paths to stale ids whose content CASC does not hold
+  (observed on azeroth `_obj0` reads), which made the scan skip tiles and
+  risked GUID reuse for new placements on them.
+* Model keys for the synthetic `world/nodxt/detail/filedataid:<N>` ground
+  effect paths recover the embedded FileDataID at the model-manager choke
+  point, so a path-only key from any call site no longer dies with
+  `fdid=<none>`.
 
 ## 6. Export pipeline — implemented
 

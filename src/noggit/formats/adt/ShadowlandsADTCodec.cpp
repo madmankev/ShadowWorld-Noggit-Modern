@@ -121,15 +121,23 @@ namespace Noggit::Formats::ADT
         case ShadowlandsADTPart::Root:
           if (!has(fourcc('M', 'H', 'D', 'R')))
             return no("it has no MHDR chunk");
-          if (!has(fourcc('M', 'C', 'I', 'N')))
-            return no("it has no MCIN chunk");
+          if (!has(fourcc('M', 'C', 'N', 'K')))
+            return no("it has no MCNK chunk");
+          // MCIN is deliberately NOT required: retail ROOT files may omit it
+          // (the client walks MCNK sequentially), and the native writer now
+          // synthesizes one. Requiring it rejected the CASC originals of 62
+          // azeroth tiles and forced them down the lossy synthesized path.
           if (has(fourcc('M', 'T', 'E', 'X')) || has(fourcc('M', 'M', 'D', 'X')))
             return no("it carries MTEX/MMDX, i.e. a legacy monolithic ADT");
           return true;
         case ShadowlandsADTPart::Tex0:
         case ShadowlandsADTPart::Obj0:
         case ShadowlandsADTPart::Obj1:
-          return has(fourcc('M', 'C', 'N', 'K')) ? true : no("it has no MCNK chunk");
+          // MCNK is optional in the satellite parts: a retail OBJ1 (or OBJ0)
+          // on a tile with no matching references carries no per-chunk
+          // sections at all. Requiring MCNK rejected 89 genuine retail OBJ1
+          // parts and their CASC originals alike.
+          return true;
         case ShadowlandsADTPart::Lod:
           return true;
         }
@@ -832,6 +840,16 @@ namespace Noggit::Formats::ADT
       auto const* mlmd_chunk = find_chunk(chunks, fourcc('M','L','M','D'));
       auto const* mlmx_chunk = find_chunk(chunks, fourcc('M','L','M','X'));
       auto const* mlfd_chunk = find_chunk(chunks, fourcc('M','L','F','D'));
+      if (!mldd_chunk && !mldx_chunk && !mldl_chunk && !mdli_chunk
+          && !mlmd_chunk && !mlmx_chunk && !mlfd_chunk)
+      {
+        // A retail OBJ1 on a tile without LOD placements carries none of the
+        // LOD chunks; there is nothing to remap, so the part passes through
+        // byte for byte. Throwing here failed BOTH save paths for 27 azeroth
+        // tiles ("OBJ1 has an unsupported LOD placement layout"), leaving
+        // those tiles with none of their edits on disk.
+        return obj1;
+      }
       if (!mldd_chunk || !mldx_chunk || !mldl_chunk || !mlmd_chunk || !mlmx_chunk
           || !mlfd_chunk || mlfd_chunk->size != 12 * sizeof(std::uint32_t))
         throw std::runtime_error("OBJ1 has an unsupported LOD placement layout.");
@@ -1331,8 +1349,10 @@ namespace Noggit::Formats::ADT
         auto const chunks =
           parse_chunks(backing.part(ShadowlandsADTPart::Root).bytes, "original ROOT");
 
+        // MCIN is not in this list: the native writer synthesizes one when
+        // the retail original omits it (see writeRoot).
         for (auto const magic : {fourcc('M','V','E','R'), fourcc('M','H','D','R'),
-                                 fourcc('M','C','I','N')})
+                                 fourcc('M','C','N','K')})
         {
           if (!find_chunk(chunks, magic))
             return fail("original ROOT is missing a chunk the writer needs");

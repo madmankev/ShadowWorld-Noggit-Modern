@@ -239,7 +239,7 @@ private:
 	// there instead of being logged one line per tile (a partially installed
 	// map can have hundreds of unreadable object files; callers report a
 	// single aggregated summary).
-	uint32_t getHighestGUIDFromFile(const std::string& pFilename, std::vector<std::string>* read_failures = nullptr) const;
+	uint32_t getHighestGUIDFromFile(const std::string& pFilename, std::vector<std::string>* read_failures = nullptr, int tile_x = -1, int tile_z = -1) const;
 
   bool _uid_fix_all_in_progress = false;
 

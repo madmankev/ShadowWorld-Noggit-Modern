@@ -571,9 +571,14 @@ void MapTile::finishLoadingShadowlandsTerrainOnly()
     }
     else
     {
-      LogError << "[ModernADT] tile " << index.x << ',' << index.z
-               << ": MHDR flag 0x1 announces MFBO flight bounds but no valid MFBO"
-                  " chunk was found; the bounds stay empty." << std::endl;
+      // Retail data quirk, not a read failure: some retail tiles announce
+      // MFBO in the MHDR flags while carrying no MFBO chunk at all (see the
+      // spec audit, MFBO section). Nothing can be recovered; the empty
+      // bounds are the correct result, so this is informational.
+      Log << "[ModernADT] tile " << index.x << ',' << index.z
+          << ": the retail ROOT announces MFBO flight bounds in its MHDR"
+             " flags but carries no MFBO chunk; the bounds stay empty."
+          << std::endl;
     }
   }
 

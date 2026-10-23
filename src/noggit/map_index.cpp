@@ -428,7 +428,12 @@ namespace
 
       try
       {
-        BlizzardArchive::ClientFile source(name, client_data);
+        // Read by the MPHD FileDataID: the auxiliary WDTs are frequently
+        // absent from the listfile, and the path-only read then fails even
+        // though the id is known and valid ("could not be copied ... CASC
+        // error 2" for azeroth_tex.wdt and friends).
+        BlizzardArchive::ClientFile source(
+          BlizzardArchive::Listfile::FileKey(name, fdid), client_data);
         std::vector<char> data(source.getBuffer(),
                                source.getBuffer() + source.getSize());
         BlizzardArchive::ClientFile target(name, client_data,
@@ -1478,7 +1483,7 @@ void MapIndex::set_sort_models_by_size_class(bool state)
 }
 
 
-uint32_t MapIndex::getHighestGUIDFromFile(const std::string& pFilename, std::vector<std::string>* read_failures) const
+uint32_t MapIndex::getHighestGUIDFromFile(const std::string& pFilename, std::vector<std::string>* read_failures, int tile_x, int tile_z) const
 {
     uint32_t highGUID = 0;
     auto* client_data = Noggit::Application::NoggitApplication::instance()->clientData();
@@ -1501,12 +1506,49 @@ uint32_t MapIndex::getHighestGUIDFromFile(const std::string& pFilename, std::vec
     {
       scan_path = client_data->exists(obj0_path.string()) ? obj0_path.string() : pFilename;
 
-      BlizzardArchive::ClientFile file(scan_path, client_data);
-      if (file.isEof() || file.getSize() < 8)
-        return highGUID;
+      // Prefer the MAID FileDataIDs of the map's own WDT: a modded or partial
+      // listfile can resolve the tile paths to stale ids whose content CASC
+      // does not hold (observed: azeroth _obj0 reads failed by path while the
+      // editor loaded the very same parts through their MAID ids). The MAID
+      // ids are what the client itself loads the tile with.
+      std::uint32_t maid_fdid = 0;
+      if (_parsedWdt.maid_present && _parsedWdt.maid.size() == 4096
+          && tile_x >= 0 && tile_x < 64 && tile_z >= 0 && tile_z < 64)
+      {
+        auto const& maid = _parsedWdt.maid[static_cast<std::size_t>(tile_z) * 64 + tile_x];
+        maid_fdid = (scan_path == obj0_path.string()) ? maid.obj0_adt : maid.root_adt;
+      }
 
-      file_bytes.assign(reinterpret_cast<std::uint8_t const*>(file.getBuffer()),
-                        reinterpret_cast<std::uint8_t const*>(file.getBuffer()) + file.getSize());
+      auto read_keyed = [client_data](BlizzardArchive::Listfile::FileKey key,
+                                      std::vector<std::uint8_t>& out) -> bool
+      {
+        BlizzardArchive::ClientFile file(key, client_data);
+        if (file.isEof() || file.getSize() < 8)
+          return false;
+        out.assign(reinterpret_cast<std::uint8_t const*>(file.getBuffer()),
+                   reinterpret_cast<std::uint8_t const*>(file.getBuffer()) + file.getSize());
+        return true;
+      };
+
+      bool have_bytes = false;
+      if (maid_fdid)
+      {
+        try
+        {
+          have_bytes = read_keyed(BlizzardArchive::Listfile::FileKey(scan_path, maid_fdid),
+                                  file_bytes);
+        }
+        catch (...)
+        {
+          have_bytes = false;
+        }
+      }
+      if (!have_bytes)
+        have_bytes = read_keyed(BlizzardArchive::Listfile::FileKey(scan_path,
+                                                                   client_data->listfile()),
+                                file_bytes);
+      if (!have_bytes)
+        return highGUID;
     }
     catch (std::exception const& e)
     {
@@ -2163,7 +2205,7 @@ void MapIndex::searchMaxUID()
         continue;
       }
 
-      highestGUID = std::max(highestGUID, getHighestGUIDFromFile(filename.str(), &read_failures));
+      highestGUID = std::max(highestGUID, getHighestGUIDFromFile(filename.str(), &read_failures, x, z));
     }
   }
 

@@ -865,7 +865,10 @@ namespace Noggit::Formats::Conversion
     auto wdt_bytes = source.read_file(base + ".wdt");
     if (!wdt_bytes)
     {
-      add_error("cannot read " + base + ".wdt");
+      add_error("cannot read " + base + ".wdt from the selected source"
+                " (client source: the listfile may not resolve the path;"
+                " project source: the file may not be saved in the project"
+                " folder)");
       return report;
     }
 
@@ -977,6 +980,14 @@ namespace Noggit::Formats::Conversion
           }
           if (auto bytes = source.read_file(canonical))
             return *bytes;
+          // Last resort: read by the raw FileDataID. A partial/custom listfile
+          // resolves neither the MAID id nor the canonical path, but CASC can
+          // still serve the file by id.
+          if (fdid && source.read_fdid)
+          {
+            if (auto bytes = source.read_fdid(fdid))
+              return *bytes;
+          }
           return {};
         };
 

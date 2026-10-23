@@ -1250,6 +1250,226 @@ int main()
     check(!small_result.ok, "a malformed MAOF refuses the rebuild rather than lose tiles");
   }
 
+  std::printf("\nROOT without MCIN (retail variant)\n");
+  {
+    // Retail ROOT files may omit MCIN entirely (observed on azeroth tiles:
+    // MVER MHDR MH2O MFBO MCNK... with no MCIN). Requiring it made every
+    // save of such a tile refuse the merge and the native path alike and
+    // fall to the lossy synthesized fallback, dropping MTXP/MHID and the
+    // real FileDataIDs (62 azeroth tiles in one session).
+    ConversionOptions options;
+    options.target = MapFormat::modern;
+    options.map_name = "emeralddream";
+    options.convert_liquids = true;
+    options.include_wdl = false;
+
+    auto source = make_source(known);
+    FdidAllocator fdids(options.custom_fdid_base);
+    auto const legacy = build_legacy_adt(true, 2, 5, false, false, true, 1);
+    auto const result = convertAdtLegacyToModern(legacy, options, source, fdids);
+    check(result.ok && !result.root.empty(), "fixture: modern ROOT with liquids");
+
+    auto rd32 = [](std::vector<std::uint8_t> const& b, std::size_t at)
+    {
+      return std::uint32_t(b[at]) | (std::uint32_t(b[at + 1]) << 8)
+           | (std::uint32_t(b[at + 2]) << 16) | (std::uint32_t(b[at + 3]) << 24);
+    };
+    auto wr32 = [](std::vector<std::uint8_t>& b, std::size_t at, std::uint32_t v)
+    {
+      b[at] = std::uint8_t(v); b[at + 1] = std::uint8_t(v >> 8);
+      b[at + 2] = std::uint8_t(v >> 16); b[at + 3] = std::uint8_t(v >> 24);
+    };
+
+    // Strip the MCIN chunk out of the converted ROOT, mimicking the retail
+    // MCIN-less file.
+    std::vector<std::uint8_t> no_mcin;
+    {
+      std::size_t pos = 0;
+      while (pos + 8 <= result.root.size())
+      {
+        std::uint32_t const magic = rd32(result.root, pos);
+        std::uint32_t const size = rd32(result.root, pos + 4);
+        std::size_t end = pos + 8 + size;
+        if (end > result.root.size())
+          end = result.root.size();
+        if (magic != fc('M', 'C', 'I', 'N'))
+          no_mcin.insert(no_mcin.end(),
+                         result.root.begin() + pos, result.root.begin() + end);
+        pos = end;
+      }
+    }
+    check(no_mcin.size() < result.root.size(), "fixture: the MCIN chunk was stripped");
+
+    // Re-anchor MHDR.mh2o against a known basis, the way a real file that
+    // was written without MCIN would be.
+    std::uint32_t const chosen_basis = 0x34;
+    std::size_t mhdr_payload = 0, mh2o_pos = 0;
+    {
+      std::size_t pos = 0;
+      while (pos + 8 <= no_mcin.size())
+      {
+        std::uint32_t const magic = rd32(no_mcin, pos);
+        std::uint32_t const size = rd32(no_mcin, pos + 4);
+        if (magic == fc('M', 'H', 'D', 'R')) mhdr_payload = pos + 8;
+        if (magic == fc('M', 'H', '2', 'O')) mh2o_pos = pos;
+        pos += 8 + size;
+      }
+    }
+    check(mhdr_payload && mh2o_pos, "fixture: the stripped ROOT keeps MHDR and MH2O");
+    wr32(no_mcin, mhdr_payload + offsetof(MHDR, mh2o),
+         static_cast<std::uint32_t>(mh2o_pos - chosen_basis));
+    wr32(no_mcin, mhdr_payload + offsetof(MHDR, mcin), 0);
+
+    bool native_ok = true;
+    std::string native_why;
+    std::vector<std::uint8_t> rewritten;
+    try
+    {
+      auto input = ModernAdtWriter::rootInputFromLegacy(profile, legacy);
+      rewritten = ModernAdtWriter::writeRoot(profile, no_mcin, input);
+      ModernAdtWriter::validatePartOrThrow(profile, rewritten, AdtPartExpectation::Root,
+                                           "ROOT part");
+    }
+    catch (std::exception const& e)
+    {
+      native_ok = false;
+      native_why = e.what();
+    }
+    if (!native_ok)
+      std::printf("    native writer on MCIN-less ROOT: %s\n", native_why.c_str());
+    check(native_ok, "the native ROOT writer rewrites a retail ROOT that has no MCIN");
+
+    if (native_ok)
+    {
+      // The output must carry a synthesized MCIN whose entries point at the
+      // real MCNK chunks, and the header references must use the basis
+      // calibrated from the original MH2O anchor (0x34), not a guess.
+      std::size_t pos = 0, mcin_pos = 0, out_mh2o = 0, out_mhdr_payload = 0;
+      std::size_t mcnk_positions[256] = {};
+      std::size_t mcnk_count = 0;
+      while (pos + 8 <= rewritten.size())
+      {
+        std::uint32_t const magic = rd32(rewritten, pos);
+        std::uint32_t const size = rd32(rewritten, pos + 4);
+        if (magic == fc('M', 'C', 'I', 'N')) mcin_pos = pos;
+        if (magic == fc('M', 'H', 'D', 'R')) out_mhdr_payload = pos + 8;
+        if (magic == fc('M', 'H', '2', 'O')) out_mh2o = pos;
+        if (magic == fc('M', 'C', 'N', 'K') && mcnk_count < 256)
+          mcnk_positions[mcnk_count++] = pos;
+        pos += 8 + size;
+      }
+      check(mcin_pos && mcnk_count == 256,
+            "the rewritten ROOT carries MCIN and all 256 MCNK chunks");
+      if (mcin_pos && out_mhdr_payload)
+        check(rd32(rewritten, out_mhdr_payload + offsetof(MHDR, mcin))
+                == static_cast<std::uint32_t>(mcin_pos - chosen_basis),
+              "MHDR.mcin uses the basis calibrated from the original MH2O anchor");
+      if (out_mh2o && out_mhdr_payload)
+        check(rd32(rewritten, out_mhdr_payload + offsetof(MHDR, mh2o))
+                == static_cast<std::uint32_t>(out_mh2o - chosen_basis),
+              "MHDR.mh2o keeps pointing at the MH2O chunk under the calibrated basis");
+      bool entries_ok = mcin_pos != 0 && mcnk_count == 256;
+      for (std::size_t i = 0; entries_ok && i < 256; ++i)
+      {
+        std::size_t const entry = mcin_pos + 8 + i * sizeof(ENTRY_MCIN);
+        if (rd32(rewritten, entry) != mcnk_positions[i])
+          entries_ok = false;
+      }
+      check(entries_ok, "every synthesized MCIN entry points at its real MCNK chunk");
+    }
+  }
+
+  std::printf("\nconversion source reading by FileDataID\n");
+  {
+    // With a partial custom listfile neither the MAID ids nor the canonical
+    // paths resolve (the field session ran on a listfile.csv that did not
+    // cover the azeroth parts), and the modern->legacy conversion skipped
+    // every tile although CASC could have served each file by id. read_fdid
+    // is that last resort.
+    ConversionOptions mod_options;
+    mod_options.target = MapFormat::modern;
+    mod_options.map_name = "test";
+    mod_options.convert_liquids = true;
+    mod_options.include_wdl = false;
+    auto mod_source = make_source(known);
+    FdidAllocator mod_fdids(mod_options.custom_fdid_base);
+    auto const parts =
+      convertAdtLegacyToModern(build_legacy_adt(true, 1, 0), mod_options, mod_source, mod_fdids);
+    check(parts.ok && !parts.root.empty() && !parts.tex0.empty() && !parts.obj0.empty(),
+          "fixture: modern parts for the fdid-source test");
+
+    std::size_t const tile_i = 34 * 64 + 12;
+    std::uint32_t const root_fdid = 4242001;
+    std::uint32_t const obj0_fdid = 4242002;
+    std::uint32_t const obj1_fdid = 4242003;
+    std::uint32_t const tex0_fdid = 4242004;
+
+    std::vector<std::uint8_t> wdt;
+    {
+      Writer w;
+      w.tag(fc('M', 'V', 'E', 'R')); w.u32(4); w.u32(18);
+      w.tag(fc('M', 'P', 'H', 'D')); w.u32(32);
+      w.u32(0x200);            // wdt_has_maid
+      w.zeros(28);             // words [1..7]
+      w.tag(fc('M', 'A', 'I', 'N')); w.u32(4096 * 8);
+      std::size_t const main_at = w.position();
+      w.zeros(4096 * 8);
+      w.patch_u32(main_at + tile_i * 8, 1);
+      w.tag(fc('M', 'A', 'I', 'D')); w.u32(4096 * 32);
+      std::size_t const maid_at = w.position();
+      w.zeros(4096 * 32);
+      w.patch_u32(maid_at + tile_i * 32 + 0, root_fdid);
+      w.patch_u32(maid_at + tile_i * 32 + 4, obj0_fdid);
+      w.patch_u32(maid_at + tile_i * 32 + 8, obj1_fdid);
+      w.patch_u32(maid_at + tile_i * 32 + 12, tex0_fdid);
+      wdt = w.b;
+    }
+
+    ConversionOptions options;
+    options.target = MapFormat::wotlk;
+    options.map_name = "Test";
+    options.map_id = 1234;
+    options.convert_liquids = true;
+    options.include_wdl = false;
+
+    auto fdid_source = make_source({});
+    fdid_source.read_file = [&wdt](std::string const& path)
+      -> std::optional<std::vector<std::uint8_t>>
+    {
+      // Only the WDT resolves by path; every ADT part is invisible to the
+      // listfile, exactly like the partial CSV in the field session.
+      if (path == "world/maps/test/test.wdt")
+        return wdt;
+      return std::nullopt;
+    };
+    fdid_source.fdid_to_path = [](std::uint32_t) { return std::string{}; };
+    fdid_source.read_fdid = [&parts, root_fdid, obj0_fdid, tex0_fdid](std::uint32_t fdid)
+      -> std::optional<std::vector<std::uint8_t>>
+    {
+      if (fdid == root_fdid) return parts.root;
+      if (fdid == tex0_fdid) return parts.tex0;
+      if (fdid == obj0_fdid) return parts.obj0;
+      return std::nullopt;
+    };
+
+    auto const report = convertMap(options, fdid_source);
+    for (std::size_t i = 0; i < report.errors.size() && i < 5; ++i)
+      std::printf("    error: %s\n", report.errors[i].c_str());
+    check(report.tiles_converted == 1,
+          "the tile converts when only read_fdid can serve its parts");
+    bool wrote_legacy_tile = false;
+    for (auto const& f : report.files)
+      if (f.relative_path == "World/Maps/Test/Test_12_34.adt")
+        wrote_legacy_tile = true;
+    check(wrote_legacy_tile, "the legacy monolithic tile is in the report");
+
+    auto blind_source = fdid_source;
+    blind_source.read_fdid = nullptr;
+    auto const blind = convertMap(options, blind_source);
+    check(blind.tiles_converted == 0,
+          "without read_fdid the same tile is skipped (contrast)");
+  }
+
   std::printf("\nmap export pipeline\n");
   {
     namespace Export = Noggit::Formats::Export;

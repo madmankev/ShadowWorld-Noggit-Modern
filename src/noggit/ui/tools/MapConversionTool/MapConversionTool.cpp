@@ -41,29 +41,65 @@ namespace Noggit::Ui::Tools::MapConversionTool
 
   namespace
   {
-    std::vector<std::uint8_t> readClientFile(BlizzardArchive::ClientData* client_data,
-                                             std::string const& normalized_path)
-    {
-      try
-      {
-        BlizzardArchive::Listfile::FileKey key(normalized_path);
-        BlizzardArchive::ClientFile file(key, client_data);
-        auto const size = file.getSize();
-        auto const* buffer = reinterpret_cast<std::uint8_t const*>(file.getBuffer());
-        return std::vector<std::uint8_t>(buffer, buffer + size);
-      }
-      catch (...)
-      {
-        return {};
-      }
-    }
-
     std::string backslashPath(std::string path)
     {
       for (char& c : path)
         if (c == '/')
           c = '\\';
       return path;
+    }
+
+    //! Read one client file, trying every key that can resolve it.
+    //!
+    //! A path-only FileKey carries no FileDataID unless the listfile resolves
+    //! one, and the CASC read then fails without a word - with a partial
+    //! custom listfile every client-source conversion died on "cannot read
+    //! <map>.wdt" before a single tile was attempted. Mirror the editor's
+    //! read_casc_original chain: deduced component key, listfile path keys in
+    //! both slash styles, then the raw FileDataID.
+    std::vector<std::uint8_t> readClientFile(BlizzardArchive::ClientData* client_data,
+                                             std::string const& normalized_path)
+    {
+      auto attempt = [client_data](BlizzardArchive::Listfile::FileKey key)
+        -> std::vector<std::uint8_t>
+      {
+        try
+        {
+          BlizzardArchive::ClientFile file(key, client_data);
+          auto const size = file.getSize();
+          if (!size)
+            return {};
+          auto const* buffer = reinterpret_cast<std::uint8_t const*>(file.getBuffer());
+          return std::vector<std::uint8_t>(buffer, buffer + size);
+        }
+        catch (...)
+        {
+          return {};
+        }
+      };
+
+      BlizzardArchive::Listfile::FileKey deduced(normalized_path);
+      if (client_data->listfile())
+        deduced.deduceOtherComponent(client_data->listfile());
+      if (auto bytes = attempt(deduced); !bytes.empty())
+        return bytes;
+
+      BlizzardArchive::Listfile::FileKey listed(backslashPath(normalized_path),
+                                                client_data->listfile());
+      if (auto bytes = attempt(listed); !bytes.empty())
+        return bytes;
+
+      if (client_data->listfile())
+      {
+        std::uint32_t const fdid =
+          client_data->listfile()->getFileDataID(backslashPath(normalized_path));
+        if (fdid)
+        {
+          if (auto bytes = attempt(BlizzardArchive::Listfile::FileKey(fdid)); !bytes.empty())
+            return bytes;
+        }
+      }
+      return {};
     }
   }
 
@@ -87,10 +123,35 @@ namespace Noggit::Ui::Tools::MapConversionTool
     {
       if (!client_data->listfile())
         return std::nullopt;
-      std::uint32_t const fdid = client_data->listfile()->getFileDataID(backslashPath(path));
+      std::uint32_t fdid = client_data->listfile()->getFileDataID(backslashPath(path));
+      if (!fdid)
+        fdid = client_data->listfile()->getFileDataID(path);
       if (!fdid)
         return std::nullopt;
       return fdid;
+    };
+    //! Direct FileDataID read: with a partial custom listfile many genuine
+    //! client files resolve by no path at all, yet the WDT's MAID entries
+    //! carry their true ids and CASC can still serve them.
+    source.read_fdid = [client_data](std::uint32_t fdid)
+      -> std::optional<std::vector<std::uint8_t>>
+    {
+      if (!fdid)
+        return std::nullopt;
+      try
+      {
+        BlizzardArchive::ClientFile file(BlizzardArchive::Listfile::FileKey(fdid),
+                                         client_data);
+        auto const size = file.getSize();
+        if (!size)
+          return std::nullopt;
+        auto const* buffer = reinterpret_cast<std::uint8_t const*>(file.getBuffer());
+        return std::vector<std::uint8_t>(buffer, buffer + size);
+      }
+      catch (...)
+      {
+        return std::nullopt;
+      }
     };
     source.fdid_to_path = [client_data](std::uint32_t fdid) -> std::string
     {
@@ -477,6 +538,19 @@ namespace Noggit::Ui::Tools::MapConversionTool
       _report_view->appendPlainText(
         QString("%1 FileDataID(s) were newly allocated and must be registered "
                 "(listfile/server) - see conversion_manifest.json.").arg(allocated));
+
+    // The report view is transient and a failed conversion was undiagnosable
+    // from the application log ("... 1 errors" with no content at all).
+    // Mirror the first errors and warnings into the log as well.
+    constexpr std::size_t max_logged_issues = 20;
+    for (std::size_t i = 0; i < report.errors.size() && i < max_logged_issues; ++i)
+      LogError << "[MapConversion] error: " << report.errors[i] << std::endl;
+    if (report.errors.size() > max_logged_issues)
+      LogError << "[MapConversion] ... " << (report.errors.size() - max_logged_issues)
+               << " more error(s) in the report view / conversion_manifest.json"
+               << std::endl;
+    for (std::size_t i = 0; i < report.warnings.size() && i < max_logged_issues; ++i)
+      Log << "[MapConversion] warning: " << report.warnings[i] << std::endl;
 
     Log << "[MapConversion] " << (report.ok ? "converted" : "failed to convert")
         << " map \"" << report.map_name << "\": " << report.tiles_converted << "/"

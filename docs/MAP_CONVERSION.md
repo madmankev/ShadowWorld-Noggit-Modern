@@ -222,6 +222,22 @@ Selection is user-facing in two places:
 
 Proven by the "map generations" section of `tools/adt_format_check.cpp`.
 
+## Source file resolution (both directions)
+
+The converter reads through a `ConversionFileSource`. Against a client
+(CASC) the reader mirrors the editor's hard-won chain instead of a single
+path lookup: a deduced-component `FileKey`, the listfile path key in both
+slash styles, then the raw FileDataID - a path-only key silently fails
+whenever the listfile cannot resolve it, which with a partial custom
+`listfile.csv` used to kill the whole conversion on "cannot read <map>.wdt"
+before a single tile was attempted. As a last resort for split ADT parts,
+the source can also read **directly by FileDataID** (`read_fdid`): the WDT's
+MAID ids stay authoritative even when neither listfile path resolves.
+
+Failed conversions mirror their first 20 errors (and warnings) into the
+application log; the dialog report view and `conversion_manifest.json` keep
+the full lists.
+
 ## Known fidelity limits (both directions)
 
 * FileDataIDs that the source listfile cannot resolve become manifest

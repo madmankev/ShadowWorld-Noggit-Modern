@@ -30,6 +30,38 @@ namespace
 
     return filename;
   }
+
+  //! Ground-effect doodads of the Shadowlands DB2 bridge are referenced by
+  //! synthetic "world/nodxt/detail/filedataid:<N>" paths. Several call sites
+  //! build the model key from the path alone, without the FileDataID; CASC
+  //! cannot resolve the synthetic path, so every such model died with an
+  //! "fdid=<none>" read error. Recover the id at the single choke point all
+  //! model references pass through.
+  BlizzardArchive::Listfile::FileKey key_with_embedded_fdid(
+      BlizzardArchive::Listfile::FileKey const& key)
+  {
+    if (key.fileDataID() != 0 || !key.hasFilepath())
+      return key;
+
+    std::string const& path = key.filepath();
+    static constexpr char marker[] = "filedataid:";
+    auto const pos = path.rfind(marker);
+    if (pos == std::string::npos)
+      return key;
+
+    try
+    {
+      unsigned long long const parsed =
+        std::stoull(path.substr(pos + sizeof(marker) - 1));
+      if (!parsed)
+        return key;
+      return BlizzardArchive::Listfile::FileKey(path, static_cast<std::uint32_t>(parsed));
+    }
+    catch (std::exception const&)
+    {
+      return key;
+    }
+  }
 }
 
 // ModelManager::_ is defined in AsyncObjectManagers.cpp to fix static destruction order.
@@ -99,7 +131,7 @@ void ModelManager::unload_all(Noggit::NoggitRenderContext context)
 scoped_model_reference::scoped_model_reference(BlizzardArchive::Listfile::FileKey const& file_key, Noggit::NoggitRenderContext context)
 
     : _valid(true)
-    , _file_key(file_key)
+    , _file_key(key_with_embedded_fdid(file_key))
     , _model(ModelManager::_.emplace(_file_key, context))
     , _context(context)
 
