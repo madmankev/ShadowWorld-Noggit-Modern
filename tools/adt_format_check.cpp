@@ -922,6 +922,125 @@ int main()
     check(cg[0] == 8.0f && cg[3] == -8.0f, "a valid entry is left untouched");
   }
 
+  std::printf("\nmap generations (post-WotLK families as distinct formats)\n");
+  {
+    auto const& sl = generationFeatures(MapGeneration::shadowlands_9_2_7);
+    auto const& rt = generationFeatures(MapGeneration::retail_12_x);
+    auto const& wl = generationFeatures(MapGeneration::wotlk_3_3_5);
+    check(std::string(sl.label) == "9.2.7", "the Shadowlands family is named by its version");
+    check(std::string(rt.label) == "12.x", "the retail family is named by its version");
+    check(sl.split_adt && rt.split_adt && !wl.split_adt, "only the modern families split ADTs");
+    check(!sl.wdt_mai2 && !sl.wdl_mssf, "Shadowlands carries neither MAI2 nor MSSF");
+    check(rt.wdt_mai2 && rt.wdl_mssf, "retail carries MAI2 and MSSF");
+    check(sl.wdl_mssn && rt.wdl_mssn, "both modern families carry sky scenes");
+
+    // A retail-shaped WDT: the Shadowlands family's chunks plus MAI2.
+    Writer wdt;
+    wdt.tag(fc('M', 'V', 'E', 'R')); wdt.u32(4); wdt.u32(18);
+    wdt.tag(fc('M', 'P', 'H', 'D')); wdt.u32(32);
+    wdt.u32(0x200); wdt.zeros(28);
+    wdt.tag(fc('M', 'A', 'I', 'N')); wdt.u32(16); wdt.zeros(16);
+    wdt.tag(fc('M', 'A', 'I', 'D')); wdt.u32(32); wdt.zeros(32);
+    std::size_t const mai2_at = wdt.b.size();
+    wdt.tag(fc('M', 'A', 'I', '2')); wdt.u32(16); wdt.u32(7); wdt.zeros(12);
+    auto const wdt12 = wdt.b;
+
+    auto const down = convertWdtBetweenGenerations(
+      wdt12, MapGeneration::retail_12_x, MapGeneration::shadowlands_9_2_7);
+    check(down.ok, "a retail WDT converts down to Shadowlands");
+    check(down.bytes.size() == mai2_at, "the MAI2 chunk is removed entirely");
+    check(down.bytes == std::vector<std::uint8_t>(wdt12.begin(), wdt12.begin() + mai2_at),
+          "everything before it is byte-identical");
+    bool strip_noted = false;
+    for (auto const& n : down.notes)
+      strip_noted = strip_noted || (n.find("MAI2") != std::string::npos
+                                    && n.find("stripped") != std::string::npos);
+    check(strip_noted, "the strip is reported");
+    check(detectModernGeneration(wdt12, {}) == MapGeneration::retail_12_x,
+          "MAI2 in the WDT identifies the retail family");
+    check(detectModernGeneration(down.bytes, {}) == MapGeneration::shadowlands_9_2_7,
+          "the down-converted WDT identifies as Shadowlands");
+
+    auto const up = convertWdtBetweenGenerations(
+      down.bytes, MapGeneration::shadowlands_9_2_7, MapGeneration::retail_12_x);
+    check(up.ok, "a Shadowlands WDT converts up to retail");
+    check(up.bytes == down.bytes, "no bytes are invented going up");
+    bool absent_noted = false;
+    for (auto const& n : up.notes)
+      absent_noted = absent_noted || (n.find("MAI2") != std::string::npos
+                                      && n.find("stays absent") != std::string::npos);
+    check(absent_noted, "a missing MAI2 is reported rather than fabricated");
+
+    auto const same = convertWdtBetweenGenerations(
+      wdt12, MapGeneration::retail_12_x, MapGeneration::retail_12_x);
+    check(same.ok && same.bytes == wdt12 && same.notes.empty(),
+          "same generation is an identity with nothing to report");
+
+    auto const refused = convertWdtBetweenGenerations(
+      wdt12, MapGeneration::retail_12_x, MapGeneration::wotlk_3_3_5);
+    check(!refused.ok && refused.bytes.empty(),
+          "WotLK on either end is refused: that is convertMap's job");
+
+    // A retail-shaped WDL: MSSN plus the MSSF the Shadowlands family lacks.
+    Writer wdl;
+    wdl.tag(fc('M', 'V', 'E', 'R')); wdl.u32(4); wdl.u32(18);
+    wdl.tag(fc('M', 'A', 'O', 'F')); wdl.u32(16); wdl.zeros(16);
+    wdl.tag(fc('M', 'S', 'S', 'N')); wdl.u32(8); wdl.u32(3); wdl.zeros(4);
+    wdl.tag(fc('M', 'S', 'S', 'F')); wdl.u32(8); wdl.u32(9); wdl.zeros(4);
+    auto const wdl12 = wdl.b;
+    std::size_t const mssf_at = wdl12.size() - 16;
+
+    auto const wdl_down = convertWdlBetweenGenerations(
+      wdl12, MapGeneration::retail_12_x, MapGeneration::shadowlands_9_2_7);
+    check(wdl_down.ok && wdl_down.bytes.size() == mssf_at, "MSSF is stripped from the WDL");
+    check(wdl_down.bytes == std::vector<std::uint8_t>(wdl12.begin(), wdl12.begin() + mssf_at),
+          "MSSN and the rest survive the strip byte-identically");
+    check(detectModernGeneration({}, wdl12) == MapGeneration::retail_12_x,
+          "MSSF in the WDL identifies the retail family");
+    check(detectModernGeneration({}, wdl_down.bytes) == MapGeneration::shadowlands_9_2_7,
+          "the stripped WDL identifies as Shadowlands");
+    auto const wdl_up = convertWdlBetweenGenerations(
+      wdl_down.bytes, MapGeneration::shadowlands_9_2_7, MapGeneration::retail_12_x);
+    check(wdl_up.ok && wdl_up.bytes == wdl_down.bytes, "no MSSF is invented going up");
+
+    // Both modern families share the ADT layout, so a converted part crosses
+    // generations unchanged - after being walked and version-checked.
+    ConversionOptions gen_options;
+    gen_options.target = MapFormat::modern;
+    gen_options.map_name = "emeralddream";
+    gen_options.convert_liquids = true;
+    gen_options.include_wdl = false;
+    auto gen_source = make_source(known);
+    FdidAllocator gen_fdids(gen_options.custom_fdid_base);
+    auto const gen_result =
+      convertAdtLegacyToModern(build_legacy_adt(true, 1, 0), gen_options, gen_source, gen_fdids);
+    check(gen_result.ok && !gen_result.root.empty(), "a modern ROOT part for the crossing test");
+    if (gen_result.ok && !gen_result.root.empty())
+    {
+      auto const step = convertAdtPartBetweenGenerations(
+        gen_result.root, MapGeneration::shadowlands_9_2_7, MapGeneration::retail_12_x);
+      check(step.ok && step.bytes == gen_result.root,
+            "the part crosses modern generations verbatim");
+      bool layout_noted = false;
+      for (auto const& n : step.notes)
+        layout_noted = layout_noted || n.find("MVER 18") != std::string::npos;
+      check(layout_noted, "the shared layout is what the copy is justified by");
+
+      auto const bad_end = convertAdtPartBetweenGenerations(
+        gen_result.root, MapGeneration::shadowlands_9_2_7, MapGeneration::wotlk_3_3_5);
+      check(!bad_end.ok, "a WotLK end is refused for ADT parts too");
+
+      std::vector<std::uint8_t> const junk{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+      auto const junk_step = convertAdtPartBetweenGenerations(
+        junk, MapGeneration::shadowlands_9_2_7, MapGeneration::retail_12_x);
+      check(!junk_step.ok, "a blob that is not a modern part is refused");
+    }
+
+    ConversionOptions gen_defaults;
+    check(gen_defaults.target_generation == MapGeneration::shadowlands_9_2_7,
+          "conversions default to the family the editor saves in");
+  }
+
   std::printf("\nfirst-bad-MCNK locator\n");
   {
     auto const legacy = build_legacy_adt(true, 2, 5);

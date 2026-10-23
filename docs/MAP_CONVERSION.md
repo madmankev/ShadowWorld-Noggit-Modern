@@ -157,6 +157,53 @@ Map level:
   `MPHD` 8-byte flags); the map is directly usable by a 3.3.5 server/client
   once the missing-asset warnings are addressed.
 
+## Client generations: Shadowlands 9.2.7 vs retail 12.x
+
+`MapFormat::modern` says "not WotLK", but post-WotLK clients are not one
+family. A Shadowlands client and a current retail client (12.x) agree on the
+ADT layout and disagree on the map-level file set, and their listfiles resolve
+different FileDataIDs for the same path. The converter names the families
+explicitly so conversion between them is expressible - and so a save aimed at
+one client never silently writes the other's file set.
+
+| | `MapGeneration` | ADT | WDT | WDL |
+| --- | --- | --- | --- | --- |
+| WotLK | `wotlk_3_3_5` | monolithic, legacy layout | `MPHD`+`MAIN` | `MWMO/MWID/MODF` |
+| Shadowlands | `shadowlands_9_2_7` | split parts, MVER 18 | + `MPHD` fdid columns, `MAID` | + `MLMD/MLMX`, `MSSN/MSSC/MSSO` |
+| Retail | `retail_12_x` | split parts, MVER 18 (same layout) | + `MAI2` (12.0.5+) | + `MSSF` (Dragonflight+) |
+
+`generationFeatures()` exposes that table; `detectModernGeneration(wdt, wdl)`
+reads it back off real bytes - MAI2 in the WDT or MSSF in the WDL means
+retail, their absence means Shadowlands (the family the editor saves in).
+
+Conversion rules, by file kind:
+
+- **ADT parts** - `convertAdtPartBetweenGenerations`. The two modern families
+  share the ADT layout, so between them a part converts by validation and
+  verbatim copy: the file must walk clean and carry MVER 18, and is then
+  unchanged. WotLK on either end is refused - that is a `convertMap`
+  direction, not a generation step.
+- **WDT** - `convertWdtBetweenGenerations`. Down (retail -> Shadowlands)
+  strips MAI2 byte-exactly and keeps everything else verbatim. Up
+  (Shadowlands -> retail) passes the file through and *reports* the missing
+  MAI2 instead of inventing one: MAI2 is a per-tile FileDataID table, and
+  fabricating ids offline would write numbers the target client cannot
+  resolve. The correct source for MAI2 is the target client's own copy of the
+  WDT - the same self-heal the save path applies to stale overrides.
+- **WDL** - `convertWdlBetweenGenerations`. Identical policy for MSSF;
+  MSSN/MSSC/MSSO are carried by both families and survive untouched.
+
+`ConversionOptions::target_generation` (default
+`shadowlands_9_2_7`) selects the family `MapFormat::modern` means for a run of
+`convertMap`: the builders produce the Shadowlands shape as before, and the
+WDT/WDL then step to the chosen generation, each strip and each honest absence
+landing in the report as warnings.
+
+The Qt dialog is unchanged - it still offers the two `convertMap` directions
+against Shadowlands; the generation step is API-level, ready for a family
+picker whenever the Qt side is rebuilt. Proven by the "map generations"
+section of `tools/adt_format_check.cpp`.
+
 ## Known fidelity limits (both directions)
 
 * FileDataIDs that the source listfile cannot resolve become manifest

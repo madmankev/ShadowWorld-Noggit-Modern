@@ -36,8 +36,73 @@ namespace Noggit::Formats::Conversion
   enum class MapFormat
   {
     wotlk,   //!< 3.3.5: monolithic ADT, name-referenced objects, MCLQ
-    modern   //!< 9.2.7: split ADT parts, FileDataID references, MH2O
+    modern   //!< split ADT parts, FileDataID references, MH2O; which modern
+             //!  family is meant by ConversionOptions::target_generation
   };
+
+  //! The post-WotLK client families, as distinct formats rather than one
+  //! generic "modern".
+  //!
+  //! A Shadowlands client and a current retail client agree on the ADT layout
+  //! (MVER 18) but not on the map-level file set: the WDT carries MAI2 since
+  //! 12.0.5 and the WDL carries MSSF since Dragonflight, and their listfiles
+  //! resolve different FileDataIDs for the same path. Naming the generation is
+  //! what makes conversion between generations expressible, and what keeps a
+  //! save aimed at one client from silently writing the other's file set.
+  enum class MapGeneration
+  {
+    wotlk_3_3_5,
+    shadowlands_9_2_7,
+    retail_12_x,
+  };
+
+  struct GenerationFeatures
+  {
+    MapGeneration generation;
+    char const* label;  //!< "3.3.5", "9.2.7", "12.x"
+    bool split_adt;     //!< modern families; WotLK is monolithic
+    bool wdt_mai2;      //!< WDT MAI2, 12.0.5+
+    bool wdl_mssf;      //!< WDL MSSF, Dragonflight+
+    bool wdl_mssn;      //!< WDL sky scenes, Shadowlands+ (both modern families)
+  };
+
+  GenerationFeatures const& generationFeatures(MapGeneration generation);
+
+  //! Which modern family a map-level file set belongs to, from the chunks it
+  //! actually carries: MAI2 in the WDT or MSSF in the WDL means retail, their
+  //! absence means Shadowlands. Falls back to Shadowlands when neither file
+  //! walks, which is the family the editor saves in.
+  MapGeneration detectModernGeneration(std::vector<std::uint8_t> const& wdt,
+                                      std::vector<std::uint8_t> const& wdl);
+
+  //! The result of moving one file between generations.
+  struct GenerationConversionReport
+  {
+    bool ok = false;
+    std::vector<std::uint8_t> bytes;
+    //! What happened, per chunk: stripped because the target family does not
+    //! carry it, or left absent because authoring it offline would mean
+    //! fabricating content (per-tile FileDataIDs, sky scenes) the target client
+    //! cannot resolve.
+    std::vector<std::string> notes;
+  };
+
+  //! Convert a WDT between post-WotLK generations. Chunks the target family
+  //! does not carry are stripped byte-exactly; chunks it carries but the source
+  //! lacks are reported and left absent, never invented.
+  GenerationConversionReport convertWdtBetweenGenerations(
+      std::vector<std::uint8_t> const& source, MapGeneration from, MapGeneration to);
+
+  //! The WDL counterpart of convertWdtBetweenGenerations.
+  GenerationConversionReport convertWdlBetweenGenerations(
+      std::vector<std::uint8_t> const& source, MapGeneration from, MapGeneration to);
+
+  //! The ADT layout is identical across the modern families, so between them an
+  //! ADT part converts by validation and verbatim copy: the part must walk
+  //! clean and carry MVER 18, and is then unchanged. WotLK on either end is a
+  //! different conversion, not a generation step, and is refused here.
+  GenerationConversionReport convertAdtPartBetweenGenerations(
+      std::vector<std::uint8_t> const& source, MapGeneration from, MapGeneration to);
 
   //! Everything the converter needs from the application: reading source
   //! files and translating between paths and FileDataIDs.
@@ -66,6 +131,12 @@ namespace Noggit::Formats::Conversion
     int map_id = -1;
     //! Client build the conversion targets (registration metadata).
     std::string target_build = "9.2.7.45745";
+    //! Which modern family MapFormat::modern means here. Defaults to the
+    //! family the editor saves in; set retail_12_x to convert a map up to a
+    //! current retail client, which adds the WDT/WDL chunks that family
+    //! carries where they can be had without fabricating content, and reports
+    //! the rest.
+    MapGeneration target_generation = MapGeneration::shadowlands_9_2_7;
     //! First FileDataID handed to content the listfile cannot resolve and
     //! to the converted map files themselves. Kept far away from retail
     //! ids; must not collide with the server's own custom id range.

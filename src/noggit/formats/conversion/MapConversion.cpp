@@ -1020,6 +1020,19 @@ namespace Noggit::Formats::Conversion
     }
     else
     {
+      // buildModernWdt produces the Shadowlands family's WDT; a conversion
+      // aimed at another modern generation steps from there, stripping what
+      // the target does not carry and reporting what it carries but cannot be
+      // had without fabricating content.
+      if (to_modern && options.target_generation != MapGeneration::shadowlands_9_2_7)
+      {
+        auto step = convertWdtBetweenGenerations(
+          new_wdt, MapGeneration::shadowlands_9_2_7, options.target_generation);
+        for (auto const& note : step.notes)
+          if (step.ok) add_warning(note); else add_error(note);
+        if (step.ok)
+          new_wdt = std::move(step.bytes);
+      }
       report.files.push_back({out_base + ".wdt", std::move(new_wdt)});
     }
 
@@ -1036,7 +1049,18 @@ namespace Noggit::Formats::Conversion
           new_wdl = buildLegacyWdl(*wdl_bytes, source, fdids, wdl_issues);
         take_issues(wdl_issues, "WDL");
         if (!new_wdl.empty())
+        {
+          if (to_modern && options.target_generation != MapGeneration::shadowlands_9_2_7)
+          {
+            auto step = convertWdlBetweenGenerations(
+              new_wdl, MapGeneration::shadowlands_9_2_7, options.target_generation);
+            for (auto const& note : step.notes)
+              if (step.ok) add_warning(note); else add_error(note);
+            if (step.ok)
+              new_wdl = std::move(step.bytes);
+          }
           report.files.push_back({out_base + ".wdl", std::move(new_wdl)});
+        }
       }
     }
 
@@ -1086,6 +1110,262 @@ namespace Noggit::Formats::Conversion
   // --------------------------------------------------------------------
   // Manifest
   // --------------------------------------------------------------------
+
+  // ---- generation conversion ----
+
+  namespace
+  {
+    constexpr std::uint32_t gen_cc(char a, char b, char c, char d) noexcept
+    {
+      return (std::uint32_t(static_cast<unsigned char>(a)) << 24)
+           | (std::uint32_t(static_cast<unsigned char>(b)) << 16)
+           | (std::uint32_t(static_cast<unsigned char>(c)) << 8)
+           | std::uint32_t(static_cast<unsigned char>(d));
+    }
+
+    struct GenChunk
+    {
+      std::uint32_t magic;
+      std::size_t offset;
+      std::size_t size;
+    };
+
+    //! Walk a file's top-level chunks, requiring the walk to end exactly at the
+    //! end of the file: a generation step copies bytes verbatim, so a file it
+    //! cannot account for completely is a file it must not touch.
+    bool gen_walk(std::vector<std::uint8_t> const& bytes,
+                  std::vector<GenChunk>& out, std::string* error)
+    {
+      std::size_t pos = 0;
+      while (pos + 8 <= bytes.size())
+      {
+        GenChunk chunk{};
+        std::memcpy(&chunk.magic, bytes.data() + pos, 4);
+        std::memcpy(&chunk.size, bytes.data() + pos + 4, 4);
+        chunk.offset = pos;
+        if (chunk.size > bytes.size() - pos - 8)
+        {
+          if (error)
+            *error = "truncated chunk at offset " + std::to_string(pos);
+          return false;
+        }
+        out.push_back(chunk);
+        pos += 8 + chunk.size;
+      }
+      if (pos != bytes.size())
+      {
+        if (error)
+          *error = "the walk ends " + std::to_string(bytes.size() - pos)
+                 + " byte(s) inside a chunk tag";
+        return false;
+      }
+      return true;
+    }
+
+    std::string gen_chunk_text(std::uint32_t magic)
+    {
+      std::string text;
+      for (int shift = 24; shift >= 0; shift -= 8)
+      {
+        auto const character = static_cast<char>((magic >> shift) & 0xFF);
+        text += (character >= 32 && character < 127) ? character : '?';
+      }
+      return text;
+    }
+
+    bool gen_carries_wdt_chunk(std::uint32_t magic, GenerationFeatures const& target)
+    {
+      if (magic == gen_cc('M', 'A', 'I', '2'))
+        return target.wdt_mai2;
+      return true; // every other chunk a modern WDT carries, both families carry
+    }
+
+    bool gen_carries_wdl_chunk(std::uint32_t magic, GenerationFeatures const& target)
+    {
+      if (magic == gen_cc('M', 'S', 'S', 'F'))
+        return target.wdl_mssf;
+      return true;
+    }
+
+    bool gen_has(std::vector<GenChunk> const& chunks, std::uint32_t magic)
+    {
+      for (auto const& chunk : chunks)
+        if (chunk.magic == magic)
+          return true;
+      return false;
+    }
+
+    GenerationConversionReport gen_convert_file(std::vector<std::uint8_t> const& source,
+                                                MapGeneration from, MapGeneration to,
+                                                bool is_wdt, char const* what)
+    {
+      GenerationConversionReport report;
+
+      if (from == MapGeneration::wotlk_3_3_5 || to == MapGeneration::wotlk_3_3_5)
+      {
+        report.notes.push_back(std::string(what)
+          + ": WotLK is a different conversion (convertMap), not a step between"
+            " modern generations.");
+        return report;
+      }
+
+      if (from == to)
+      {
+        report.bytes = source;
+        report.ok = true;
+        return report;
+      }
+
+      auto const& target = generationFeatures(to);
+      std::vector<GenChunk> chunks;
+      std::string error;
+      if (!gen_walk(source, chunks, &error))
+      {
+        report.notes.push_back(std::string(what) + ": the source does not walk, "
+                               + error + "; leaving it untouched.");
+        return report;
+      }
+
+      report.bytes.reserve(source.size());
+      for (auto const& chunk : chunks)
+      {
+        bool const carried = is_wdt ? gen_carries_wdt_chunk(chunk.magic, target)
+                                    : gen_carries_wdl_chunk(chunk.magic, target);
+        if (!carried)
+        {
+          report.notes.push_back(std::string(what) + ": stripped "
+                                 + gen_chunk_text(chunk.magic) + ", which the "
+                                 + target.label + " family does not carry.");
+          continue;
+        }
+        report.bytes.insert(report.bytes.end(),
+                            source.begin() + static_cast<std::ptrdiff_t>(chunk.offset),
+                            source.begin() + static_cast<std::ptrdiff_t>(chunk.offset + 8 + chunk.size));
+      }
+
+      // Chunks the target family carries but the source lacks are reported,
+      // never invented: MAI2 is a per-tile FileDataID table and MSSF a sky-node
+      // table, and fabricating either offline would write ids and nodes the
+      // target client cannot resolve. The right source for them is the target
+      // client's own copy of the file, which is what the save path already does
+      // for stale overrides.
+      if (is_wdt && target.wdt_mai2 && !gen_has(chunks, gen_cc('M', 'A', 'I', '2')))
+        report.notes.push_back(std::string(what) + ": the " + target.label
+          + " family carries MAI2 but the source has none; it stays absent,"
+            " because authoring per-tile FileDataIDs offline would fabricate ids"
+            " the target client cannot resolve. Take it from the target client's"
+            " own WDT where one is available.");
+      if (!is_wdt && target.wdl_mssf && !gen_has(chunks, gen_cc('M', 'S', 'S', 'F')))
+        report.notes.push_back(std::string(what) + ": the " + target.label
+          + " family carries MSSF but the source has none; it stays absent rather"
+            " than fabricated.");
+
+      report.ok = true;
+      return report;
+    }
+  }
+
+  GenerationFeatures const& generationFeatures(MapGeneration generation)
+  {
+    static GenerationFeatures const wotlk = {
+      MapGeneration::wotlk_3_3_5, "3.3.5", false, false, false, false};
+    static GenerationFeatures const shadowlands = {
+      MapGeneration::shadowlands_9_2_7, "9.2.7", true, false, false, true};
+    static GenerationFeatures const retail = {
+      MapGeneration::retail_12_x, "12.x", true, true, true, true};
+
+    switch (generation)
+    {
+    case MapGeneration::wotlk_3_3_5: return wotlk;
+    case MapGeneration::retail_12_x: return retail;
+    case MapGeneration::shadowlands_9_2_7: break;
+    }
+    return shadowlands;
+  }
+
+  MapGeneration detectModernGeneration(std::vector<std::uint8_t> const& wdt,
+                                      std::vector<std::uint8_t> const& wdl)
+  {
+    std::vector<GenChunk> chunks;
+    std::string error;
+
+    if (gen_walk(wdt, chunks, &error))
+      if (gen_has(chunks, gen_cc('M', 'A', 'I', '2')))
+        return MapGeneration::retail_12_x;
+
+    chunks.clear();
+    if (gen_walk(wdl, chunks, &error))
+      if (gen_has(chunks, gen_cc('M', 'S', 'S', 'F')))
+        return MapGeneration::retail_12_x;
+
+    return MapGeneration::shadowlands_9_2_7;
+  }
+
+  GenerationConversionReport convertWdtBetweenGenerations(
+      std::vector<std::uint8_t> const& source, MapGeneration from, MapGeneration to)
+  {
+    return gen_convert_file(source, from, to, true, "WDT");
+  }
+
+  GenerationConversionReport convertWdlBetweenGenerations(
+      std::vector<std::uint8_t> const& source, MapGeneration from, MapGeneration to)
+  {
+    return gen_convert_file(source, from, to, false, "WDL");
+  }
+
+  GenerationConversionReport convertAdtPartBetweenGenerations(
+      std::vector<std::uint8_t> const& source, MapGeneration from, MapGeneration to)
+  {
+    GenerationConversionReport report;
+
+    if (from == MapGeneration::wotlk_3_3_5 || to == MapGeneration::wotlk_3_3_5)
+    {
+      report.notes.push_back("ADT part: WotLK is a different conversion"
+                             " (convertMap), not a step between modern generations.");
+      return report;
+    }
+
+    std::vector<GenChunk> chunks;
+    std::string error;
+    if (!gen_walk(source, chunks, &error))
+    {
+      report.notes.push_back("ADT part: the source does not walk, " + error + ".");
+      return report;
+    }
+
+    bool version_ok = false;
+    for (auto const& chunk : chunks)
+    {
+      if (chunk.magic != gen_cc('M', 'V', 'E', 'R'))
+        continue;
+      if (chunk.size < 4)
+        break;
+      std::uint32_t version = 0;
+      std::memcpy(&version, source.data() + chunk.offset + 8, 4);
+      version_ok = (version == 18);
+      break;
+    }
+
+    if (!version_ok)
+    {
+      report.notes.push_back("ADT part: no MVER 18 chunk; both modern families"
+                             " use version 18, so this is not a modern part.");
+      return report;
+    }
+
+    // The ADT layout is identical across the modern families: same version,
+    // same chunk set, same offsets. Conversion between them is the statement
+    // that nothing changes, checked.
+    if (from != to)
+      report.notes.push_back(std::string("ADT part: the ")
+        + generationFeatures(from).label + " and " + generationFeatures(to).label
+        + " families share the ADT layout (MVER 18); copied unchanged after the"
+          " part walked clean.");
+
+    report.bytes = source;
+    report.ok = true;
+    return report;
+  }
 
   std::string ConversionReport::manifest_json() const
   {
