@@ -171,6 +171,7 @@ one client never silently writes the other's file set.
 | WotLK | `wotlk_3_3_5` | monolithic, legacy layout | `MPHD`+`MAIN` | `MWMO/MWID/MODF` |
 | Shadowlands | `shadowlands_9_2_7` | split parts, MVER 18 | + `MPHD` fdid columns, `MAID` | + `MLMD/MLMX`, `MSSN/MSSC/MSSO` |
 | Retail | `retail_12_x` | split parts, MVER 18 (same layout) | + `MAI2` (12.0.5+) | + `MSSF` (Dragonflight+) |
+| Forever | `forever_1_60_x` | Shadowlands family (beta assumption, documented) | as Shadowlands | as Shadowlands |
 
 `generationFeatures()` exposes that table; `detectModernGeneration(wdt, wdl)`
 reads it back off real bytes - MAI2 in the WDT or MSSF in the WDL means
@@ -199,10 +200,27 @@ Conversion rules, by file kind:
 WDT/WDL then step to the chosen generation, each strip and each honest absence
 landing in the report as warnings.
 
-The Qt dialog is unchanged - it still offers the two `convertMap` directions
-against Shadowlands; the generation step is API-level, ready for a family
-picker whenever the Qt side is rebuilt. Proven by the "map generations"
-section of `tools/adt_format_check.cpp`.
+`generationFromBuildString` maps a client build string - the one
+`loadProject` detects from `.build.info` - to its generation: 3.x -> WotLK,
+4.x..9.x -> Shadowlands (the oldest modern family the editor authors), 10.x
+and up -> retail, 1.60 and up -> Forever, unparseable/unsupported -> a
+caller-chosen fallback. Forever's map files are treated as the Shadowlands
+family until research shows a divergence (its beta layouts can change between
+updates); chunk-wise the two are indistinguishable, so
+`detectModernGeneration` never *returns* Forever - only the project/client
+version can say a map is Forever.
+
+Selection is user-facing in two places:
+
+* **Tools → Convert map (WotLK <-> modern)...** has a "Modern family" picker
+  (Shadowlands 9.2.7 / Retail 12.x / Forever 1.60.x) that defaults to the
+  generation of the project's detected client build and feeds
+  `options.target_generation`.
+* **Editor → Export map for client...** asks which generation to package for
+  and steps the exported WDT/WDL to it - see
+  [`MODERN_EXPORT.md`](MODERN_EXPORT.md).
+
+Proven by the "map generations" section of `tools/adt_format_check.cpp`.
 
 ## Known fidelity limits (both directions)
 

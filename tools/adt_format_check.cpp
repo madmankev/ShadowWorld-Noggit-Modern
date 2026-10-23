@@ -1038,6 +1038,42 @@ int main()
       check(!junk_step.ok, "a blob that is not a modern part is refused");
     }
 
+    // Forever: the Shadowlands file family until research shows a divergence.
+    auto const& fv = generationFeatures(MapGeneration::forever_1_60_x);
+    check(std::string(fv.label) == "1.60.x", "Forever is named by its version");
+    check(fv.split_adt && !fv.wdt_mai2 && !fv.wdl_mssf && fv.wdl_mssn,
+          "Forever carries the Shadowlands family's features");
+
+    check(generationFromBuildString("3.3.5.12340") == MapGeneration::wotlk_3_3_5,
+          "a 3.3.5 build maps to WotLK");
+    check(generationFromBuildString("9.2.7.45745") == MapGeneration::shadowlands_9_2_7,
+          "a 9.2.7 build maps to Shadowlands");
+    check(generationFromBuildString("8.3.7.35249") == MapGeneration::shadowlands_9_2_7,
+          "builds before 9.x map to the oldest modern family the editor authors");
+    check(generationFromBuildString("12.1.5.60248") == MapGeneration::retail_12_x,
+          "a 12.x build maps to retail");
+    check(generationFromBuildString("10.2.0.1") == MapGeneration::retail_12_x,
+          "a 10.x build maps to retail");
+    check(generationFromBuildString("1.60.0.1234") == MapGeneration::forever_1_60_x,
+          "a 1.60 build maps to Forever");
+    check(generationFromBuildString("") == MapGeneration::shadowlands_9_2_7,
+          "an empty build string falls back");
+    check(generationFromBuildString("garbage", MapGeneration::wotlk_3_3_5)
+            == MapGeneration::wotlk_3_3_5,
+          "an unparseable build string uses the fallback");
+    check(generationFromBuildString("1.15.2.123") == MapGeneration::shadowlands_9_2_7,
+          "a non-Forever 1.x build falls back: classic is not an editor target");
+
+    auto const to_forever = convertWdtBetweenGenerations(
+      wdt12, MapGeneration::retail_12_x, MapGeneration::forever_1_60_x);
+    check(to_forever.ok && to_forever.bytes.size() == wdt12.size() - 24,
+          "retail -> Forever strips MAI2 like retail -> Shadowlands");
+    auto const sl_to_forever = convertWdtBetweenGenerations(
+      down.bytes, MapGeneration::shadowlands_9_2_7, MapGeneration::forever_1_60_x);
+    check(sl_to_forever.ok && sl_to_forever.bytes == down.bytes
+            && sl_to_forever.notes.empty(),
+          "Shadowlands -> Forever is byte-identical with nothing to report");
+
     ConversionOptions gen_defaults;
     check(gen_defaults.target_generation == MapGeneration::shadowlands_9_2_7,
           "conversions default to the family the editor saves in");
@@ -1433,6 +1469,131 @@ int main()
       no_wdt.files.push_back({"World/Maps/Test/Test_12_34.adt", parts.root});
       auto const r = Export::exportModernMap(options, no_wdt);
       check(!r.ok && !r.errors.empty(), "an export without a WDT is refused");
+    }
+
+    // export-version selection: the map-level files step to the chosen family
+    {
+      auto build_wdt_mai2 = [&]()
+      {
+        Writer w;
+        w.tag(fc('M','V','E','R')); w.u32(4); w.u32(18);
+        w.tag(fc('M','P','H','D')); w.u32(32);
+        w.u32(0x200); w.u32(0); w.u32(888); w.zeros(20);
+        w.tag(fc('M','A','I','N')); w.u32(4096 * 8);
+        std::size_t const main_at = w.position();
+        w.zeros(4096 * 8);
+        w.patch_u32(main_at + tile_i * 8, 1);
+        w.tag(fc('M','A','I','D')); w.u32(4096 * 32);
+        w.zeros(4096 * 32);
+        w.tag(fc('M','A','I','2')); w.u32(16); w.u32(7); w.zeros(12);
+        return w.b;
+      };
+      auto make_retail_input = [&]()
+      {
+        Export::ExportInput in;
+        in.files.push_back({"World/Maps/Test/Test.wdt", build_wdt_mai2()});
+        in.files.push_back({"World/Maps/Test/Test_12_34.adt", parts.root});
+        in.files.push_back({"World/Maps/Test/Test_12_34_tex0.adt", parts.tex0});
+        in.files.push_back({"World/Maps/Test/Test_12_34_obj0.adt", parts.obj0});
+        in.path_to_fdid = [](std::string const&) { return 0u; };
+        return in;
+      };
+      auto exported_wdt = [](Export::ExportResult const& r) -> Export::ExportFile const*
+      {
+        for (auto const& f : r.files)
+          if (f.relative_path == "World/Maps/Test/Test.wdt")
+            return &f;
+        return nullptr;
+      };
+      auto has_chunk = [](std::vector<std::uint8_t> const& b, std::uint32_t magic)
+      {
+        std::size_t pos = 0;
+        while (pos + 8 <= b.size())
+        {
+          std::uint32_t m = 0, sz = 0;
+          std::memcpy(&m, b.data() + pos, 4);
+          std::memcpy(&sz, b.data() + pos + 4, 4);
+          if (m == magic) return true;
+          if (sz > b.size() - pos - 8) return false;
+          pos += 8 + sz;
+        }
+        return false;
+      };
+
+      // retail source -> Shadowlands export: MAI2 stripped from the WDT
+      Export::ExportOptions sl_options = options;
+      sl_options.export_generation = MapGeneration::shadowlands_9_2_7;
+      auto const down_exp = Export::exportModernMap(sl_options, make_retail_input());
+      check(down_exp.ok, "a retail-source map exports to the Shadowlands family");
+      check(down_exp.source_generation == MapGeneration::retail_12_x,
+            "MAI2 in the source WDT is detected as the retail generation");
+      auto const* down_wdt = exported_wdt(down_exp);
+      check(down_wdt && !has_chunk(down_wdt->bytes, fc('M','A','I','2')),
+            "the exported WDT carries no MAI2");
+      bool step_warned = false;
+      for (auto const& w : down_exp.warnings)
+        if (w.find("generation step") != std::string::npos
+            && w.find("MAI2") != std::string::npos)
+          step_warned = true;
+      check(step_warned, "the strip is reported as a generation-step warning");
+      // the MAID assignments made before the step survive it
+      if (down_wdt)
+      {
+        std::size_t maid_at = 0;
+        std::size_t pos = 0;
+        while (pos + 8 <= down_wdt->bytes.size())
+        {
+          std::uint32_t m = 0, sz = 0;
+          std::memcpy(&m, down_wdt->bytes.data() + pos, 4);
+          std::memcpy(&sz, down_wdt->bytes.data() + pos + 4, 4);
+          if (m == fc('M','A','I','D')) maid_at = pos + 8;
+          pos += 8 + sz;
+        }
+        check(maid_at && read_u32(down_wdt->bytes, maid_at + tile_i * 32) >= 900000000u,
+              "MAID assignments survive the generation step");
+      }
+
+      // retail source -> retail export: pass-through, MAI2 kept, no step
+      Export::ExportOptions rt_options = options;
+      rt_options.export_generation = MapGeneration::retail_12_x;
+      auto const same_exp = Export::exportModernMap(rt_options, make_retail_input());
+      check(same_exp.ok && same_exp.source_generation == MapGeneration::retail_12_x,
+            "a retail export of retail bytes detects and stays retail");
+      auto const* same_wdt = exported_wdt(same_exp);
+      check(same_wdt && has_chunk(same_wdt->bytes, fc('M','A','I','2')),
+            "the retail export keeps the source MAI2");
+      bool stepped = false;
+      for (auto const& w : same_exp.warnings)
+        if (w.find("generation step") != std::string::npos) stepped = true;
+      check(!stepped, "same-generation export performs no step");
+
+      // Shadowlands source -> retail export: honest absence, no fabrication
+      auto const up_exp = Export::exportModernMap(rt_options, make_input(false, false, false));
+      check(up_exp.ok && up_exp.source_generation == MapGeneration::shadowlands_9_2_7,
+            "the Shadowlands fixture detects as Shadowlands");
+      bool absent_warned = false;
+      for (auto const& w : up_exp.warnings)
+        if (w.find("MAI2") != std::string::npos && w.find("stays absent") != std::string::npos)
+          absent_warned = true;
+      check(absent_warned, "exporting up to retail reports the absent MAI2 instead of inventing one");
+      auto const* up_wdt = exported_wdt(up_exp);
+      check(up_wdt && !has_chunk(up_wdt->bytes, fc('M','A','I','2')),
+            "no MAI2 chunk appears in the up-exported WDT");
+
+      // WotLK as export version: refused, pointing at the conversion tool
+      Export::ExportOptions bad_options = options;
+      bad_options.export_generation = MapGeneration::wotlk_3_3_5;
+      auto const refused = Export::exportModernMap(bad_options, make_input(false, false, false));
+      check(!refused.ok, "WotLK as an export version is refused");
+      bool pointed = false;
+      for (auto const& e : refused.errors)
+        if (e.find("Convert map") != std::string::npos) pointed = true;
+      check(pointed, "the refusal points at the conversion tool");
+
+      // the manifest names both generations
+      check(down_exp.manifest_json().find("\"source_generation\": \"12.x\"") != std::string::npos
+            && down_exp.manifest_json().find("\"export_generation\": \"9.2.7\"") != std::string::npos,
+            "the manifest records the source and export generations");
     }
   }
 

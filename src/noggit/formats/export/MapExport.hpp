@@ -70,6 +70,14 @@ namespace Noggit::Formats::Export
     //! First FileDataID handed to files the client does not know - the same
     //! convention (and default base) the map converter uses.
     std::uint32_t fdid_base = 900000000u;
+    //! The modern family to package the map-level files for. ADT parts are
+    //! identical across the modern families and are exported as they are;
+    //! the WDT and WDL are stepped from the generation detected in the
+    //! source bytes to this one with the generation converter (strip-only,
+    //! never fabricating). WotLK is refused: re-authoring ADT layouts is the
+    //! conversion tool's job, not the exporter's.
+    Conversion::MapGeneration export_generation =
+        Conversion::MapGeneration::shadowlands_9_2_7;
   };
 
   struct ExportInput
@@ -100,6 +108,13 @@ namespace Noggit::Formats::Export
 
     unsigned int tiles_total = 0;
     unsigned int tiles_complete = 0;
+
+    //! The generation detected in the source WDT/WDL bytes, and the one the
+    //! map-level files were stepped to (equal when nothing had to change).
+    Conversion::MapGeneration source_generation =
+        Conversion::MapGeneration::shadowlands_9_2_7;
+    Conversion::MapGeneration export_generation =
+        Conversion::MapGeneration::shadowlands_9_2_7;
 
     //! Same conventions as conversion_manifest.json: files with sizes and a
     //! content hash, fdid assignments, registration fields, warnings/errors.

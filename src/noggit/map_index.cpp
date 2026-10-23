@@ -22,6 +22,7 @@
 #include <noggit/database/SqlUIDStorage.h>
 
 #include <QtCore/QSettings>
+#include <QInputDialog>
 #include <QByteArray>
 #include <QTextStream>
 #include <QRegExp>
@@ -147,6 +148,43 @@ MapIndex::MapIndex (const std::string &pBasename, int map_id, World* world,
         LogDebug << "[WDT Load] " << filename.str() << ": " << issue.message << std::endl;
         break;
     }
+  }
+
+  if (modern_client)
+  {
+    // Name the two versions in play: the generation the WDT bytes were
+    // authored for (MAI2/MSSF are the markers) and the generation of the
+    // loaded client (from its detected build). Saving keeps the client's
+    // own WDT; the export steps map-level files between generations.
+    auto const wdt_generation =
+      Noggit::Formats::Conversion::detectModernGeneration(_rawWdt, {});
+    std::string client_build;
+    if (auto const* project = Noggit::Project::CurrentProject::get())
+      client_build = project->ClientBuild;
+    auto client_generation =
+      Noggit::Formats::Conversion::generationFromBuildString(client_build);
+    if (client_data->version() == BlizzardArchive::ClientVersion::FOREVER)
+      client_generation = Noggit::Formats::Conversion::MapGeneration::forever_1_60_x;
+
+    auto const& wdt_features =
+      Noggit::Formats::Conversion::generationFeatures(wdt_generation);
+    auto const& client_features =
+      Noggit::Formats::Conversion::generationFeatures(client_generation);
+
+    Log << "[WDT Load] " << filename.str() << ": file generation "
+        << wdt_features.label << ", client generation " << client_features.label
+        << (client_build.empty() ? std::string() : " (" + client_build + ")")
+        << std::endl;
+
+    if (wdt_features.split_adt != client_features.split_adt
+        || wdt_features.wdt_mai2 != client_features.wdt_mai2
+        || wdt_features.wdl_mssf != client_features.wdl_mssf)
+      Log << "[WDT Load] " << filename.str()
+          << ": this WDT was authored for a different client generation ("
+          << wdt_features.label << ") than the loaded client ("
+          << client_features.label << "). Saves keep the client's own WDT;"
+             " 'Export map for client...' steps the map-level files between"
+             " generations." << std::endl;
   }
 
   if (!_parsedWdt.known_skipped.empty())
@@ -539,15 +577,68 @@ void MapIndex::exportMapForClient()
   try
   {
     namespace Export = Noggit::Formats::Export;
+    using Noggit::Formats::Conversion::MapGeneration;
 
-    auto const project_root =
-      std::filesystem::path(Noggit::Project::CurrentProject::get()->ProjectPath);
+    auto const* project = Noggit::Project::CurrentProject::get();
+    auto const project_root = std::filesystem::path(project->ProjectPath);
     std::error_code ec;
+
+    // ---- export-version selection ----
+    // The client generation comes from the detected build (FOREVER projects
+    // override: their builds predate the mapping's major-version logic).
+    std::string const client_build = project ? project->ClientBuild : std::string();
+    MapGeneration client_generation =
+      Noggit::Formats::Conversion::generationFromBuildString(client_build);
+    if (client_data->version() == BlizzardArchive::ClientVersion::FOREVER)
+      client_generation = MapGeneration::forever_1_60_x;
+    auto const& client_features =
+      Noggit::Formats::Conversion::generationFeatures(client_generation);
+    std::string const client_label =
+      std::string(client_features.label)
+      + (client_build.empty() ? std::string() : " (" + client_build + ")");
+
+    QStringList choices;
+    choices.append(QString::fromStdString("Loaded client - " + client_label));
+    choices.append("Shadowlands 9.2.7");
+    choices.append("Retail 12.x");
+    choices.append("Forever 1.60.x (beta; Shadowlands-family files)");
+
+    QSettings settings;
+    int last_choice = settings.value("map_export/generation_choice", 0).toInt();
+    if (last_choice < 0 || last_choice >= choices.size())
+      last_choice = 0;
+
+    bool picked = false;
+    QString const choice = QInputDialog::getItem(
+      nullptr, "Export map for client",
+      "Export version - map-level files (WDT/WDL) are stepped to the chosen\n"
+      "family; ADT parts are identical across the modern families:",
+      choices, last_choice, false, &picked);
+    if (!picked)
+    {
+      Log << "[Map Export] Cancelled." << std::endl;
+      return;
+    }
+    int const choice_index = choices.indexOf(choice);
+    settings.setValue("map_export/generation_choice", choice_index);
+
+    MapGeneration export_generation = client_generation;
+    if (choice_index == 1)
+      export_generation = MapGeneration::shadowlands_9_2_7;
+    else if (choice_index == 2)
+      export_generation = MapGeneration::retail_12_x;
+    else if (choice_index == 3)
+      export_generation = MapGeneration::forever_1_60_x;
 
     Export::ExportOptions options;
     options.map_directory = basename;
     options.map_display_name = basename;
     options.map_id = _map_id;
+    options.export_generation = export_generation;
+
+    Log << "[Map Export] export version: "
+        << Noggit::Formats::Conversion::generationFeatures(export_generation).label
+        << "; loaded client: " << client_label << std::endl;
 
     std::string const base = "World\\Maps\\" + basename + "\\" + basename;
 

@@ -84,6 +84,7 @@ namespace Noggit::Ui::Tools::MapConversionTool
 
     QLineEdit* _map_name_edit = nullptr;
     QComboBox* _target_combo = nullptr;
+    QComboBox* _generation_combo = nullptr;
     QCheckBox* _include_wdl_check = nullptr;
     QCheckBox* _convert_liquids_check = nullptr;
     QCheckBox* _big_alpha_check = nullptr;

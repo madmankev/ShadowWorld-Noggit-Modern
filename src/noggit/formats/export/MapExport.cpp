@@ -162,6 +162,15 @@ namespace Noggit::Formats::Export
   {
     ExportResult result;
     result.options = options;
+    result.export_generation = options.export_generation;
+
+    if (options.export_generation == Conversion::MapGeneration::wotlk_3_3_5)
+    {
+      result.errors.push_back("export packages the modern families; re-authoring"
+                              " the ADT/WDT/WDL layouts for WotLK is the Convert"
+                              " map tool's job, not the exporter's");
+      return result;
+    }
 
     std::string const dir = mexp_normalize(options.map_directory);
     std::string const base = "world\\maps\\" + dir + "\\" + dir;
@@ -488,15 +497,61 @@ namespace Noggit::Formats::Export
       record(result.wdt_fdid, wdt_path, "wdt_file", false);
     }
 
-    // ---- assemble the deployable set: input files, WDT replaced ----
+    // ---- generation step: detect the family the source bytes belong to and
+    // step the map-level files to the selected export family ----
+    std::vector<std::uint8_t> wdl_original;
+    if (ExportFile const* wdl_file = find_file(wdl_path))
+      wdl_original = wdl_file->bytes;
+    result.source_generation = Conversion::detectModernGeneration(wdt, wdl_original);
+
+    std::vector<std::uint8_t> wdl_final;
+    bool have_wdl_final = false;
+    if (result.source_generation != options.export_generation)
+    {
+      auto const& from_label = Conversion::generationFeatures(result.source_generation).label;
+      auto const& to_label = Conversion::generationFeatures(options.export_generation).label;
+
+      auto wdt_step = Conversion::convertWdtBetweenGenerations(
+        wdt, result.source_generation, options.export_generation);
+      for (auto const& note : wdt_step.notes)
+        result.warnings.push_back("WDT generation step (" + std::string(from_label)
+                                  + " -> " + to_label + "): " + note);
+      if (wdt_step.ok)
+        wdt = std::move(wdt_step.bytes);
+      else
+        result.errors.push_back("the WDT could not be stepped from "
+                                + std::string(from_label) + " to " + to_label);
+
+      if (!wdl_original.empty())
+      {
+        auto wdl_step = Conversion::convertWdlBetweenGenerations(
+          wdl_original, result.source_generation, options.export_generation);
+        for (auto const& note : wdl_step.notes)
+          result.warnings.push_back("WDL generation step (" + std::string(from_label)
+                                    + " -> " + to_label + "): " + note);
+        if (wdl_step.ok)
+        {
+          wdl_final = std::move(wdl_step.bytes);
+          have_wdl_final = true;
+        }
+        else
+        {
+          result.errors.push_back("the WDL could not be stepped from "
+                                  + std::string(from_label) + " to " + to_label);
+        }
+      }
+    }
+
+    // ---- assemble the deployable set: input files, WDT (and a stepped WDL)
+    // replaced ----
     result.files = input.files;
     for (auto& file : result.files)
     {
-      if (mexp_normalize(file.relative_path) == wdt_path)
-      {
+      std::string const path = mexp_normalize(file.relative_path);
+      if (path == wdt_path)
         file.bytes = wdt;
-        break;
-      }
+      else if (have_wdl_final && path == wdl_path)
+        file.bytes = wdl_final;
     }
 
     result.ok = result.errors.empty();
@@ -521,6 +576,10 @@ namespace Noggit::Formats::Export
         << "\",\n";
     out << "  \"map_id\": " << options.map_id << ",\n";
     out << "  \"target_build\": \"" << mexp_json_escape(options.target_build) << "\",\n";
+    out << "  \"source_generation\": \""
+        << Conversion::generationFeatures(source_generation).label << "\",\n";
+    out << "  \"export_generation\": \""
+        << Conversion::generationFeatures(export_generation).label << "\",\n";
     out << "  \"stats\": {\n";
     out << "    \"tiles_total\": " << tiles_total << ",\n";
     out << "    \"tiles_complete\": " << tiles_complete << ",\n";

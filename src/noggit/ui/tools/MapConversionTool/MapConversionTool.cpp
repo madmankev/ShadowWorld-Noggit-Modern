@@ -35,6 +35,7 @@ namespace Noggit::Ui::Tools::MapConversionTool
 {
   using Noggit::Formats::Conversion::ConversionFileSource;
   using Noggit::Formats::Conversion::ConversionOptions;
+  using Noggit::Formats::Conversion::MapGeneration;
   using Noggit::Formats::Conversion::ConversionReport;
   using Noggit::Formats::Conversion::MapFormat;
 
@@ -214,6 +215,28 @@ namespace Noggit::Ui::Tools::MapConversionTool
     _target_combo->setCurrentIndex(project_is_wotlk ? 1 : 0);
     form->addRow("Convert to", _target_combo);
 
+    // Which modern family "modern" means for this run. The post-WotLK
+    // clients are distinct formats (WDT MAI2, WDL MSSF, different
+    // listfiles); the converter steps the map-level files to the family
+    // picked here and reports what it strips and what it cannot author.
+    _generation_combo = new QComboBox(form_group);
+    _generation_combo->addItem("Shadowlands 9.2.7",
+                               static_cast<int>(MapGeneration::shadowlands_9_2_7));
+    _generation_combo->addItem("Retail 12.x",
+                               static_cast<int>(MapGeneration::retail_12_x));
+    _generation_combo->addItem("Forever 1.60.x (beta; Shadowlands-family files)",
+                               static_cast<int>(MapGeneration::forever_1_60_x));
+    {
+      MapGeneration const client_generation =
+        _project
+          ? Noggit::Formats::Conversion::generationFromBuildString(_project->ClientBuild)
+          : MapGeneration::shadowlands_9_2_7;
+      int const generation_index =
+        _generation_combo->findData(static_cast<int>(client_generation));
+      _generation_combo->setCurrentIndex(generation_index >= 0 ? generation_index : 0);
+    }
+    form->addRow("Modern family", _generation_combo);
+
     _map_id_spin = new QSpinBox(form_group);
     _map_id_spin->setRange(-1, 1000000);
     _map_id_spin->setValue(-1);
@@ -291,6 +314,8 @@ namespace Noggit::Ui::Tools::MapConversionTool
 
     ConversionOptions options;
     options.target = static_cast<MapFormat>(_target_combo->currentData().toInt());
+    options.target_generation =
+      static_cast<MapGeneration>(_generation_combo->currentData().toInt());
     options.map_name = map_name;
     options.map_id = _map_id_spin->value();
     options.include_wdl = _include_wdl_check->isChecked();

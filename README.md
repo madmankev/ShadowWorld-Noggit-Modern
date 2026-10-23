@@ -96,10 +96,14 @@ Version-specific readers and writers handle the differences between clients.
     losing chunks when tiles lack `MARE` slots.
 -   **Editor → Export map for client...** packages a saved map for
     deployment: the validated file set, MAID/MPHD FileDataID assignments for
-    tiles and files the client does not know, plus
+    tiles and files the client does not know, the chosen **export version**
+    (map-level files stepped between client generations), plus
     `listfile-additions.csv`, `map-registration.json` and
     `export-manifest.json` under `<project>/export/<map>/`
     ([docs/MODERN_EXPORT.md](docs/MODERN_EXPORT.md)).
+-   Client and file generations are named in the log: every modern WDT load
+    reports the generation the file was authored for next to the loaded
+    client's detected build, and warns when they differ.
 -   The project selector uses a Shadow-World themed, animated Qt interface.
 
 ### Compatibility Notes
@@ -151,12 +155,17 @@ server-side FileDataIDs, Map.db2 row) before the game can load them; the
 manifest lists exactly which ids are new.
 
 Post-WotLK **generations** are distinct formats in the converter
-(`MapGeneration`: WotLK 3.3.5, Shadowlands 9.2.7, retail 12.x): conversion
-between the modern generations strips the chunks the target family does not
-carry (WDT `MAI2`, WDL `MSSF`) and reports - never fabricates - the ones that
-cannot be authored offline; ADT parts cross generations verbatim after
-validation, because both families are MVER 18. See
-[docs/MAP_CONVERSION.md](docs/MAP_CONVERSION.md).
+(`MapGeneration`: WotLK 3.3.5, Shadowlands 9.2.7, retail 12.x, Forever
+1.60.x): conversion between the modern generations strips the chunks the
+target family does not carry (WDT `MAI2`, WDL `MSSF`) and reports - never
+fabricates - the ones that cannot be authored offline; ADT parts cross
+generations verbatim after validation, because the modern families are all
+MVER 18. The client build string detected from `.build.info` maps to its
+generation (`generationFromBuildString`), the **Convert map** dialog has a
+"Modern family" picker defaulted from it, and **Editor → Export map for
+client...** asks which generation to package for and steps the exported
+WDT/WDL to it. See [docs/MAP_CONVERSION.md](docs/MAP_CONVERSION.md) and
+[docs/MODERN_EXPORT.md](docs/MODERN_EXPORT.md).
 
 ### Outside the Current Scope
 

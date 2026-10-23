@@ -1273,14 +1273,59 @@ namespace Noggit::Formats::Conversion
       MapGeneration::shadowlands_9_2_7, "9.2.7", true, false, false, true};
     static GenerationFeatures const retail = {
       MapGeneration::retail_12_x, "12.x", true, true, true, true};
+    // Forever's map files are the Shadowlands family's until research shows
+    // a divergence (see the enum docs); the editor already saves Forever
+    // projects through the same modern paths.
+    static GenerationFeatures const forever = {
+      MapGeneration::forever_1_60_x, "1.60.x", true, false, false, true};
 
     switch (generation)
     {
     case MapGeneration::wotlk_3_3_5: return wotlk;
     case MapGeneration::retail_12_x: return retail;
+    case MapGeneration::forever_1_60_x: return forever;
     case MapGeneration::shadowlands_9_2_7: break;
     }
     return shadowlands;
+  }
+
+  MapGeneration generationFromBuildString(std::string const& build,
+                                          MapGeneration fallback)
+  {
+    // "major.minor[.patch[.build]]" - only major and minor carry generation
+    // meaning, and anything non-numeric ends the parse.
+    std::size_t pos = 0;
+    auto number = [&]() -> int
+    {
+      int value = -1;
+      std::size_t start = pos;
+      while (pos < build.size() && build[pos] >= '0' && build[pos] <= '9')
+      {
+        value = (value < 0 ? 0 : value) * 10 + (build[pos] - '0');
+        ++pos;
+      }
+      if (pos == start)
+        return -1;
+      // consume one separator
+      if (pos < build.size() && build[pos] == '.')
+        ++pos;
+      return value;
+    };
+
+    int const major = number();
+    if (major < 0)
+      return fallback;
+    int const minor = number();
+
+    if (major == 3)
+      return MapGeneration::wotlk_3_3_5;
+    if (major == 1 && minor >= 60)
+      return MapGeneration::forever_1_60_x;
+    if (major >= 10)
+      return MapGeneration::retail_12_x;
+    if (major >= 4)
+      return MapGeneration::shadowlands_9_2_7;
+    return fallback;
   }
 
   MapGeneration detectModernGeneration(std::vector<std::uint8_t> const& wdt,

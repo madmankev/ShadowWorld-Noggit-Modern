@@ -53,6 +53,36 @@ never modified, so the save path's self-heal (which restores a project WDT
 differing from the client original) and the export never fight each other:
 deploy the exported WDT, keep editing against the client's.
 
+## Export-version selection
+
+**Editor → Export map for client...** asks which generation to package for,
+and remembers the choice between runs. The default is the **loaded client**,
+whose generation comes from the detected `.build.info` build string
+(`generationFromBuildString`; `ClientVersion::FOREVER` projects override to
+Forever 1.60.x); the other choices are Shadowlands 9.2.7, Retail 12.x and
+Forever 1.60.x.
+
+The exporter does not trust the choice blindly: it **detects** the generation
+of the source bytes itself (`detectModernGeneration` - MAI2 in the WDT or
+MSSF in the WDL means retail) and steps the WDT and WDL from what they *are*
+to what was *asked for* with the generation converter
+([MAP_CONVERSION.md](MAP_CONVERSION.md)): strip-only down-steps, honest
+"stays absent" reports on up-steps, never a fabricated chunk. ADT parts are
+identical across the modern families and are never stepped. WotLK as an
+export version is refused with a pointer at the Convert map tool -
+re-authoring layouts is a conversion, not an export.
+
+The manifest records `"source_generation"` and `"export_generation"`; step
+notes land in the warnings as `WDT generation step (12.x -> 9.2.7): ...`.
+
+The same pairing is surfaced once per map load, so "which versions am I
+actually between" is answerable from the log:
+
+    [WDT Load] World\Maps\X\X.wdt: file generation 12.x, client generation 9.2.7 (9.2.7.45745)
+
+followed by an explicit mismatch line when file and client generations differ
+in a format-relevant way.
+
 ## Artifacts
 
 Written next to the exported files in `<project>/export/<map directory>/`:

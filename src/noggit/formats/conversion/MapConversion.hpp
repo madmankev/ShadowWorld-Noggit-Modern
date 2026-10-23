@@ -54,7 +54,23 @@ namespace Noggit::Formats::Conversion
     wotlk_3_3_5,
     shadowlands_9_2_7,
     retail_12_x,
+    //! ShadowWorld's Forever beta (1.60.x). Its map files are treated as the
+    //! Shadowlands family - the editor already saves Forever projects through
+    //! the same modern paths - until research shows a divergence; beta client
+    //! layouts can change between updates. Chunk-wise it is indistinguishable
+    //! from Shadowlands, so detectModernGeneration never returns it: only the
+    //! project/client version can say a map is Forever.
+    forever_1_60_x,
   };
+
+  //! Map a client build string ("3.3.5.12340", "9.2.7.45745", "12.1.5.60248",
+  //! "1.60.0.1234") to the generation it belongs to. Builds between 4.x and
+  //! 9.x map to the Shadowlands family - the oldest modern family this editor
+  //! authors - and 10.x and later to retail. Unparseable or unsupported
+  //! builds (1.x classic except Forever's 1.60, 2.x) map to  fallback.
+  MapGeneration generationFromBuildString(
+      std::string const& build,
+      MapGeneration fallback = MapGeneration::shadowlands_9_2_7);
 
   struct GenerationFeatures
   {
