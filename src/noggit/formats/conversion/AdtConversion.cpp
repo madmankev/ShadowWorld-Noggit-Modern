@@ -35,12 +35,46 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <sstream>
 
 namespace Noggit::Formats::Conversion
 {
+
+  void sanitizeModfEntry(ENTRY_MODF& entry)
+  {
+    static_assert(sizeof(entry.extents) == 6 * sizeof(float),
+                  "MODF extents are two vec3 corners, upper then lower");
+
+    for (float& value : entry.pos)
+      if (!std::isfinite(value))
+        value = 0.0f;
+    for (float& value : entry.rot)
+      if (!std::isfinite(value))
+        value = 0.0f;
+
+    float* extents = reinterpret_cast<float*>(&entry.extents);
+
+    bool rebuild = false;
+    for (int i = 0; i < 6; ++i)
+      rebuild = rebuild || !std::isfinite(extents[i]);
+
+    if (rebuild)
+    {
+      for (int axis = 0; axis < 3; ++axis)
+      {
+        extents[axis] = entry.pos[axis] + 1.0f;      // extents[0]: upper corner
+        extents[3 + axis] = entry.pos[axis] - 1.0f;  // extents[1]: lower corner
+      }
+    }
+
+    for (int axis = 0; axis < 3; ++axis)
+      if (extents[3 + axis] > extents[axis])
+        std::swap(extents[axis], extents[3 + axis]);
+  }
+
   //! Named (not anonymous) so unity builds cannot merge these helpers
   //! with the identically shaped ones in MapConversion.cpp.
   namespace adt_detail
@@ -1387,6 +1421,7 @@ namespace Noggit::Formats::Conversion
       for (std::size_t i = 0; i < model.modf.size(); ++i)
       {
         ENTRY_MODF entry = model.modf[i];
+        sanitizeModfEntry(entry);
         if (entry.nameID >= model.wmo_names.size() || model.wmo_names[entry.nameID].empty())
         {
           std::ostringstream message;

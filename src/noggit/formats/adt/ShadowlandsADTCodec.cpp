@@ -1230,6 +1230,7 @@ namespace Noggit::Formats::ADT
         {
           // Existing modern OBJ0 WMO placements use these bits with FileDataIDs.
           entry.flags |= 0x000C;
+          Conversion::sanitizeModfEntry(entry);
         }
         // Record the new index before appending, so the per-chunk MCRF
         // references can be renumbered: dropping a placement shifts every index

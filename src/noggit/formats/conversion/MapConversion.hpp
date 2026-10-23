@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstdint>
+#include <noggit/MapHeaders.h>
 #include <functional>
 #include <map>
 #include <optional>
@@ -21,6 +22,17 @@
 
 namespace Noggit::Formats::Conversion
 {
+
+  //! Bring a WMO placement (a MODF entry) into a shape the client can consume.
+  //!
+  //! Entries whose extents are non-finite or inverted - lower corner above the
+  //! upper corner - make the client's spatial queries walk garbage memory, and
+  //! both hand-edited projects and legacy imports contain them, while the split
+  //! pipeline copies MODF entries verbatim into OBJ0. Non-finite extents become
+  //! a one-unit box around the placement position, inverted corners are swapped
+  //! per axis, and non-finite positions or rotations become zero.
+  void sanitizeModfEntry(ENTRY_MODF& entry);
+
   enum class MapFormat
   {
     wotlk,   //!< 3.3.5: monolithic ADT, name-referenced objects, MCLQ

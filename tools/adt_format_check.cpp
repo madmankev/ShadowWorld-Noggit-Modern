@@ -44,6 +44,7 @@
 #include <noggit/formats/conversion/MapConversion.hpp>
 #include <noggit/MapHeaders.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -876,6 +877,49 @@ int main()
       std::printf("    native writer: %s\n", e.what());
     }
     check(native_ok, "native ROOT writer handles the wet tile");
+  }
+
+  // A MODF entry the client can consume: finite, and with the lower corner
+  // below the upper one. Legacy imports and hand-edited projects contain both
+  // NaN extents and inverted boxes, and the split pipeline copies MODF entries
+  // verbatim, so the sanitizer is the only thing between them and the client's
+  // spatial queries.
+  std::printf("\nMODF extent sanitizing\n");
+  {
+    ENTRY_MODF inverted{};
+    inverted.pos[0] = 100.0f; inverted.pos[1] = 200.0f; inverted.pos[2] = 30.0f;
+    inverted.rot[0] = std::nanf("");
+    float* e = reinterpret_cast<float*>(&inverted.extents);
+    e[0] = 5.0f; e[1] = 5.0f; e[2] = 5.0f;        // upper corner ...
+    e[3] = 900.0f; e[4] = 900.0f; e[5] = 900.0f;  // ... below the lower one
+    sanitizeModfEntry(inverted);
+    check(std::isfinite(inverted.rot[0]), "a NaN rotation becomes finite");
+    float const* c = reinterpret_cast<float const*>(&inverted.extents);
+    check(c[3] <= c[0] && c[4] <= c[1] && c[5] <= c[2],
+          "inverted corners are swapped per axis");
+    check(c[0] == 900.0f && c[3] == 5.0f, "the swap keeps the original corners");
+
+    ENTRY_MODF nanbox{};
+    nanbox.pos[0] = 10.0f; nanbox.pos[1] = 20.0f; nanbox.pos[2] = 3.0f;
+    float* n = reinterpret_cast<float*>(&nanbox.extents);
+    for (int i = 0; i < 6; ++i)
+      n[i] = std::nanf("");
+    sanitizeModfEntry(nanbox);
+    float const* cn = reinterpret_cast<float const*>(&nanbox.extents);
+    bool finite = true;
+    for (int i = 0; i < 6; ++i)
+      finite = finite && std::isfinite(cn[i]);
+    check(finite, "non-finite extents become finite");
+    check(cn[0] == 11.0f && cn[3] == 9.0f, "the rebuilt box is the position +/- 1");
+
+    ENTRY_MODF good{};
+    good.pos[0] = 1.0f; good.pos[1] = 2.0f; good.pos[2] = 3.0f;
+    float* g = reinterpret_cast<float*>(&good.extents);
+    g[0] = 8.0f; g[1] = 8.0f; g[2] = 8.0f;
+    g[3] = -8.0f; g[4] = -8.0f; g[5] = -8.0f;
+    sanitizeModfEntry(good);
+    float const* cg = reinterpret_cast<float const*>(&good.extents);
+    check(cg[0] == 8.0f && cg[3] == -8.0f, "a valid entry is left untouched");
   }
 
   std::printf("\nfirst-bad-MCNK locator\n");
