@@ -3,9 +3,11 @@
 #include <noggit/formats/adt/ModernAdtWriter.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <sstream>
+#include <unordered_map>
 
 namespace Noggit::Formats::ADT
 {
@@ -1126,10 +1128,41 @@ namespace Noggit::Formats::ADT
       AdtFormatProfile const& profile,
       std::vector<std::uint8_t>& root)
   {
-    auto const layout = collect_root_layout(root, "ROOT part");
-    if (!layout.mhdr || !layout.mcin)
-      throw ModernAdtWriterError("ROOT lacks MHDR/MCIN; cannot refresh bookkeeping.");
-    std::uint32_t const basis = mhdr_offset_basis(root, layout.mhdr, layout.mcin);
+    auto layout = collect_root_layout(root, "ROOT part");
+    if (!layout.mhdr)
+      throw ModernAdtWriterError("ROOT lacks MHDR; cannot refresh bookkeeping.");
+
+    // Retail ROOT files may omit MCIN (the same variant writeRoot handles by
+    // synthesizing it). The merged fallback rewrites the original ROOT in
+    // place, so it has to grow the chunk the same way: the output contract -
+    // validatePart and the split-ADT gate - wants MCIN, and refusing here is
+    // what left 969 tile saves with nothing on disk after the native path had
+    // already failed ("ROOT lacks MHDR/MCIN; cannot refresh bookkeeping").
+    std::optional<std::uint32_t> calibrated_basis;
+    if (!layout.mcin)
+    {
+      if (layout.mhdr->size < mhdr_payload_size)
+        throw ModernAdtWriterError("ROOT MHDR is truncated; cannot refresh bookkeeping.");
+      // Calibrate against the original stored offsets BEFORE the insertion
+      // shifts every chunk after MHDR; the basis is a fixed file anchor and
+      // stays valid for the shifted positions.
+      calibrated_basis = calibrate_basis_without_mcin(
+          root, layout, mhdr_offset_basis(root, layout.mhdr, nullptr));
+      auto const insert_at = layout.mhdr->offset + chunk_tag_size + layout.mhdr->size;
+      if (insert_at > root.size())
+        throw ModernAdtWriterError("ROOT MHDR chunk extends past the part.");
+      std::vector<std::uint8_t> mcin_payload(mcin_payload_size, 0);
+      auto const mcin_bytes = make_chunk(MCC_MCIN, mcin_payload);
+      root.insert(root.begin() + static_cast<std::ptrdiff_t>(insert_at),
+                  mcin_bytes.begin(), mcin_bytes.end());
+      layout = collect_root_layout(root, "ROOT part");
+      if (!layout.mcin)
+        throw ModernAdtWriterError("ROOT MCIN synthesis failed.");
+    }
+
+    std::uint32_t const basis = calibrated_basis
+      ? *calibrated_basis
+      : mhdr_offset_basis(root, layout.mhdr, layout.mcin);
 
     std::vector<std::pair<std::size_t, std::size_t>> positions;
     positions.reserve(layout.mcnks.size());
@@ -1182,5 +1215,673 @@ namespace Noggit::Formats::ADT
     for (auto const& problem : problems)
       message << "\n  - " << problem;
     throw ModernAdtValidationError(message.str());
+  }
+
+  namespace
+  {
+    constexpr std::uint32_t MCC_MLDD = fourcc('M', 'L', 'D', 'D');
+    constexpr std::uint32_t MCC_MLDX = fourcc('M', 'L', 'D', 'X');
+    constexpr std::uint32_t MCC_MLDL = fourcc('M', 'L', 'D', 'L');
+    constexpr std::uint32_t MCC_MDLI = fourcc('M', 'D', 'L', 'I');
+    constexpr std::uint32_t MCC_MLDB = fourcc('M', 'L', 'D', 'B');
+    constexpr std::uint32_t MCC_MLMD = fourcc('M', 'L', 'M', 'D');
+    constexpr std::uint32_t MCC_MLMX = fourcc('M', 'L', 'M', 'X');
+    constexpr std::uint32_t MCC_MLMB = fourcc('M', 'L', 'M', 'B');
+    constexpr std::uint32_t MCC_MWDR = fourcc('M', 'W', 'D', 'R');
+    constexpr std::uint32_t MCC_MWDS = fourcc('M', 'W', 'D', 'S');
+    constexpr std::uint32_t MCC_MLFD = fourcc('M', 'L', 'F', 'D');
+
+    //! MLMD/MLMX record: a MODF placement without its bounding box, which is
+    //! what MLMX carries next to it instead.
+    struct LodMapObject
+    {
+      std::uint32_t nameID;
+      std::uint32_t uniqueID;
+      float pos[3];
+      float rot[3];
+      std::uint16_t flags;
+      std::uint16_t doodadSet;
+      std::uint16_t nameSet;
+      std::uint16_t scale;
+    };
+    static_assert(sizeof(LodMapObject) == 40, "MLMD entry layout");
+
+    //! MLDX/MLMX record: transformed bounding box plus its radius.
+    struct LodExtent
+    {
+      float min[3];
+      float max[3];
+      float radius;
+    };
+    static_assert(sizeof(LodExtent) == 28, "MLDX/MLMX entry layout");
+
+    //! MWDR record: inclusive [begin, end] range into the MWDS pool. An empty
+    //! range is begin > end; {1, 0} reads as zero elements under signed,
+    //! unsigned and widening arithmetic alike.
+    struct LodWmoRange
+    {
+      std::uint32_t begin;
+      std::uint32_t end;
+    };
+    static_assert(sizeof(LodWmoRange) == 8, "MWDR entry layout");
+
+    template<typename Entry>
+    std::vector<Entry> chunk_records(std::vector<std::uint8_t> const& bytes,
+                                     ChunkView const& chunk,
+                                     char const* label)
+    {
+      if (chunk.size % sizeof(Entry))
+        throw ModernAdtWriterError(std::string(label) + " has an invalid record size.");
+      std::vector<Entry> records(chunk.size / sizeof(Entry));
+      if (chunk.size)
+        std::memcpy(records.data(), bytes.data() + chunk.payload, chunk.size);
+      return records;
+    }
+
+    template<typename Entry>
+    std::vector<Entry> payload_records(std::vector<std::uint8_t> const& payload,
+                                       char const* label)
+    {
+      if (payload.size() % sizeof(Entry))
+        throw ModernAdtWriterError(std::string(label) + " payload has an invalid record size.");
+      std::vector<Entry> records(payload.size() / sizeof(Entry));
+      if (!payload.empty())
+        std::memcpy(records.data(), payload.data(), payload.size());
+      return records;
+    }
+
+    template<typename Entry>
+    std::vector<std::uint8_t> records_bytes(std::vector<Entry> const& records)
+    {
+      std::vector<std::uint8_t> bytes(records.size() * sizeof(Entry));
+      if (!bytes.empty())
+        std::memcpy(bytes.data(), records.data(), bytes.size());
+      return bytes;
+    }
+
+    std::uint64_t lod_placement_key(std::uint32_t name_id, std::uint32_t unique_id)
+    {
+      return (static_cast<std::uint64_t>(unique_id) << 32) | name_id;
+    }
+
+    std::vector<std::uint8_t> lod_replace_chunk(
+      std::vector<std::uint8_t> const& input,
+      std::uint32_t magic,
+      std::vector<std::uint8_t> const& replacement)
+    {
+      auto const chunks = parse_chunks(input, "split ADT part");
+      std::vector<std::uint8_t> output;
+      bool replaced = false;
+      for (auto const& chunk : chunks)
+      {
+        if (chunk.magic == magic)
+        {
+          if (!replaced)
+            output.insert(output.end(), replacement.begin(), replacement.end());
+          replaced = true;
+        }
+        else
+          append_range(output, input, chunk.offset, chunk.payload + chunk.size);
+      }
+      if (!replaced)
+        output.insert(output.end(), replacement.begin(), replacement.end());
+      return output;
+    }
+
+    std::vector<std::uint8_t> lod_remove_chunk(
+      std::vector<std::uint8_t> const& input,
+      std::uint32_t magic)
+    {
+      auto const chunks = parse_chunks(input, "split ADT part");
+      std::vector<std::uint8_t> output;
+      for (auto const& chunk : chunks)
+      {
+        if (chunk.magic == magic)
+          continue;
+        append_range(output, input, chunk.offset, chunk.payload + chunk.size);
+      }
+      return output;
+    }
+
+    std::string describe_chunk_list(std::vector<ChunkView> const& chunks)
+    {
+      std::ostringstream out;
+      for (std::size_t i = 0; i < chunks.size(); ++i)
+      {
+        if (i)
+          out << ' ';
+        out << describe_magic(chunks[i].magic) << '(' << chunks[i].size << ')';
+      }
+      return out.str();
+    }
+
+    std::array<float, 3> lod_server_position(float const (&position)[3])
+    {
+      constexpr float map_midpoint = 17066.666f;
+      return {map_midpoint - position[2], map_midpoint - position[0], position[1]};
+    }
+
+    LodExtent lod_moved_extent(LodExtent const& old_extent,
+                               float const (&old_position)[3],
+                               float const (&new_position)[3],
+                               float scale_ratio,
+                               bool rotation_changed)
+    {
+      auto const before = lod_server_position(old_position);
+      auto const after = lod_server_position(new_position);
+      LodExtent result = old_extent;
+      float radius = 0.0f;
+      for (int axis = 0; axis < 3; ++axis)
+      {
+        radius = std::max(radius, std::abs(old_extent.min[axis] - before[axis]));
+        radius = std::max(radius, std::abs(old_extent.max[axis] - before[axis]));
+      }
+      for (int axis = 0; axis < 3; ++axis)
+      {
+        if (rotation_changed)
+        {
+          result.min[axis] = after[axis] - radius * scale_ratio;
+          result.max[axis] = after[axis] + radius * scale_ratio;
+        }
+        else
+        {
+          result.min[axis] = after[axis] + (old_extent.min[axis] - before[axis]) * scale_ratio;
+          result.max[axis] = after[axis] + (old_extent.max[axis] - before[axis]) * scale_ratio;
+        }
+      }
+      result.radius = old_extent.radius * scale_ratio;
+      return result;
+    }
+
+    LodExtent lod_map_object_extent(ENTRY_MODF const& placement)
+    {
+      LodExtent result{};
+      constexpr float map_midpoint = 17066.666f;
+      auto const& low = placement.extents[0];
+      auto const& high = placement.extents[1];
+      result.min[0] = map_midpoint - high.z;
+      result.max[0] = map_midpoint - low.z;
+      result.min[1] = map_midpoint - high.x;
+      result.max[1] = map_midpoint - low.x;
+      result.min[2] = low.y;
+      result.max[2] = high.y;
+      result.radius = std::sqrt(
+        std::pow(result.max[0] - result.min[0], 2.0f)
+        + std::pow(result.max[1] - result.min[1], 2.0f)
+        + std::pow(result.max[2] - result.min[2], 2.0f));
+      return result;
+    }
+
+    //! One side's three LOD bands inside MLFD. Retail bands are contiguous:
+    //! offset[b] is the cumulative length before b and the three lengths sum
+    //! to the list size. Anything else is a layout this writer does not
+    //! claim to understand.
+    struct LodBandTable
+    {
+      std::uint32_t offset[3];
+      std::uint32_t length[3];
+    };
+
+    bool lod_bands_valid(LodBandTable const& bands, std::size_t total)
+    {
+      std::size_t cumulative = 0;
+      for (int b = 0; b < 3; ++b)
+      {
+        if (static_cast<std::size_t>(bands.offset[b]) != cumulative)
+          return false;
+        cumulative += bands.length[b];
+        if (cumulative > total)
+          return false;
+      }
+      return cumulative == total;
+    }
+
+    std::size_t lod_band_of(LodBandTable const& bands, std::size_t index)
+    {
+      if (index < static_cast<std::size_t>(bands.length[0]))
+        return 0;
+      if (index < static_cast<std::size_t>(bands.length[0]) + bands.length[1])
+        return 1;
+      return 2;
+    }
+  }
+
+  Obj1LodRewrite rewriteObj1Lod(
+      std::vector<std::uint8_t> const& obj1,
+      std::vector<std::uint8_t> const& mddf_payload,
+      std::vector<std::uint8_t> const& modf_payload)
+  {
+    Obj1LodRewrite result;
+    result.bytes = obj1;
+
+    auto const chunks = parse_chunks(obj1, "modern OBJ1");
+    auto const* mldd = find_chunk(chunks, MCC_MLDD);
+    auto const* mldx = find_chunk(chunks, MCC_MLDX);
+    auto const* mldl = find_chunk(chunks, MCC_MLDL);
+    auto const* mdli = find_chunk(chunks, MCC_MDLI);
+    auto const* mldb = find_chunk(chunks, MCC_MLDB);
+    auto const* mlmd = find_chunk(chunks, MCC_MLMD);
+    auto const* mlmx = find_chunk(chunks, MCC_MLMX);
+    auto const* mlmb = find_chunk(chunks, MCC_MLMB);
+    auto const* mwdr = find_chunk(chunks, MCC_MWDR);
+    auto const* mwds = find_chunk(chunks, MCC_MWDS);
+    auto const* mlfd = find_chunk(chunks, MCC_MLFD);
+
+    bool const doodad_side = mldd && mldx;
+    bool const wmo_side = mlmd && mlmx;
+    if (!doodad_side && !wmo_side)
+    {
+      if (mldl || mdli || mldb || mlmb || mwdr || mwds || mlfd)
+      {
+        result.reason = "OBJ1 carries LOD companion chunks without a complete MLDD/MLDX"
+                        " or MLMD/MLMX pair, so its LOD lists were passed through as-is."
+                        " Layout: " + describe_chunk_list(chunks);
+      }
+      return result;
+    }
+
+    std::vector<std::string> problems;
+    std::vector<ENTRY_MDDF> old_doodads;
+    std::vector<LodExtent> old_doodad_extents;
+    std::vector<std::uint32_t> old_doodad_lod;
+    std::vector<std::uint32_t> old_doodad_indices;
+    std::vector<std::uint8_t> old_doodad_batches;
+    std::vector<LodMapObject> old_map_objects;
+    std::vector<LodExtent> old_map_extents;
+    std::vector<std::uint8_t> old_map_classes;
+    std::vector<LodWmoRange> old_map_ranges;
+
+    if (doodad_side)
+    {
+      if (mldd->size % sizeof(ENTRY_MDDF))
+        problems.emplace_back("MLDD size is not a multiple of the 36 byte MDDF record");
+      else
+        old_doodads = chunk_records<ENTRY_MDDF>(obj1, *mldd, "OBJ1 MLDD");
+      if (mldx->size % sizeof(LodExtent))
+        problems.emplace_back("MLDX size is not a multiple of the 28 byte extent record");
+      else
+        old_doodad_extents = chunk_records<LodExtent>(obj1, *mldx, "OBJ1 MLDX");
+      if (problems.empty() && old_doodads.size() != old_doodad_extents.size())
+        problems.emplace_back("MLDD (" + std::to_string(old_doodads.size())
+                              + " entries) and MLDX (" + std::to_string(old_doodad_extents.size())
+                              + " extents) disagree");
+      if (mldl)
+      {
+        if (mldl->size % sizeof(std::uint32_t)
+            || (problems.empty() && mldl->size / sizeof(std::uint32_t) != old_doodads.size()))
+          problems.emplace_back("MLDL does not hold one float per MLDD entry");
+        else
+          old_doodad_lod = chunk_records<std::uint32_t>(obj1, *mldl, "OBJ1 MLDL");
+      }
+      if (mldb)
+      {
+        if (problems.empty() && mldb->size != old_doodads.size())
+          problems.emplace_back("MLDB is " + std::to_string(mldb->size)
+                                + " byte(s) for " + std::to_string(old_doodads.size())
+                                + " MLDD entries");
+        else
+          old_doodad_batches.assign(obj1.begin() + mldb->payload,
+                                    obj1.begin() + mldb->payload + mldb->size);
+      }
+      if (mdli)
+      {
+        if (mdli->size % sizeof(std::uint32_t))
+          problems.emplace_back("MDLI size is not a multiple of 4");
+        else
+          old_doodad_indices = chunk_records<std::uint32_t>(obj1, *mdli, "OBJ1 MDLI");
+      }
+    }
+    if (wmo_side)
+    {
+      if (mlmd->size % sizeof(LodMapObject))
+        problems.emplace_back("MLMD size is not a multiple of the 40 byte record");
+      else
+        old_map_objects = chunk_records<LodMapObject>(obj1, *mlmd, "OBJ1 MLMD");
+      if (mlmx->size % sizeof(LodExtent))
+        problems.emplace_back("MLMX size is not a multiple of the 28 byte extent record");
+      else
+        old_map_extents = chunk_records<LodExtent>(obj1, *mlmx, "OBJ1 MLMX");
+      if (problems.empty() && old_map_objects.size() != old_map_extents.size())
+        problems.emplace_back("MLMD (" + std::to_string(old_map_objects.size())
+                              + " entries) and MLMX (" + std::to_string(old_map_extents.size())
+                              + " extents) disagree");
+      if (mlmb)
+      {
+        if (problems.empty() && mlmb->size != old_map_objects.size())
+          problems.emplace_back("MLMB is " + std::to_string(mlmb->size)
+                                + " byte(s) for " + std::to_string(old_map_objects.size())
+                                + " MLMD entries");
+        else
+          old_map_classes.assign(obj1.begin() + mlmb->payload,
+                                 obj1.begin() + mlmb->payload + mlmb->size);
+      }
+      if (mwdr)
+      {
+        if (mwdr->size % sizeof(LodWmoRange)
+            || (problems.empty() && mwdr->size / sizeof(LodWmoRange) != old_map_objects.size()))
+          problems.emplace_back("MWDR does not hold one range per MLMD entry");
+        else
+          old_map_ranges = chunk_records<LodWmoRange>(obj1, *mwdr, "OBJ1 MWDR");
+      }
+    }
+
+    std::array<std::uint32_t, 12> counts{};
+    LodBandTable doodad_bands{};
+    LodBandTable wmo_bands{};
+    if (!mlfd)
+      problems.emplace_back("the LOD placement lists exist but MLFD is missing");
+    else if (mlfd->size != counts.size() * sizeof(std::uint32_t))
+      problems.emplace_back("MLFD is " + std::to_string(mlfd->size) + " byte(s), not 48");
+    else
+    {
+      std::memcpy(counts.data(), obj1.data() + mlfd->payload, sizeof(counts));
+      for (int b = 0; b < 3; ++b)
+      {
+        doodad_bands.offset[b] = counts[b];
+        doodad_bands.length[b] = counts[3 + b];
+        wmo_bands.offset[b] = counts[6 + b];
+        wmo_bands.length[b] = counts[9 + b];
+      }
+      if (problems.empty() && doodad_side && !lod_bands_valid(doodad_bands, old_doodads.size()))
+        problems.emplace_back("MLFD's doodad bands do not tile MLDD");
+      if (problems.empty() && wmo_side && !lod_bands_valid(wmo_bands, old_map_objects.size()))
+        problems.emplace_back("MLFD's WMO bands do not tile MLMD");
+    }
+
+    if (!problems.empty())
+    {
+      std::ostringstream reason;
+      reason << "OBJ1 holds LOD chunks in a layout this writer does not rebuild (";
+      for (std::size_t i = 0; i < problems.size(); ++i)
+        reason << (i ? "; " : "") << problems[i];
+      reason << "), so its LOD lists were passed through as-is. Layout: "
+             << describe_chunk_list(chunks);
+      result.reason = reason.str();
+      return result;
+    }
+
+    // The merged OBJ0 lists are the truth about which placements exist now.
+    // A retail LOD entry survives when its (nameID, uniqueID) is still
+    // placed; its transform comes from the merged entry, everything the LOD
+    // side owns (flags, band, companions) is carried over. Editor-added
+    // placements stay out of the LOD lists: they render normally up close
+    // and only Blizzard's offline LOD baker decides what represents them at
+    // distance - inventing extents, classes and band memberships for them is
+    // what previously desynchronized MLDB/MLMB/MWDR from their lists.
+    auto const new_doodads = payload_records<ENTRY_MDDF>(mddf_payload, "merged MDDF");
+    auto const new_map_objects = payload_records<ENTRY_MODF>(modf_payload, "merged MODF");
+    std::unordered_map<std::uint64_t, std::size_t> doodad_by_key;
+    std::unordered_map<std::uint64_t, std::size_t> map_object_by_key;
+    for (std::size_t i = 0; i < new_doodads.size(); ++i)
+      doodad_by_key.emplace(lod_placement_key(new_doodads[i].nameID, new_doodads[i].uniqueID), i);
+    for (std::size_t i = 0; i < new_map_objects.size(); ++i)
+      map_object_by_key.emplace(
+        lod_placement_key(new_map_objects[i].nameID, new_map_objects[i].uniqueID), i);
+
+    std::vector<ENTRY_MDDF> out_doodads;
+    std::vector<LodExtent> out_doodad_extents;
+    std::vector<std::uint32_t> out_doodad_lod;
+    std::vector<std::uint32_t> out_doodad_indices;
+    std::vector<std::uint8_t> out_doodad_batches;
+    std::array<std::size_t, 3> doodad_survivors{};
+    if (doodad_side)
+    {
+      for (std::size_t i = 0; i < old_doodads.size(); ++i)
+      {
+        auto const& old = old_doodads[i];
+        auto const it = doodad_by_key.find(lod_placement_key(old.nameID, old.uniqueID));
+        if (it == doodad_by_key.end())
+          continue; // the editor deleted this placement
+        auto const& merged = new_doodads[it->second];
+
+        ENTRY_MDDF entry = merged;
+        entry.flags = old.flags; // the LOD list keeps its own flag word
+
+        bool const rotation_changed = !std::equal(std::begin(old.rot), std::end(old.rot),
+                                                  std::begin(merged.rot));
+        bool const unchanged = !rotation_changed
+          && std::equal(std::begin(old.pos), std::end(old.pos), std::begin(merged.pos))
+          && old.scale == merged.scale;
+        LodExtent extent = old_doodad_extents[i];
+        if (!unchanged)
+          extent = lod_moved_extent(extent, old.pos, merged.pos,
+                                    static_cast<float>(merged.scale)
+                                      / static_cast<float>(std::max(1u, static_cast<unsigned>(old.scale))),
+                                    rotation_changed);
+
+        out_doodads.push_back(entry);
+        out_doodad_extents.push_back(extent);
+        if (mldl)
+          out_doodad_lod.push_back(old_doodad_lod[i]);
+        if (mldb)
+          out_doodad_batches.push_back(old_doodad_batches[i]);
+        if (mdli)
+          out_doodad_indices.push_back(i < old_doodad_indices.size()
+                                         ? old_doodad_indices[i] : 0xFFFFFFFFu);
+        ++doodad_survivors[lod_band_of(doodad_bands, i)];
+      }
+    }
+
+    std::vector<LodMapObject> out_map_objects;
+    std::vector<LodExtent> out_map_extents;
+    std::vector<std::uint8_t> out_map_classes;
+    std::vector<LodWmoRange> out_map_ranges;
+    std::array<std::size_t, 3> map_object_survivors{};
+    if (wmo_side)
+    {
+      for (std::size_t i = 0; i < old_map_objects.size(); ++i)
+      {
+        auto const& old = old_map_objects[i];
+        auto const it = map_object_by_key.find(lod_placement_key(old.nameID, old.uniqueID));
+        if (it == map_object_by_key.end())
+          continue;
+        auto const& merged = new_map_objects[it->second];
+
+        LodMapObject entry{};
+        std::memcpy(&entry, &merged, 32);
+        std::memcpy(reinterpret_cast<std::uint8_t*>(&entry) + 32,
+                    reinterpret_cast<std::uint8_t const*>(&merged) + 56, 8);
+        // Keep shipped bounds byte-for-byte when the placement has not moved.
+        LodExtent extent = std::memcmp(&entry, &old, sizeof(entry)) == 0
+          ? old_map_extents[i]
+          : lod_map_object_extent(merged);
+
+        out_map_objects.push_back(entry);
+        out_map_extents.push_back(extent);
+        if (mlmb)
+          out_map_classes.push_back(old_map_classes[i]);
+        if (mwdr)
+          out_map_ranges.push_back(old_map_ranges[i]);
+        ++map_object_survivors[lod_band_of(wmo_bands, i)];
+      }
+    }
+
+    if (doodad_side)
+    {
+      for (int b = 0; b < 3; ++b)
+        counts[3 + b] = static_cast<std::uint32_t>(doodad_survivors[b]);
+      counts[0] = 0;
+      counts[1] = counts[3];
+      counts[2] = counts[3] + counts[4];
+    }
+    if (wmo_side)
+    {
+      for (int b = 0; b < 3; ++b)
+        counts[9 + b] = static_cast<std::uint32_t>(map_object_survivors[b]);
+      counts[6] = 0;
+      counts[7] = counts[9];
+      counts[8] = counts[9] + counts[10];
+    }
+
+    auto output = obj1;
+    auto put = [&output](std::uint32_t magic, std::vector<std::uint8_t> const& payload)
+    {
+      output = lod_replace_chunk(output, magic, make_chunk(magic, payload));
+    };
+    if (doodad_side)
+    {
+      put(MCC_MLDD, records_bytes(out_doodads));
+      put(MCC_MLDX, records_bytes(out_doodad_extents));
+      if (mldl)
+        put(MCC_MLDL, records_bytes(out_doodad_lod));
+      if (mldb)
+        put(MCC_MLDB, out_doodad_batches);
+      if (mdli)
+        put(MCC_MDLI, records_bytes(out_doodad_indices));
+    }
+    if (wmo_side)
+    {
+      put(MCC_MLMD, records_bytes(out_map_objects));
+      put(MCC_MLMX, records_bytes(out_map_extents));
+      if (mlmb)
+        put(MCC_MLMB, out_map_classes);
+      if (mwdr)
+        put(MCC_MWDR, records_bytes(out_map_ranges));
+    }
+    put(MCC_MLFD, records_bytes(std::vector<std::uint32_t>(counts.begin(), counts.end())));
+
+    result.bytes = std::move(output);
+    result.rewritten = true;
+    return result;
+  }
+
+  Obj0CompanionRewrite rewriteObj0Companions(
+      std::vector<std::uint8_t> const& obj0,
+      std::vector<std::uint8_t> const& original_obj0)
+  {
+    Obj0CompanionRewrite result;
+    result.bytes = obj0;
+
+    auto const original_chunks = parse_chunks(original_obj0, "original OBJ0");
+    auto const* original_modf_chunk = find_chunk(original_chunks, MCC_MODF);
+    auto const* original_mlmb = find_chunk(original_chunks, MCC_MLMB);
+    auto const* original_mwdr = find_chunk(original_chunks, MCC_MWDR);
+    if (!original_mlmb && !original_mwdr)
+      return result; // nothing per-WMO to keep in step
+
+    std::vector<std::string> notes;
+    std::vector<ENTRY_MODF> original_modf;
+    if (original_modf_chunk)
+    {
+      if (original_modf_chunk->size % sizeof(ENTRY_MODF))
+        notes.emplace_back("the original MODF chunk has an invalid record size, so its"
+                           " companion chunks were dropped");
+      else
+        original_modf = chunk_records<ENTRY_MODF>(original_obj0, *original_modf_chunk,
+                                                  "original OBJ0 MODF");
+    }
+
+    bool const mlmb_usable = original_mlmb
+      && notes.empty() && original_mlmb->size == original_modf.size();
+    if (original_mlmb && !mlmb_usable && notes.empty())
+      notes.emplace_back("MLMB is " + std::to_string(original_mlmb->size) + " byte(s) for "
+                         + std::to_string(original_modf.size())
+                         + " MODF placement(s), which contradicts the one-byte-per-WMO"
+                           " layout, so MLMB and MWDR were dropped rather than written"
+                           " mismatched");
+    bool mwdr_usable = original_mwdr && notes.empty()
+      && original_mwdr->size % sizeof(LodWmoRange) == 0
+      && original_mwdr->size / sizeof(LodWmoRange) == original_modf.size();
+    if (original_mwdr && !mwdr_usable && notes.empty())
+      notes.emplace_back("MWDR does not hold one range per original MODF placement, so"
+                         " MLMB and MWDR were dropped rather than written mismatched");
+
+    // The most common retail MLMB class is the default for editor-added WMOs;
+    // with no retail byte to learn from, dropping MLMB is more honest than a
+    // hardcoded class.
+    std::uint8_t default_class = 0;
+    bool have_default_class = false;
+    if (mlmb_usable)
+    {
+      std::array<std::size_t, 256> histogram{};
+      for (std::size_t i = 0; i < original_mlmb->size; ++i)
+        ++histogram[original_obj0[original_mlmb->payload + i]];
+      std::size_t best = 0;
+      for (std::size_t value = 0; value < 256; ++value)
+        if (histogram[value] > best)
+        {
+          best = histogram[value];
+          default_class = static_cast<std::uint8_t>(value);
+          have_default_class = true;
+        }
+    }
+    bool mlmb_rebuilt = mlmb_usable && have_default_class;
+    if (mlmb_usable && !have_default_class && !original_modf.empty())
+      notes.emplace_back("MLMB had no retail class byte to default editor-added WMOs to,"
+                         " so it was dropped");
+
+    auto const new_chunks = parse_chunks(obj0, "merged OBJ0");
+    auto const* new_modf_chunk = find_chunk(new_chunks, MCC_MODF);
+    std::vector<ENTRY_MODF> new_modf;
+    if (new_modf_chunk)
+    {
+      if (new_modf_chunk->size % sizeof(ENTRY_MODF))
+        notes.emplace_back("the merged MODF chunk has an invalid record size, so the"
+                           " companion chunks were dropped");
+      else
+        new_modf = chunk_records<ENTRY_MODF>(obj0, *new_modf_chunk, "merged OBJ0 MODF");
+    }
+    else if (original_modf_chunk || original_mlmb || original_mwdr)
+      notes.emplace_back("the merged OBJ0 has no MODF chunk, so the companion chunks were"
+                         " dropped");
+
+    std::unordered_map<std::uint64_t, std::size_t> original_by_key;
+    for (std::size_t i = 0; i < original_modf.size(); ++i)
+      original_by_key.emplace(
+        lod_placement_key(original_modf[i].nameID, original_modf[i].uniqueID), i);
+
+    std::vector<std::uint8_t> rebuilt_mlmb;
+    std::vector<LodWmoRange> rebuilt_mwdr;
+    if (!notes.empty())
+    {
+      mlmb_rebuilt = false;
+      mwdr_usable = false;
+    }
+    if (mlmb_rebuilt || mwdr_usable)
+    {
+      for (auto const& placement : new_modf)
+      {
+        auto const it = original_by_key.find(
+          lod_placement_key(placement.nameID, placement.uniqueID));
+        bool const carried = it != original_by_key.end();
+        if (mlmb_rebuilt)
+          rebuilt_mlmb.push_back(carried
+            ? original_obj0[original_mlmb->payload + it->second]
+            : default_class);
+        if (mwdr_usable)
+        {
+          LodWmoRange range{1, 0}; // empty inclusive range for editor-added WMOs
+          if (carried)
+            std::memcpy(&range,
+                        original_obj0.data() + original_mwdr->payload
+                          + it->second * sizeof(LodWmoRange),
+                        sizeof(range));
+          rebuilt_mwdr.push_back(range);
+        }
+        if (!carried)
+        {
+          ++result.defaults_used;
+          if (!result.first_default_fdid)
+            result.first_default_fdid = placement.nameID;
+        }
+      }
+    }
+
+    auto output = obj0;
+    if (mlmb_rebuilt && !rebuilt_mlmb.empty())
+      output = lod_replace_chunk(output, MCC_MLMB, make_chunk(MCC_MLMB, rebuilt_mlmb));
+    else if (original_mlmb)
+      output = lod_remove_chunk(output, MCC_MLMB);
+    if (mwdr_usable && !rebuilt_mwdr.empty())
+      output = lod_replace_chunk(output, MCC_MWDR, make_chunk(MCC_MWDR, records_bytes(rebuilt_mwdr)));
+    else if (original_mwdr)
+      output = lod_remove_chunk(output, MCC_MWDR);
+    result.bytes = std::move(output);
+
+    std::ostringstream note;
+    for (std::size_t i = 0; i < notes.size(); ++i)
+      note << (i ? "; " : "") << notes[i];
+    result.note = note.str();
+    return result;
   }
 }

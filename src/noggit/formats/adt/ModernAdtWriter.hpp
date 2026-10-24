@@ -116,6 +116,74 @@ namespace Noggit::Formats::ADT
     using ModernAdtWriterError::ModernAdtWriterError;
   };
 
+  //! Regeneration of the OBJ1 LOD placement chunks against the merged OBJ0
+  //! placement lists.
+  //!
+  //! Retail OBJ1 layouts vary per tile: the doodad side (MLDD/MLDX with the
+  //! optional companions MLDL, MDLI and MLDB) can exist without the WMO side
+  //! (MLMD/MLMX with the optional companions MLMB and MWDR/MWDS) and vice
+  //! versa, and MLDL only ships when a doodad carries the liquid-height flag.
+  //! Requiring every chunk at once refused the merge for 169 azeroth tiles in
+  //! one session ("OBJ1 has an unsupported LOD placement layout"), so nothing
+  //! of those tiles' edits reached disk.
+  //!
+  //! The rewrite regenerates the sides that exist and keeps the per-entry
+  //! companion chunks (MLDB per MLDD, MLMB/MWDR per MLMD) in lockstep with
+  //! the lists they annotate: a companion array whose count disagrees with
+  //! its list is an out-of-bounds read for the client when it streams the
+  //! tile's LOD objects. Placements the editor added stay out of the LOD
+  //! lists (they render normally up close and gain LOD representation when
+  //! the lists are next regenerated from the game data), placements the
+  //! editor deleted leave the lists, and survivors keep their retail band
+  //! membership, flags and companion bytes with their transforms updated.
+  struct Obj1LodRewrite
+  {
+    //! The OBJ1 to write: the regenerated one, or the untouched input when
+    //! the layout is passed through.
+    std::vector<std::uint8_t> bytes;
+    //! True when LOD chunks were regenerated.
+    bool rewritten = false;
+    //! Non-empty when OBJ1 carries LOD chunks in a layout this writer cannot
+    //! regenerate. bytes is then the untouched input: internally consistent
+    //! (every companion still matches its list) but possibly stale relative
+    //! to edited placements, which shows as distant LOD objects lagging the
+    //! edit rather than as a broken tile. Callers should surface it.
+    std::string reason;
+  };
+
+  [[nodiscard]] Obj1LodRewrite rewriteObj1Lod(
+      std::vector<std::uint8_t> const& obj1,
+      std::vector<std::uint8_t> const& mddf_payload,
+      std::vector<std::uint8_t> const& modf_payload);
+
+  //! Keeps OBJ0's per-WMO companion chunks in step with a rebuilt MODF.
+  //!
+  //! MLMB (8.2+) carries one byte per MODF placement and MWDR/MWDS (9.0+)
+  //! one {begin,end} range per MODF into the shared MWDS pool. A merge that
+  //! replaces MODF but copies these arrays byte-for-byte leaves counts and
+  //! order disagreeing with the placements they annotate - the same
+  //! out-of-bounds class the OBJ1 companions have. Survivors carry their
+  //! retail bytes by (nameID, uniqueID); editor-added placements get the
+  //! most common retail MLMB class and an empty MWDR range. An array whose
+  //! size does not match the retail MODF count contradicts the documented
+  //! layout, so it is dropped (the client falls back to its defaults) and
+  //! reported rather than guessed at.
+  struct Obj0CompanionRewrite
+  {
+    std::vector<std::uint8_t> bytes;
+    //! Editor-added WMO placements that were given default companion bytes.
+    std::size_t defaults_used = 0;
+    //! FileDataID of the first placement that got defaults (0 when none did).
+    std::uint32_t first_default_fdid = 0;
+    //! Non-empty when a companion chunk was dropped as contradicting the
+    //! documented layout; callers should surface it.
+    std::string note;
+  };
+
+  [[nodiscard]] Obj0CompanionRewrite rewriteObj0Companions(
+      std::vector<std::uint8_t> const& obj0,
+      std::vector<std::uint8_t> const& original_obj0);
+
   class ModernAdtWriter
   {
   public:

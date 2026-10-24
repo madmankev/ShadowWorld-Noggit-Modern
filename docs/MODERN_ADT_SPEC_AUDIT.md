@@ -155,6 +155,38 @@ when the source carries them.
   Noggit always writes full-size 64x64 alpha and 512-byte shadow maps, and a
   cleared bit tells the client to expect the 63x63 "fixed" layout, which is
   the same #134 assert. Harness-covered.
+* OBJ1 LOD lists follow the merged placements, side by side
+  (`ModernAdtWriter::rewriteObj1Lod`, harness-covered). Retail OBJ1 tiles
+  carry the doodad LOD side (MLDD/MLDX, optionally MLDL/MDLI/MLDB) without
+  the WMO side (MLMD/MLMX, optionally MLMB/MWDR/MWDS) and vice versa; the
+  previous rewrite demanded all of them at once and refused 169 azeroth tiles
+  in one editing session, so none of their edits ever reached disk. The
+  rewrite is now side-aware: each present side's list is filtered and rebuilt
+  from the merged MDDF/MODF (survivors keep their LOD flags, band and
+  companions; moved placements get recomputed extents; new ones default),
+  MLFD is re-tiled around the survivors, and any layout the writer cannot
+  fully account for is passed through verbatim with a logged reason instead
+  of half-rebuilt. A half-rebuild is worse than staleness: per-entry
+  companions (MLDB class bytes, MLMB, MWDR ranges) whose counts no longer
+  match the list they annotate are an out-of-bounds read while the client
+  streams the tile - the crash frame of 2026-10-24 (EpsilonAddon serving a
+  saved tile at azeroth_32_49).
+* The same count-lockstep rule protects OBJ0 (`rewriteObj0Companions`):
+  MLMB/MWDR were copied verbatim next to a rebuilt MODF, so every save that
+  added or deleted a WMO left the companions describing the wrong placements.
+  They are now rebuilt entry-for-entry from the original - carried for
+  survivors, the modal retail byte for MLMB and the empty inclusive range
+  {1,0} for MWDR on new placements - and if the original's own companions
+  disagree with its MODF, both chunks are dropped together with a logged
+  note (a lone MLMB without matching MWDR would misannotate every placement).
+* A retail ROOT without MCIN no longer blocks the save fallback
+  (`refreshRootBookkeeping`): azeroth ROOTs of the 9.2.7 client legitimately
+  omit MCIN, and the fallback refused them with "ROOT lacks MHDR/MCIN; cannot
+  refresh bookkeeping" after the native writer had already failed on the OBJ1
+  gate - the tile was lost twice over. The fallback now synthesizes a zeroed
+  MCIN directly after MHDR, calibrating the offset basis from the MH2O/MFBO
+  anchors **before** inserting it, then re-points every entry at the real
+  MCNK chunks - identical to what the native writer does.
 * The GUID scan (`searchMaxUID`) reads each tile by the WDT's MAID
   FileDataIDs first, falling back to path resolution: a modded or partial
   listfile can map tile paths to stale ids whose content CASC does not hold

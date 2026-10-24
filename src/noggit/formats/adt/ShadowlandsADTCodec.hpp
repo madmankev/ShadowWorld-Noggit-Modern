@@ -62,15 +62,22 @@ namespace Noggit::Formats::ADT
     //! such id, so those assets stay invisible until they are registered.
     std::size_t custom_fdids = 0;
 
+    //! Editor-added WMO placements written with a default byte in the OBJ0
+    //! companion chunks (MLMB/MWDR) instead of retail per-placement data.
+    //! They render normally; only the LOD-distance class/range is a default.
+    std::size_t companion_defaults = 0;
+
     std::string first_unresolved_texture;
     std::string first_recovered_placement;
     std::string first_skipped_placement;
     std::string first_custom_fdid;
+    //! FileDataID of the first WMO placement that got companion defaults.
+    std::uint32_t first_companion_default_fdid = 0;
 
     [[nodiscard]] bool empty() const noexcept
     {
       return !unresolved_textures && !recovered_placements && !skipped_placements
-             && !synthesized && !custom_fdids;
+             && !synthesized && !custom_fdids && !companion_defaults;
     }
   };
 

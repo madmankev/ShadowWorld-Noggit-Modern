@@ -717,359 +717,6 @@ namespace Noggit::Formats::ADT
       return output;
     }
 
-    struct LodExtent
-    {
-      float min[3];
-      float max[3];
-      float radius;
-    };
-    static_assert(sizeof(LodExtent) == 28);
-
-    struct LodMapObject
-    {
-      std::uint32_t nameID;
-      std::uint32_t uniqueID;
-      float pos[3];
-      float rot[3];
-      std::uint16_t flags;
-      std::uint16_t doodadSet;
-      std::uint16_t nameSet;
-      std::uint16_t scale;
-    };
-    static_assert(sizeof(LodMapObject) == 40);
-
-    template<typename Entry>
-    std::vector<Entry> placement_records(std::vector<std::uint8_t> const& bytes,
-                                         ChunkView const& chunk,
-                                         char const* label)
-    {
-      if (chunk.size % sizeof(Entry))
-        throw std::runtime_error(std::string(label) + " has an invalid record size.");
-      std::vector<Entry> records(chunk.size / sizeof(Entry));
-      if (chunk.size)
-        std::memcpy(records.data(), bytes.data() + chunk.payload, chunk.size);
-      return records;
-    }
-
-    template<typename Entry>
-    std::vector<std::uint8_t> record_bytes(std::vector<Entry> const& records)
-    {
-      std::vector<std::uint8_t> bytes(records.size() * sizeof(Entry));
-      if (!bytes.empty())
-        std::memcpy(bytes.data(), records.data(), bytes.size());
-      return bytes;
-    }
-
-    std::uint64_t placement_key(std::uint32_t name_id, std::uint32_t unique_id)
-    {
-      return (static_cast<std::uint64_t>(unique_id) << 32) | name_id;
-    }
-
-    std::array<float, 3> server_position(float const (&position)[3])
-    {
-      constexpr float map_midpoint = 17066.666f;
-      return {map_midpoint - position[2], map_midpoint - position[0], position[1]};
-    }
-
-    LodExtent moved_extent(LodExtent const& old_extent,
-                           float const (&old_position)[3],
-                           float const (&new_position)[3],
-                           float scale_ratio,
-                           bool rotation_changed)
-    {
-      auto const before = server_position(old_position);
-      auto const after = server_position(new_position);
-      LodExtent result = old_extent;
-      float radius = 0.0f;
-      for (int axis = 0; axis < 3; ++axis)
-      {
-        radius = std::max(radius, std::abs(old_extent.min[axis] - before[axis]));
-        radius = std::max(radius, std::abs(old_extent.max[axis] - before[axis]));
-      }
-      for (int axis = 0; axis < 3; ++axis)
-      {
-        if (rotation_changed)
-        {
-          result.min[axis] = after[axis] - radius * scale_ratio;
-          result.max[axis] = after[axis] + radius * scale_ratio;
-        }
-        else
-        {
-          result.min[axis] = after[axis] + (old_extent.min[axis] - before[axis]) * scale_ratio;
-          result.max[axis] = after[axis] + (old_extent.max[axis] - before[axis]) * scale_ratio;
-        }
-      }
-      result.radius = old_extent.radius * scale_ratio;
-      return result;
-    }
-
-    LodExtent new_doodad_extent(ENTRY_MDDF const& placement)
-    {
-      auto const center = server_position(placement.pos);
-      auto const radius = 32.0f * static_cast<float>(placement.scale) / 1024.0f;
-      LodExtent result{};
-      for (int axis = 0; axis < 3; ++axis)
-      {
-        result.min[axis] = center[axis] - radius;
-        result.max[axis] = center[axis] + radius;
-      }
-      result.radius = radius;
-      return result;
-    }
-
-    LodExtent map_object_extent(ENTRY_MODF const& placement)
-    {
-      LodExtent result{};
-      constexpr float map_midpoint = 17066.666f;
-      auto const& low = placement.extents[0];
-      auto const& high = placement.extents[1];
-      result.min[0] = map_midpoint - high.z;
-      result.max[0] = map_midpoint - low.z;
-      result.min[1] = map_midpoint - high.x;
-      result.max[1] = map_midpoint - low.x;
-      result.min[2] = low.y;
-      result.max[2] = high.y;
-      result.radius = std::sqrt(
-        std::pow(result.max[0] - result.min[0], 2.0f)
-        + std::pow(result.max[1] - result.min[1], 2.0f)
-        + std::pow(result.max[2] - result.min[2], 2.0f));
-      return result;
-    }
-
-    std::vector<std::uint8_t> rewrite_obj1(
-      std::vector<std::uint8_t> const& obj1,
-      std::vector<std::uint8_t> const& mddf_bytes,
-      std::vector<std::uint8_t> const& modf_bytes)
-    {
-      auto const chunks = parse_chunks(obj1, "modern OBJ1");
-      auto const* mldd_chunk = find_chunk(chunks, fourcc('M','L','D','D'));
-      auto const* mldx_chunk = find_chunk(chunks, fourcc('M','L','D','X'));
-      auto const* mldl_chunk = find_chunk(chunks, fourcc('M','L','D','L'));
-      auto const* mdli_chunk = find_chunk(chunks, fourcc('M','D','L','I'));
-      auto const* mlmd_chunk = find_chunk(chunks, fourcc('M','L','M','D'));
-      auto const* mlmx_chunk = find_chunk(chunks, fourcc('M','L','M','X'));
-      auto const* mlfd_chunk = find_chunk(chunks, fourcc('M','L','F','D'));
-      if (!mldd_chunk && !mldx_chunk && !mldl_chunk && !mdli_chunk
-          && !mlmd_chunk && !mlmx_chunk && !mlfd_chunk)
-      {
-        // A retail OBJ1 on a tile without LOD placements carries none of the
-        // LOD chunks; there is nothing to remap, so the part passes through
-        // byte for byte. Throwing here failed BOTH save paths for 27 azeroth
-        // tiles ("OBJ1 has an unsupported LOD placement layout"), leaving
-        // those tiles with none of their edits on disk.
-        return obj1;
-      }
-      if (!mldd_chunk || !mldx_chunk || !mldl_chunk || !mlmd_chunk || !mlmx_chunk
-          || !mlfd_chunk || mlfd_chunk->size != 12 * sizeof(std::uint32_t))
-        throw std::runtime_error("OBJ1 has an unsupported LOD placement layout.");
-
-      ChunkView const new_mddf{0, 0, 0, static_cast<std::uint32_t>(mddf_bytes.size())};
-      ChunkView const new_modf{0, 0, 0, static_cast<std::uint32_t>(modf_bytes.size())};
-      auto const doodads = placement_records<ENTRY_MDDF>(mddf_bytes, new_mddf, "OBJ0 MDDF");
-      auto const map_objects = placement_records<ENTRY_MODF>(modf_bytes, new_modf, "OBJ0 MODF");
-      auto const old_doodads = placement_records<ENTRY_MDDF>(obj1, *mldd_chunk, "OBJ1 MLDD");
-      auto const old_doodad_extents = placement_records<LodExtent>(obj1, *mldx_chunk, "OBJ1 MLDX");
-      auto const old_doodad_lod = placement_records<std::uint32_t>(obj1, *mldl_chunk, "OBJ1 MLDL");
-      auto const old_doodad_indices = mdli_chunk
-        ? placement_records<std::uint32_t>(obj1, *mdli_chunk, "OBJ1 MDLI")
-        : std::vector<std::uint32_t>{};
-      auto const old_map_objects = placement_records<LodMapObject>(obj1, *mlmd_chunk, "OBJ1 MLMD");
-      auto const old_map_extents = placement_records<LodExtent>(obj1, *mlmx_chunk, "OBJ1 MLMX");
-      auto counts = placement_records<std::uint32_t>(obj1, *mlfd_chunk, "OBJ1 MLFD");
-      if (old_doodads.size() != old_doodad_extents.size()
-          || old_doodads.size() != old_doodad_lod.size()
-          || old_map_objects.size() != old_map_extents.size()
-          || counts[3] + counts[4] != old_doodads.size()
-          || counts[8] + counts[11] != old_map_objects.size()
-          || counts[8] != counts[9])
-        throw std::runtime_error("OBJ1 LOD placement counts do not match MLFD.");
-
-      std::unordered_map<std::uint64_t, std::size_t> doodad_indices;
-      std::unordered_map<std::uint64_t, std::size_t> map_indices;
-      for (std::size_t i = 0; i < old_doodads.size(); ++i)
-        doodad_indices.emplace(placement_key(old_doodads[i].nameID, old_doodads[i].uniqueID), i);
-      for (std::size_t i = 0; i < old_map_objects.size(); ++i)
-        map_indices.emplace(placement_key(old_map_objects[i].nameID, old_map_objects[i].uniqueID), i);
-
-      std::vector<ENTRY_MDDF> updated_doodads;
-      std::vector<LodExtent> updated_doodad_extents;
-      std::vector<std::uint32_t> updated_doodad_lod;
-      std::vector<std::size_t> updated_doodad_groups;
-      std::array<std::uint32_t, 2> doodad_groups{};
-      for (auto const& placement : doodads)
-      {
-        auto entry = placement;
-        LodExtent extent{};
-        std::uint32_t lod = 0;
-        std::size_t group = 0;
-        if (auto const it = doodad_indices.find(placement_key(placement.nameID, placement.uniqueID));
-            it != doodad_indices.end())
-        {
-          auto const index = it->second;
-          auto const& old = old_doodads[index];
-          entry.flags = old.flags;
-          auto const unchanged = std::equal(std::begin(old.pos), std::end(old.pos),
-                                            std::begin(placement.pos))
-            && std::equal(std::begin(old.rot), std::end(old.rot),
-                          std::begin(placement.rot))
-            && old.scale == placement.scale;
-          if (unchanged)
-            extent = old_doodad_extents[index];
-          else
-          {
-            auto const changed_rotation = !std::equal(std::begin(old.rot), std::end(old.rot),
-                                                      std::begin(placement.rot));
-            extent = moved_extent(old_doodad_extents[index], old.pos, placement.pos,
-                                  static_cast<float>(placement.scale) / std::max(1u, static_cast<unsigned>(old.scale)),
-                                  changed_rotation);
-          }
-          lod = old_doodad_lod[index];
-          group = index < counts[3] ? 0 : 1;
-        }
-        else
-        {
-          entry.flags = 0x60;
-          extent = new_doodad_extent(placement);
-          auto const exemplar = std::find_if(old_doodads.begin(), old_doodads.end(),
-            [&](ENTRY_MDDF const& old) { return old.nameID == placement.nameID; });
-          if (exemplar != old_doodads.end())
-          {
-            auto const index = static_cast<std::size_t>(exemplar - old_doodads.begin());
-            entry.flags = exemplar->flags;
-            extent = moved_extent(old_doodad_extents[index], exemplar->pos, placement.pos,
-                                  static_cast<float>(placement.scale) / std::max(1u, static_cast<unsigned>(exemplar->scale)),
-                                  true);
-            lod = old_doodad_lod[index];
-          }
-        }
-        updated_doodads.push_back(entry);
-        updated_doodad_extents.push_back(extent);
-        updated_doodad_lod.push_back(lod);
-        updated_doodad_groups.push_back(group);
-        ++doodad_groups[group];
-      }
-
-      std::vector<LodMapObject> updated_map_objects;
-      std::vector<LodExtent> updated_map_extents;
-      std::vector<std::size_t> updated_map_groups;
-      std::array<std::uint32_t, 2> map_groups{};
-      for (auto const& placement : map_objects)
-      {
-        LodMapObject entry{};
-        std::memcpy(&entry, &placement, 32);
-        std::memcpy(reinterpret_cast<std::uint8_t*>(&entry) + 32,
-                    reinterpret_cast<std::uint8_t const*>(&placement) + 56, 8);
-        auto extent = map_object_extent(placement);
-        std::size_t group = 0;
-        if (auto const it = map_indices.find(placement_key(placement.nameID, placement.uniqueID));
-            it != map_indices.end())
-        {
-          auto const index = it->second;
-          group = index < counts[8] ? 0 : 1;
-          // Keep shipped bounds byte-for-byte when the placement has not moved.
-          if (std::memcmp(&entry, &old_map_objects[index], sizeof(entry)) == 0)
-            extent = old_map_extents[index];
-        }
-        updated_map_objects.push_back(entry);
-        updated_map_extents.push_back(extent);
-        updated_map_groups.push_back(group);
-        ++map_groups[group];
-      }
-      counts[3] = doodad_groups[0];
-      counts[4] = doodad_groups[1];
-      if (counts[1])
-        counts[1] = doodad_groups[0];
-      counts[8] = map_groups[0];
-      counts[9] = map_groups[0];
-      counts[11] = map_groups[1];
-
-      auto group_doodads = [&](std::size_t group)
-      {
-        std::vector<ENTRY_MDDF> entries;
-        std::vector<LodExtent> extents;
-        std::vector<std::uint32_t> lod_values;
-        std::vector<std::size_t> indices;
-        for (std::size_t i = 0; i < updated_doodads.size(); ++i)
-          if (updated_doodad_groups[i] == group)
-            indices.push_back(i);
-        std::stable_sort(indices.begin(), indices.end(), [&](std::size_t lhs, std::size_t rhs)
-        {
-          return updated_doodad_extents[lhs].radius > updated_doodad_extents[rhs].radius;
-        });
-        for (auto const index : indices)
-        {
-          entries.push_back(updated_doodads[index]);
-          extents.push_back(updated_doodad_extents[index]);
-          lod_values.push_back(updated_doodad_lod[index]);
-        }
-        return std::make_tuple(std::move(entries), std::move(extents), std::move(lod_values));
-      };
-      auto [base_doodads, base_extents, base_lod] = group_doodads(0);
-      auto [other_doodads, other_extents, other_lod] = group_doodads(1);
-      base_doodads.insert(base_doodads.end(), other_doodads.begin(), other_doodads.end());
-      base_extents.insert(base_extents.end(), other_extents.begin(), other_extents.end());
-      base_lod.insert(base_lod.end(), other_lod.begin(), other_lod.end());
-      updated_doodads = std::move(base_doodads);
-      updated_doodad_extents = std::move(base_extents);
-      updated_doodad_lod = std::move(base_lod);
-
-      std::vector<std::uint32_t> updated_doodad_indices;
-      if (mdli_chunk)
-      {
-        updated_doodad_indices.reserve(updated_doodads.size());
-        for (auto const& entry : updated_doodads)
-        {
-          auto const it = doodad_indices.find(placement_key(entry.nameID, entry.uniqueID));
-          updated_doodad_indices.push_back(
-            it != doodad_indices.end() && it->second < old_doodad_indices.size()
-              ? old_doodad_indices[it->second]
-              : 0xFFFFFFFFu);
-        }
-      }
-
-      auto group_map_objects = [&](std::size_t group)
-      {
-        std::vector<LodMapObject> entries;
-        std::vector<LodExtent> extents;
-        std::vector<std::size_t> indices;
-        for (std::size_t i = 0; i < updated_map_objects.size(); ++i)
-          if (updated_map_groups[i] == group)
-            indices.push_back(i);
-        std::stable_sort(indices.begin(), indices.end(), [&](std::size_t lhs, std::size_t rhs)
-        {
-          return updated_map_extents[lhs].radius > updated_map_extents[rhs].radius;
-        });
-        for (auto const index : indices)
-        {
-          entries.push_back(updated_map_objects[index]);
-          extents.push_back(updated_map_extents[index]);
-        }
-        return std::make_pair(std::move(entries), std::move(extents));
-      };
-      auto [base_map_objects, base_map_extents] = group_map_objects(0);
-      auto [other_map_objects, other_map_extents] = group_map_objects(1);
-      base_map_objects.insert(base_map_objects.end(), other_map_objects.begin(), other_map_objects.end());
-      base_map_extents.insert(base_map_extents.end(), other_map_extents.begin(), other_map_extents.end());
-      updated_map_objects = std::move(base_map_objects);
-      updated_map_extents = std::move(base_map_extents);
-
-      auto output = replace_top_level_chunk(obj1, fourcc('M','L','D','D'),
-        make_chunk(fourcc('M','L','D','D'), record_bytes(updated_doodads)));
-      output = replace_top_level_chunk(output, fourcc('M','L','D','X'),
-        make_chunk(fourcc('M','L','D','X'), record_bytes(updated_doodad_extents)));
-      output = replace_top_level_chunk(output, fourcc('M','L','D','L'),
-        make_chunk(fourcc('M','L','D','L'), record_bytes(updated_doodad_lod)));
-      if (mdli_chunk)
-        output = replace_top_level_chunk(output, fourcc('M','D','L','I'),
-          make_chunk(fourcc('M','D','L','I'), record_bytes(updated_doodad_indices)));
-      output = replace_top_level_chunk(output, fourcc('M','L','M','D'),
-        make_chunk(fourcc('M','L','M','D'), record_bytes(updated_map_objects)));
-      output = replace_top_level_chunk(output, fourcc('M','L','M','X'),
-        make_chunk(fourcc('M','L','M','X'), record_bytes(updated_map_extents)));
-      return replace_top_level_chunk(output, fourcc('M','L','F','D'),
-        make_chunk(fourcc('M','L','F','D'), record_bytes(counts)));
-    }
-
     void validate_tex0_alpha_layout(std::vector<std::uint8_t> const& tex0)
     {
       auto const chunks = parse_chunks(tex0, "saved TEX0");
@@ -1540,13 +1187,45 @@ namespace Noggit::Formats::ADT
       parts.write_obj1 = backing.has(ShadowlandsADTPart::Obj1);
       parts.write_lod = backing.has(ShadowlandsADTPart::Lod);
       if (parts.write_obj1)
-        parts.obj1 = rewrite_obj1(backing.part(ShadowlandsADTPart::Obj1).bytes, mddf, modf);
+      {
+        // The LOD placement regeneration lives in the Qt-free writer so the
+        // standalone format harness pins the retail layout variants down.
+        // Retail tiles carry the doodad side (MLDD/MLDX[/MLDL/MDLI/MLDB])
+        // and the WMO side (MLMD/MLMX[/MLMB/MWDR]) independently; requiring
+        // every chunk at once refused the merge for 169 azeroth tiles in one
+        // session and left all of their edits unwritten.
+        auto lod = rewriteObj1Lod(backing.part(ShadowlandsADTPart::Obj1).bytes, mddf, modf);
+        if (!lod.reason.empty())
+          LogError << "[ModernADT][Save] OBJ1 of '" << backing.source.root_path << "': "
+                   << lod.reason << ". The rest of the tile saved normally; its"
+                      " distant LOD objects may lag the edits (visual only)."
+                   << std::endl;
+        parts.obj1 = std::move(lod.bytes);
+      }
       parts.obj0 = original_obj0;
       parts.obj0 = replace_top_level_chunk(
         parts.obj0, fourcc('M','D','D','F'), make_chunk(fourcc('M','D','D','F'), mddf));
       parts.obj0 = replace_top_level_chunk(
         parts.obj0, fourcc('M','O','D','F'), make_chunk(fourcc('M','O','D','F'), modf));
       parts.obj0 = rewrite_obj0_refs(parts.obj0, legacy_adt, doodad_remap, wmo_remap);
+      {
+        // MODF was just rebuilt, so the per-WMO companion chunks (MLMB class
+        // bytes, MWDR/MWDS doodad-set ranges) have to follow it: copied
+        // byte-for-byte they disagree with the placements they annotate, and
+        // a count the client walks past is an out-of-bounds read while the
+        // tile streams in.
+        auto companions = rewriteObj0Companions(parts.obj0, original_obj0);
+        parts.obj0 = std::move(companions.bytes);
+        if (!companions.note.empty())
+          LogError << "[ModernADT][Save] OBJ0 of '" << backing.source.root_path << "': "
+                   << companions.note << "." << std::endl;
+        if (report && companions.defaults_used)
+        {
+          report->companion_defaults += companions.defaults_used;
+          if (!report->first_companion_default_fdid)
+            report->first_companion_default_fdid = companions.first_default_fdid;
+        }
+      }
       return parts;
     }
 

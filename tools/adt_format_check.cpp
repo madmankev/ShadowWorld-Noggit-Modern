@@ -81,6 +81,12 @@ namespace
 
     void u8(std::uint8_t v) { b.push_back(v); }
 
+    void u16(std::uint16_t v)
+    {
+      for (int i = 0; i < 2; ++i)
+        b.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFF));
+    }
+
     void u32(std::uint32_t v)
     {
       for (int i = 0; i < 4; ++i)
@@ -1474,6 +1480,66 @@ int main()
       }
       check(entries_ok, "every synthesized MCIN entry points at its real MCNK chunk");
     }
+
+    // The merged fallback rewrites the ORIGINAL ROOT in place; on a retail
+    // MCIN-less ROOT it has to synthesize the chunk the same way the native
+    // writer does instead of refusing the tile ("ROOT lacks MHDR/MCIN;
+    // cannot refresh bookkeeping" - the second failure that left 969 save
+    // attempts in one session with nothing on disk).
+    {
+      std::vector<std::uint8_t> fallback_root = no_mcin;
+      bool fallback_ok = true;
+      std::string fallback_why;
+      try { ModernAdtWriter::refreshRootBookkeeping(profile, fallback_root); }
+      catch (std::exception const& e) { fallback_ok = false; fallback_why = e.what(); }
+      if (!fallback_ok)
+        std::printf("    refreshRootBookkeeping on MCIN-less ROOT: %s\n",
+                    fallback_why.c_str());
+      check(fallback_ok, "the merged fallback refreshes a retail ROOT that has no MCIN");
+      if (fallback_ok)
+      {
+        std::size_t pos = 0, mhdr_end = 0, mhdr_payload = 0, fb_mcin = 0, fb_mh2o = 0;
+        std::size_t first_mcnk = 0, first_mcnk_size = 0, fb_mcnks = 0;
+        while (pos + 8 <= fallback_root.size())
+        {
+          std::uint32_t const magic = rd32(fallback_root, pos);
+          std::uint32_t const size = rd32(fallback_root, pos + 4);
+          if (magic == fc('M', 'H', 'D', 'R')) { mhdr_end = pos + 8 + size; mhdr_payload = pos + 8; }
+          if (magic == fc('M', 'C', 'I', 'N')) fb_mcin = pos;
+          if (magic == fc('M', 'H', '2', 'O')) fb_mh2o = pos;
+          if (magic == fc('M', 'C', 'N', 'K'))
+          {
+            if (!fb_mcnks) { first_mcnk = pos; first_mcnk_size = size; }
+            ++fb_mcnks;
+          }
+          pos += 8 + size;
+        }
+        check(fb_mcin && fb_mcin == mhdr_end,
+              "the fallback synthesizes MCIN right after MHDR");
+        check(fb_mcnks == 256, "the refreshed ROOT still holds all 256 MCNK chunks");
+        if (fb_mcin && mhdr_payload)
+        {
+          check(rd32(fallback_root, mhdr_payload + offsetof(MHDR, mcin))
+                  == static_cast<std::uint32_t>(fb_mcin - chosen_basis),
+                "fallback MHDR.mcin uses the basis calibrated from the MH2O anchor");
+          check(rd32(fallback_root, fb_mcin + 8) == first_mcnk
+                && rd32(fallback_root, fb_mcin + 12) == first_mcnk_size + 8,
+                "the first synthesized MCIN entry describes the first MCNK chunk");
+        }
+        if (fb_mh2o && mhdr_payload)
+          check(rd32(fallback_root, mhdr_payload + offsetof(MHDR, mh2o))
+                  == static_cast<std::uint32_t>(fb_mh2o - chosen_basis),
+                "fallback MHDR.mh2o follows the shifted chunk under the calibrated basis");
+        bool fb_valid = true;
+        try
+        {
+          ModernAdtWriter::validatePartOrThrow(profile, fallback_root,
+                                               AdtPartExpectation::Root, "ROOT part");
+        }
+        catch (std::exception const&) { fb_valid = false; }
+        check(fb_valid, "the fallback-refreshed ROOT passes validation");
+      }
+    }
   }
 
   std::printf("\nconversion source reading by FileDataID\n");
@@ -2108,6 +2174,461 @@ int main()
     try { ModernAdtWriter::refreshRootBookkeeping(profile, empty_root); }
     catch (std::exception const&) { threw = true; }
     check(threw, "an empty ROOT is rejected rather than silently accepted");
+  }
+
+  std::printf("\nOBJ1 LOD layout variants (retail 9.2.7)\n");
+  {
+    // Retail OBJ1 varies per tile: the doodad LOD side (MLDD/MLDX, optionally
+    // MLDL/MDLI/MLDB) exists without the WMO side (MLMD/MLMX, optionally
+    // MLMB/MWDR) and vice versa, and MLDL only appears when some doodad has
+    // the liquid-height flag. A rewrite demanding every chunk at once refused
+    // 169 azeroth tiles ("OBJ1 has an unsupported LOD placement layout") and
+    // left all of their edits unwritten; a rewrite that rebuilds the lists
+    // while leaving the per-entry companions (MLDB/MLMB/MWDR) stale hands the
+    // client arrays whose counts no longer match the lists they annotate -
+    // out-of-bounds reads while the tile streams in.
+    auto make_chunk = [](std::uint32_t magic, std::vector<std::uint8_t> const& payload)
+    {
+      Writer w;
+      w.tag(magic);
+      w.u32(static_cast<std::uint32_t>(payload.size()));
+      w.raw(payload.data(), payload.size());
+      return w.b;
+    };
+    auto rec_mddf = [](std::uint32_t fdid, std::uint32_t uid, float px,
+                       std::uint16_t scale, std::uint16_t flags)
+    {
+      Writer w;
+      w.u32(fdid); w.u32(uid);
+      w.f32(px); w.f32(0.f); w.f32(0.f);   // pos
+      w.f32(0.f); w.f32(0.f); w.f32(0.f);  // rot
+      w.u32(static_cast<std::uint32_t>(scale) | (static_cast<std::uint32_t>(flags) << 16));
+      return w.b;                          // 36 bytes
+    };
+    auto rec_extent = [](float radius)
+    {
+      Writer w;
+      for (int i = 0; i < 3; ++i) w.f32(-radius);
+      for (int i = 0; i < 3; ++i) w.f32(radius);
+      w.f32(radius);
+      return w.b;                          // 28 bytes
+    };
+    auto rec_modf = [](std::uint32_t fdid, std::uint32_t uid, float px, std::uint16_t flags)
+    {
+      Writer w;
+      w.u32(fdid); w.u32(uid);
+      w.f32(px); w.f32(0.f); w.f32(0.f);
+      w.f32(0.f); w.f32(0.f); w.f32(0.f);
+      w.f32(100.f); w.f32(10.f); w.f32(100.f);    // extents[0]
+      w.f32(-100.f); w.f32(-10.f); w.f32(-100.f); // extents[1]
+      w.u32(static_cast<std::uint32_t>(flags) | (7u << 16));   // flags + doodadSet
+      w.u32(3u | (1024u << 16));                             // nameSet + scale
+      return w.b;                                            // 64 bytes
+    };
+    auto rec_mlmd = [](std::vector<std::uint8_t> const& modf_entry)
+    {
+      std::vector<std::uint8_t> out(modf_entry.begin(), modf_entry.begin() + 32);
+      out.insert(out.end(), modf_entry.begin() + 56, modf_entry.end());
+      return out;                                            // 40 bytes
+    };
+    auto mlfd_payload = [](std::array<std::uint32_t, 12> const& counts)
+    {
+      Writer w;
+      for (std::uint32_t c : counts) w.u32(c);
+      return w.b;                                            // 48 bytes
+    };
+    auto cat = [](std::vector<std::vector<std::uint8_t>> const& chunks)
+    {
+      std::vector<std::uint8_t> out;
+      for (auto const& c : chunks) out.insert(out.end(), c.begin(), c.end());
+      return out;
+    };
+    struct out_chunk { std::uint32_t magic; std::size_t payload; std::uint32_t size; };
+    auto walk = [](std::vector<std::uint8_t> const& b)
+    {
+      std::vector<out_chunk> out;
+      std::size_t pos = 0;
+      while (pos + 8 <= b.size())
+      {
+        out_chunk c;
+        c.magic = rd32_at(b, pos);
+        c.size = rd32_at(b, pos + 4);
+        c.payload = pos + 8;
+        out.push_back(c);
+        pos += 8 + c.size;
+      }
+      return out;
+    };
+    auto has_chunk = [&](std::vector<std::uint8_t> const& b, std::uint32_t magic)
+    {
+      for (auto const& c : walk(b)) if (c.magic == magic) return true;
+      return false;
+    };
+    auto chunk_payload = [&](std::vector<std::uint8_t> const& b, std::uint32_t magic)
+    {
+      for (auto const& c : walk(b))
+        if (c.magic == magic)
+          return std::vector<std::uint8_t>(b.begin() + c.payload, b.begin() + c.payload + c.size);
+      return std::vector<std::uint8_t>{};
+    };
+    auto rd32 = [](std::vector<std::uint8_t> const& b, std::size_t at)
+    {
+      return at + 4 <= b.size() ? rd32_at(b, at) : 0u;
+    };
+
+    // The full-layout fixture: doodad side with every optional chunk, WMO
+    // side with its companions, and a valid MLFD band table.
+    std::vector<std::uint8_t> full;
+    std::vector<std::uint8_t> extents_a = rec_extent(10.f);
+    std::vector<std::uint8_t> extents_b = rec_extent(20.f);
+    std::vector<std::uint8_t> extents_w1 = rec_extent(50.f);
+    std::vector<std::uint8_t> modf_w1 = rec_modf(201, 11, 0.f, 0x000C);
+    {
+      Writer mver; mver.tag(fc('M','V','E','R')); mver.u32(4); mver.u32(18);
+      std::vector<std::uint8_t> mldd;
+      for (auto const& e : {rec_mddf(101, 1, 0.f, 1024, 0x68),
+                            rec_mddf(102, 2, 5.f, 1024, 0x70),
+                            rec_mddf(103, 3, 9.f, 1024, 0x60)})
+        mldd.insert(mldd.end(), e.begin(), e.end());
+      std::vector<std::uint8_t> mldx;
+      for (auto const& e : {extents_a, extents_b, rec_extent(30.f)})
+        mldx.insert(mldx.end(), e.begin(), e.end());
+      Writer mldl; mldl.f32(1.5f); mldl.f32(2.5f); mldl.f32(3.5f);
+      Writer mdli; mdli.u32(11); mdli.u32(22); mdli.u32(33);
+      Writer mldb; mldb.u8(7); mldb.u8(8); mldb.u8(9);
+      std::vector<std::uint8_t> mlmd = rec_mlmd(modf_w1);
+      Writer mlmb; mlmb.u8(0x40);
+      Writer mwdr; mwdr.u32(0); mwdr.u32(2);
+      Writer mwds; mwds.u16(5); mwds.u16(6); mwds.u16(9);
+      full = cat({mver.b,
+                  make_chunk(fc('M','L','D','D'), mldd),
+                  make_chunk(fc('M','L','D','X'), mldx),
+                  make_chunk(fc('M','L','D','L'), mldl.b),
+                  make_chunk(fc('M','D','L','I'), mdli.b),
+                  make_chunk(fc('M','L','D','B'), mldb.b),
+                  make_chunk(fc('M','L','M','D'), mlmd),
+                  make_chunk(fc('M','L','M','X'), extents_w1),
+                  make_chunk(fc('M','L','M','B'), mlmb.b),
+                  make_chunk(fc('M','W','D','R'), mwdr.b),
+                  make_chunk(fc('M','W','D','S'), mwds.b),
+                  // doodad bands: [1,2,0] entries at [0,1,3]; wmo bands: [1,0,0] at [0,1,1]
+                  make_chunk(fc('M','L','F','D'),
+                             mlfd_payload({0, 1, 3, 1, 2, 0, 0, 1, 1, 1, 0, 0}))});
+    }
+
+    // The merged OBJ0 side: A untouched (flags differ on purpose: the MLDD
+    // record keeps its own), B moved, C dropped, D added. W1 identical to
+    // its original MODF bytes so its extent must carry over, W2 added.
+    std::vector<std::uint8_t> merged_mddf;
+    for (auto const& e : {rec_mddf(101, 1, 0.f, 1024, 0x60),
+                          rec_mddf(102, 2, 15.f, 1024, 0x60),
+                          rec_mddf(104, 4, 3.f, 1024, 0x60)})
+      merged_mddf.insert(merged_mddf.end(), e.begin(), e.end());
+    std::vector<std::uint8_t> merged_modf;
+    for (auto const& e : {modf_w1, rec_modf(202, 12, 4.f, 0x000C)})
+      merged_modf.insert(merged_modf.end(), e.begin(), e.end());
+
+    {
+      Obj1LodRewrite r = rewriteObj1Lod(full, merged_mddf, merged_modf);
+      if (!r.reason.empty())
+        std::printf("    full-layout rewrite: %s\n", r.reason.c_str());
+      check(r.rewritten && r.reason.empty(), "the full LOD layout rewrites");
+      check(r.bytes.size() > 8, "fixture guard");
+
+      auto mldd = chunk_payload(r.bytes, fc('M','L','D','D'));
+      check(mldd.size() == 2 * 36, "MLDD holds the two survivors");
+      check(rd32(mldd, 0) == 101 && rd32(mldd, 36) == 102, "surviving doodads keep their identity");
+      check(rd32(mldd, 36 + 8) == rd32(merged_mddf, 36 + 8)
+            && mldd[36 + 34] == 0x70 && mldd[34] == 0x68,
+            "moved doodads take the merged transform while flags stay the LOD record's");
+      auto mldx = chunk_payload(r.bytes, fc('M','L','D','X'));
+      check(mldx.size() == 2 * 28, "MLDX holds one extent per survivor");
+      check(std::equal(mldx.begin(), mldx.begin() + 28, extents_a.begin()),
+            "unchanged doodads carry their original extent");
+      check(!std::equal(mldx.begin() + 28, mldx.end(), extents_b.begin()),
+            "moved doodads get a recomputed extent");
+      auto mldl = chunk_payload(r.bytes, fc('M','L','D','L'));
+      Writer exp_mldl; exp_mldl.f32(1.5f); exp_mldl.f32(2.5f);
+      check(mldl == exp_mldl.b, "MLDL keeps the survivor surface heights");
+      auto mdli = chunk_payload(r.bytes, fc('M','D','L','I'));
+      check(mdli.size() == 2 * 4 && rd32(mdli, 0) == 11 && rd32(mdli, 4) == 22,
+            "MDLI shrinks with the doodads it indexes");
+      auto mldb = chunk_payload(r.bytes, fc('M','L','D','B'));
+      check(mldb.size() == 2 && mldb[0] == 7 && mldb[1] == 8,
+            "MLDB follows its MLDD list entry-for-entry");
+      auto mlmd = chunk_payload(r.bytes, fc('M','L','M','D'));
+      check(mlmd.size() == 40 && std::equal(mlmd.begin(), mlmd.end(),
+                                            rec_mlmd(modf_w1).begin()),
+            "unchanged WMO LOD records survive byte-for-byte");
+      auto mlmx = chunk_payload(r.bytes, fc('M','L','M','X'));
+      check(mlmx.size() == 28 && std::equal(mlmx.begin(), mlmx.end(), extents_w1.begin()),
+            "unchanged WMO extents carry over");
+      auto mlmb = chunk_payload(r.bytes, fc('M','L','M','B'));
+      check(mlmb.size() == 1 && mlmb[0] == 0x40, "MLMB keeps one byte per WMO survivor");
+      auto mwdr = chunk_payload(r.bytes, fc('M','W','D','R'));
+      check(mwdr.size() == 8 && rd32(mwdr, 0) == 0 && rd32(mwdr, 4) == 2,
+            "the surviving WMO keeps its doodad-set range");
+      check(chunk_payload(r.bytes, fc('M','W','D','S')).size() == 6,
+            "the MWDS pool is left intact");
+      auto mlfd = chunk_payload(r.bytes, fc('M','L','F','D'));
+      std::array<std::uint32_t, 12> expect = {0, 1, 2, 1, 1, 0, 0, 1, 1, 1, 0, 0};
+      bool bands_ok = mlfd.size() == 48;
+      for (std::size_t i = 0; bands_ok && i < 12; ++i)
+        if (rd32(mlfd, i * 4) != expect[i]) bands_ok = false;
+      check(bands_ok, "MLFD re-tiles both sides around the survivor bands");
+    }
+
+    // Doodad-only tile: the WMO side never existed and must not appear.
+    {
+      Writer mver; mver.tag(fc('M','V','E','R')); mver.u32(4); mver.u32(18);
+      auto a = rec_mddf(101, 1, 0.f, 1024, 0x68);
+      auto doodad_only = cat({mver.b,
+                              make_chunk(fc('M','L','D','D'), a),
+                              make_chunk(fc('M','L','D','X'), extents_a),
+                              make_chunk(fc('M','L','F','D'),
+                                         mlfd_payload({0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0}))});
+      Obj1LodRewrite r = rewriteObj1Lod(doodad_only, a, {});
+      if (!r.reason.empty())
+        std::printf("    doodad-only rewrite: %s\n", r.reason.c_str());
+      check(r.rewritten && r.reason.empty(), "a doodad-only OBJ1 rewrites");
+      check(chunk_payload(r.bytes, fc('M','L','D','D')).size() == 36
+            && !has_chunk(r.bytes, fc('M','L','M','D')),
+            "the doodad-only output keeps its doodads and invents no WMO side");
+    }
+
+    // WMO-only tile.
+    {
+      Writer mver; mver.tag(fc('M','V','E','R')); mver.u32(4); mver.u32(18);
+      auto wmo_only = cat({mver.b,
+                           make_chunk(fc('M','L','M','D'), rec_mlmd(modf_w1)),
+                           make_chunk(fc('M','L','M','X'), extents_w1),
+                           make_chunk(fc('M','L','F','D'),
+                                      mlfd_payload({0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0}))});
+      Obj1LodRewrite r = rewriteObj1Lod(wmo_only, {}, modf_w1);
+      if (!r.reason.empty())
+        std::printf("    wmo-only rewrite: %s\n", r.reason.c_str());
+      check(r.rewritten && r.reason.empty(), "a WMO-only OBJ1 rewrites");
+      check(chunk_payload(r.bytes, fc('M','L','M','D')).size() == 40
+            && !has_chunk(r.bytes, fc('M','L','D','D')),
+            "the WMO-only output keeps its WMOs and invents no doodad side");
+    }
+
+    // No MLDL (no doodad uses the liquid-height flag).
+    {
+      std::vector<std::uint8_t> no_mldl;
+      std::size_t pos = 0;
+      while (pos + 8 <= full.size())
+      {
+        std::uint32_t const size = rd32_at(full, pos + 4);
+        if (rd32_at(full, pos) != fc('M','L','D','L'))
+          no_mldl.insert(no_mldl.end(), full.begin() + pos, full.begin() + pos + 8 + size);
+        pos += 8 + size;
+      }
+      Obj1LodRewrite r = rewriteObj1Lod(no_mldl, merged_mddf, merged_modf);
+      if (!r.reason.empty())
+        std::printf("    MLDL-absent rewrite: %s\n", r.reason.c_str());
+      check(r.rewritten && r.reason.empty() && !has_chunk(r.bytes, fc('M','L','D','L')),
+            "an OBJ1 without MLDL rewrites and stays without MLDL");
+    }
+
+    // Corrupt layouts must pass through untouched with an explanation, never
+    // half-rebuild into count-mismatched companions.
+    {
+      Writer mver; mver.tag(fc('M','V','E','R')); mver.u32(4); mver.u32(18);
+      auto two = cat({rec_mddf(101, 1, 0.f, 1024, 0x68), rec_mddf(102, 2, 5.f, 1024, 0x70)});
+      auto mismatch = cat({mver.b,
+                           make_chunk(fc('M','L','D','D'), two),
+                           make_chunk(fc('M','L','D','X'), extents_a),
+                           make_chunk(fc('M','L','F','D'),
+                                      mlfd_payload({0, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0}))});
+      Obj1LodRewrite r = rewriteObj1Lod(mismatch, two, {});
+      check(!r.rewritten && !r.reason.empty() && r.bytes == mismatch,
+            "a MLDD/MLDX count mismatch passes through with a diagnostic");
+
+      Writer short_mlfd; short_mlfd.zeros(44);
+      auto bad_mlfd = cat({mver.b,
+                           make_chunk(fc('M','L','D','D'), rec_mddf(101, 1, 0.f, 1024, 0x68)),
+                           make_chunk(fc('M','L','D','X'), extents_a),
+                           make_chunk(fc('M','L','F','D'), short_mlfd.b)});
+      Obj1LodRewrite r2 = rewriteObj1Lod(bad_mlfd, rec_mddf(101, 1, 0.f, 1024, 0x68), {});
+      check(!r2.rewritten && !r2.reason.empty() && r2.bytes == bad_mlfd,
+            "a malformed MLFD passes through with a diagnostic");
+
+      auto fragments = cat({mver.b,
+                            make_chunk(fc('M','L','D','L'), {1, 2, 3, 4}),
+                            make_chunk(fc('M','L','F','D'),
+                                       mlfd_payload({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}))});
+      Obj1LodRewrite r3 = rewriteObj1Lod(fragments, {}, {});
+      check(!r3.rewritten && !r3.reason.empty() && r3.bytes == fragments,
+            "companion fragments without lists pass through with a diagnostic");
+
+      Writer mldb; mldb.u8(7); mldb.u8(8); mldb.u8(9);
+      auto bad_mldb = cat({mver.b,
+                           make_chunk(fc('M','L','D','D'), two),
+                           make_chunk(fc('M','L','D','X'), cat({extents_a, extents_a})),
+                           make_chunk(fc('M','L','D','B'), mldb.b),
+                           make_chunk(fc('M','L','F','D'),
+                                      mlfd_payload({0, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0}))});
+      Obj1LodRewrite r4 = rewriteObj1Lod(bad_mldb, two, {});
+      check(!r4.rewritten && !r4.reason.empty() && r4.bytes == bad_mldb,
+            "a MLDB that outnumbers its MLDD passes through with a diagnostic");
+    }
+
+    // Zero-LOD tile (MVER only): silent pass-through, as before.
+    {
+      Writer mver; mver.tag(fc('M','V','E','R')); mver.u32(4); mver.u32(18);
+      Obj1LodRewrite r = rewriteObj1Lod(mver.b, {}, {});
+      check(!r.rewritten && r.reason.empty() && r.bytes == mver.b,
+            "a zero-LOD OBJ1 stays a silent pass-through");
+    }
+  }
+
+  std::printf("\nOBJ0 WMO companion chunks (MLMB/MWDR/MWDS)\n");
+  {
+    // assemble_parts copies MLMB/MWDR verbatim next to a rebuilt MODF; the
+    // companion chunks have to follow the placements they annotate or the
+    // client reads them out of bounds.
+    auto make_chunk = [](std::uint32_t magic, std::vector<std::uint8_t> const& payload)
+    {
+      Writer w;
+      w.tag(magic);
+      w.u32(static_cast<std::uint32_t>(payload.size()));
+      w.raw(payload.data(), payload.size());
+      return w.b;
+    };
+    auto rec_modf = [](std::uint32_t fdid, std::uint32_t uid)
+    {
+      Writer w;
+      w.u32(fdid); w.u32(uid);
+      for (int i = 0; i < 6; ++i) w.f32(0.f);
+      w.f32(100.f); w.f32(10.f); w.f32(100.f);
+      w.f32(-100.f); w.f32(-10.f); w.f32(-100.f);
+      w.u32(0x000Cu | (7u << 16));
+      w.u32(3u | (1024u << 16));
+      return w.b;
+    };
+    auto cat = [](std::vector<std::vector<std::uint8_t>> const& chunks)
+    {
+      std::vector<std::uint8_t> out;
+      for (auto const& c : chunks) out.insert(out.end(), c.begin(), c.end());
+      return out;
+    };
+    struct out_chunk { std::uint32_t magic; std::size_t payload; std::uint32_t size; };
+    auto walk = [](std::vector<std::uint8_t> const& b)
+    {
+      std::vector<out_chunk> out;
+      std::size_t pos = 0;
+      while (pos + 8 <= b.size())
+      {
+        out_chunk c;
+        c.magic = rd32_at(b, pos);
+        c.size = rd32_at(b, pos + 4);
+        c.payload = pos + 8;
+        out.push_back(c);
+        pos += 8 + c.size;
+      }
+      return out;
+    };
+    auto has_chunk = [&](std::vector<std::uint8_t> const& b, std::uint32_t magic)
+    {
+      for (auto const& c : walk(b)) if (c.magic == magic) return true;
+      return false;
+    };
+    auto chunk_payload = [&](std::vector<std::uint8_t> const& b, std::uint32_t magic)
+    {
+      for (auto const& c : walk(b))
+        if (c.magic == magic)
+          return std::vector<std::uint8_t>(b.begin() + c.payload, b.begin() + c.payload + c.size);
+      return std::vector<std::uint8_t>{};
+    };
+
+    Writer mver; mver.tag(fc('M','V','E','R')); mver.u32(4); mver.u32(18);
+    auto w1 = rec_modf(201, 11);
+    auto w2 = rec_modf(202, 12);
+    auto w3 = rec_modf(203, 13);
+    Writer mlmb; mlmb.u8(0x33); mlmb.u8(0x20);
+    Writer mwdr; mwdr.u32(0); mwdr.u32(2); mwdr.u32(2); mwdr.u32(5);
+    Writer mwds; mwds.u16(7); mwds.u16(8); mwds.u16(3); mwds.u16(1); mwds.u16(9);
+    auto original = cat({mver.b,
+                         make_chunk(fc('M','O','D','F'), cat({w1, w2})),
+                         make_chunk(fc('M','L','M','B'), mlmb.b),
+                         make_chunk(fc('M','W','D','R'), mwdr.b),
+                         make_chunk(fc('M','W','D','S'), mwds.b)});
+    // What assemble_parts produces today: MODF rebuilt, companions copied
+    // verbatim from the original, one placement added by the editor.
+    auto merged = cat({mver.b,
+                       make_chunk(fc('M','O','D','F'), cat({w1, w2, w3})),
+                       make_chunk(fc('M','L','M','B'), mlmb.b),
+                       make_chunk(fc('M','W','D','R'), mwdr.b),
+                       make_chunk(fc('M','W','D','S'), mwds.b)});
+
+    Obj0CompanionRewrite r = rewriteObj0Companions(merged, original);
+    if (!r.note.empty())
+      std::printf("    companion carry: %s\n", r.note.c_str());
+    check(r.defaults_used == 1 && r.first_default_fdid == 203,
+          "the added WMO is reported as a companion default");
+    auto out_mlmb = chunk_payload(r.bytes, fc('M','L','M','B'));
+    check(out_mlmb.size() == 3 && out_mlmb[0] == 0x33 && out_mlmb[1] == 0x20
+          && out_mlmb[2] == 0x20,
+          "MLMB keeps the carried bytes and defaults the new placement to the common byte");
+    auto out_mwdr = chunk_payload(r.bytes, fc('M','W','D','R'));
+    check(out_mwdr.size() == 24
+          && rd32_at(out_mwdr, 0) == 0 && rd32_at(out_mwdr, 4) == 2
+          && rd32_at(out_mwdr, 8) == 2 && rd32_at(out_mwdr, 12) == 5
+          && rd32_at(out_mwdr, 16) == 1 && rd32_at(out_mwdr, 20) == 0,
+          "MWDR keeps the carried ranges and gives the new WMO the empty range {1,0}");
+    check(chunk_payload(r.bytes, fc('M','W','D','S')) == mwds.b,
+          "the MWDS pool is carried unchanged");
+
+    // Deleting placements shrinks both companions in lockstep.
+    {
+      auto shrunk = cat({mver.b,
+                         make_chunk(fc('M','O','D','F'), w2),
+                         make_chunk(fc('M','L','M','B'), mlmb.b),
+                         make_chunk(fc('M','W','D','R'), mwdr.b),
+                         make_chunk(fc('M','W','D','S'), mwds.b)});
+      Obj0CompanionRewrite r2 = rewriteObj0Companions(shrunk, original);
+      auto b2 = chunk_payload(r2.bytes, fc('M','L','M','B'));
+      auto d2 = chunk_payload(r2.bytes, fc('M','W','D','R'));
+      check(r2.defaults_used == 0 && r2.note.empty()
+            && b2.size() == 1 && b2[0] == 0x20
+            && d2.size() == 8 && rd32_at(d2, 0) == 2 && rd32_at(d2, 4) == 5,
+            "deleting placements shrinks MLMB and MWDR to the survivors");
+    }
+
+    // An original whose companions disagree with its own MODF: drop both
+    // rather than guess (they are a coupled pair - an MLMB without matching
+    // MWDR would misannotate every placement after the first).
+    {
+      Writer bad_mlmb; bad_mlmb.u8(0x33); bad_mlmb.u8(0x20); bad_mlmb.u8(0x40);
+      auto original2 = cat({mver.b,
+                            make_chunk(fc('M','O','D','F'), cat({w1, w2})),
+                            make_chunk(fc('M','L','M','B'), bad_mlmb.b),
+                            make_chunk(fc('M','W','D','R'), mwdr.b),
+                            make_chunk(fc('M','W','D','S'), mwds.b)});
+      auto merged2 = cat({mver.b,
+                          make_chunk(fc('M','O','D','F'), cat({w1, w2, w3})),
+                          make_chunk(fc('M','L','M','B'), bad_mlmb.b),
+                          make_chunk(fc('M','W','D','R'), mwdr.b),
+                          make_chunk(fc('M','W','D','S'), mwds.b)});
+      Obj0CompanionRewrite r3 = rewriteObj0Companions(merged2, original2);
+      if (r3.note.empty())
+        std::printf("    MLMB anomaly: no note produced\n");
+      check(!r3.note.empty()
+            && !has_chunk(r3.bytes, fc('M','L','M','B'))
+            && !has_chunk(r3.bytes, fc('M','W','D','R'))
+            && has_chunk(r3.bytes, fc('M','W','D','S')),
+            "inconsistent original companions are dropped as a pair, with a note");
+      check(r3.defaults_used == 0, "dropped companions count as no defaults");
+    }
+
+    // An OBJ0 that never had companions stays untouched.
+    {
+      auto bare = cat({mver.b, make_chunk(fc('M','O','D','F'), cat({w1, w2, w3}))});
+      Obj0CompanionRewrite r4 = rewriteObj0Companions(bare, bare);
+      check(r4.bytes == bare && r4.note.empty() && r4.defaults_used == 0,
+            "an OBJ0 without companions passes through unchanged");
+    }
   }
 
   std::printf("\n%d checks, %d failed\n", g_checks, g_failed);

@@ -1106,7 +1106,7 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
       }
       catch (std::exception const& error)
       {
-        LogError << "[ModernADT][Save] Native ROOT writer failed for \""
+        LogError << "[ModernADT][Save] Native split-tile save failed for \""
                  << _file_key.stringRepr() << "\" (" << error.what()
                  << "); falling back to the conversion path." << std::endl;
       }
@@ -1138,6 +1138,11 @@ bool MapTile::save(World* world, bool save_using_mclq_liquids)
                  << " asset(s) written with an invented FileDataID the client does not know"
                  << (report.first_custom_fdid.empty()
                        ? "" : " (first: " + report.first_custom_fdid + ")")
+                 << ", " << report.companion_defaults
+                 << " added WMO placement(s) written with default LOD companion bytes"
+                 << (report.first_companion_default_fdid
+                       ? " (first: FileDataID " + std::to_string(report.first_companion_default_fdid) + ")"
+                       : "")
                  << (report.synthesized
                        ? ". The parts were synthesized from the edited tile, so chunks that"
                          " exist only in the retail file (MTXP height textures, MHID) are"
