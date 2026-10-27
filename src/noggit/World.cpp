@@ -4636,6 +4636,99 @@ void World::importAllADTsHeightmaps(QProgressDialog* progress_dialog, float min_
   }
 }
 
+std::size_t World::importHeightmapRegion(Noggit::Formats::Heightmap::HeightmapBuffer const& image,
+                                         Noggit::Formats::Heightmap::HeightmapRegion const& region,
+                                         float min_height, float max_height, unsigned mode,
+                                         QProgressDialog* progress_dialog)
+{
+  ZoneScoped;
+
+  namespace Heightmap = Noggit::Formats::Heightmap;
+
+  if (!image.valid() || !region.valid())
+  {
+    LogError << "[Heightmap] Region import refused: the image buffer or the tile region is invalid."
+             << std::endl;
+    return 0;
+  }
+
+  Log << "[Heightmap] Importing a " << image.width << "x" << image.height << " image over tiles "
+      << region.x0 << "," << region.z0 << " - " << region.x1 << "," << region.z1 << " ("
+      << region.tile_count() << " tile(s)), heights " << min_height << " .. " << max_height
+      << ", mode " << mode << "." << std::endl;
+
+  std::size_t written = 0;
+  std::size_t processed = 0;
+  for (std::uint32_t z = region.z0; z <= region.z1; ++z)
+  {
+    for (std::uint32_t x = region.x0; x <= region.x1; ++x)
+    {
+      if (progress_dialog)
+      {
+        if (progress_dialog->wasCanceled())
+        {
+          Log << "[Heightmap] Region import canceled after " << written << " tile(s)." << std::endl;
+          return written;
+        }
+        progress_dialog->setValue(static_cast<int>(processed));
+      }
+      ++processed;
+
+      TileIndex tile(x, z);
+      bool unload = !mapIndex.tileLoaded(tile) && !mapIndex.tileAwaitingLoading(tile);
+      MapTile* mTile = mapIndex.loadTile(tile);
+      if (!mTile)
+        continue;
+
+      mTile->wait_until_loaded();
+
+      std::vector<float> slice;
+      if (!Heightmap::sliceTileFromHeightmap(image, region, x, z, slice))
+      {
+        if (unload)
+          mapIndex.unloadTile(tile);
+        continue;
+      }
+
+      // Format_RGBA64 is the precise path through MapTile::setHeightmapImage;
+      // its 8-bit branch quantizes to 256 height levels, which shows as
+      // terracing on gentle slopes.
+      QImage img(static_cast<int>(Heightmap::heightmap_tile_side),
+                 static_cast<int>(Heightmap::heightmap_tile_side),
+                 QImage::Format_RGBA64);
+      for (std::size_t row = 0; row < Heightmap::heightmap_tile_side; ++row)
+      {
+        auto* line = reinterpret_cast<QRgba64*>(img.scanLine(static_cast<int>(row)));
+        for (std::size_t col = 0; col < Heightmap::heightmap_tile_side; ++col)
+        {
+          float const sample = std::clamp(slice[row * Heightmap::heightmap_tile_side + col], 0.f, 1.f);
+          auto const level = static_cast<quint16>(sample * 65535.f + 0.5f);
+          line[col] = qRgba64(level, level, level, 0xFFFF);
+        }
+      }
+
+      mTile->setHeightmapImage(img, min_height, max_height, static_cast<int>(mode), false);
+      mTile->saveTile(this);
+      mapIndex.markOnDisc(tile, true);
+      mapIndex.unsetChanged(tile);
+      ++written;
+
+      if (unload)
+        mapIndex.unloadTile(tile);
+    }
+  }
+
+  if (progress_dialog)
+    progress_dialog->setValue(static_cast<int>(processed));
+
+  Log << "[Heightmap] Region import finished: " << written << " tile(s) written from the image."
+      << " The horizon data (.wdl) still describes the OLD terrain - regenerate it"
+         " (Editor -> Generate new WDL) before exporting for the client, or distant"
+         " terrain will not match what was imported." << std::endl;
+
+  return written;
+}
+
 void World::importAllADTVertexColorMaps(unsigned mode, bool tiledEdges)
 {
   ZoneScoped;

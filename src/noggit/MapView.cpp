@@ -8,6 +8,7 @@
 #include <noggit/WMOInstance.h> // WMOInstance
 #include <noggit/World.h>
 #include <noggit/MapTile.h>
+#include <noggit/formats/heightmap/HeightmapImport.hpp>
 #include <noggit/map_index.hpp>
 #include <noggit/TabletManager.hpp>
 #include <opengl/texture.hpp>
@@ -101,6 +102,7 @@
 #include <QtWidgets/QMenuBar>
 #include <QtWidgets/QOpenGLWidget>
 #include <QtWidgets/QPushButton>
+#include <QtWidgets/QRadioButton>
 #include <QtWidgets/QStatusBar>
 #include <QWidgetAction>
 #include <QSurfaceFormat>
@@ -1437,6 +1439,93 @@ void MapView::setupAssistMenu()
 
           });
 
+  // One image stretched over a rectangle of tiles: the "generate terrain
+  // from a heightmap" importer. Slicing happens in the Qt-free
+  // Noggit::Formats::Heightmap core (harness-tested); tiles are applied and
+  // saved immediately by World::importHeightmapRegion.
+  QDialog* heightmap_region_import_params = new QDialog(this);
+  heightmap_region_import_params->setWindowTitle("Heightmap Region Importer");
+  QVBoxLayout* heightmap_region_import_layout = new QVBoxLayout(heightmap_region_import_params);
+
+  heightmap_region_import_layout->addWidget(new QLabel(
+    "Stretches ONE grayscale image over the chosen tiles and writes the\n"
+    "terrain from it. Black = min height, white = max height. The image's\n"
+    "top-left corner is the first tile of the range, right is +X and down\n"
+    "is +Z - the same orientation as the per-tile 'Export heightmap' PNGs.\n"
+    "Any size works (it is resampled); a range of N x M tiles maps 1:1\n"
+    "from an image of (N*256+1) x (M*256+1) pixels. Every touched tile is\n"
+    "saved immediately.",
+    heightmap_region_import_params));
+
+  QRadioButton* heightmap_region_whole_map = new QRadioButton("Whole map (0,0 - 63,63)", heightmap_region_import_params);
+  QRadioButton* heightmap_region_custom = new QRadioButton("Tile range:", heightmap_region_import_params);
+  heightmap_region_whole_map->setChecked(true);
+  heightmap_region_import_layout->addWidget(heightmap_region_whole_map);
+  heightmap_region_import_layout->addWidget(heightmap_region_custom);
+
+  heightmap_region_import_layout->addWidget(new QLabel("First tile (X, Z):", heightmap_region_import_params));
+  QSpinBox* heightmap_region_x0 = new QSpinBox(heightmap_region_import_params);
+  heightmap_region_x0->setRange(0, 63);
+  heightmap_region_x0->setValue(0);
+  heightmap_region_import_layout->addWidget(heightmap_region_x0);
+  QSpinBox* heightmap_region_z0 = new QSpinBox(heightmap_region_import_params);
+  heightmap_region_z0->setRange(0, 63);
+  heightmap_region_z0->setValue(0);
+  heightmap_region_import_layout->addWidget(heightmap_region_z0);
+
+  heightmap_region_import_layout->addWidget(new QLabel("Last tile (X, Z):", heightmap_region_import_params));
+  QSpinBox* heightmap_region_x1 = new QSpinBox(heightmap_region_import_params);
+  heightmap_region_x1->setRange(0, 63);
+  heightmap_region_x1->setValue(63);
+  heightmap_region_import_layout->addWidget(heightmap_region_x1);
+  QSpinBox* heightmap_region_z1 = new QSpinBox(heightmap_region_import_params);
+  heightmap_region_z1->setRange(0, 63);
+  heightmap_region_z1->setValue(63);
+  heightmap_region_import_layout->addWidget(heightmap_region_z1);
+
+  for (QSpinBox* spin : {heightmap_region_x0, heightmap_region_z0, heightmap_region_x1, heightmap_region_z1})
+    spin->setEnabled(false);
+
+  connect(heightmap_region_custom, &QRadioButton::toggled, [=](bool checked)
+    {
+      for (QSpinBox* spin : {heightmap_region_x0, heightmap_region_z0, heightmap_region_x1, heightmap_region_z1})
+        spin->setEnabled(checked);
+    });
+  connect(heightmap_region_whole_map, &QRadioButton::toggled, [=](bool checked)
+    {
+      if (checked)
+      {
+        heightmap_region_x0->setValue(0);
+        heightmap_region_z0->setValue(0);
+        heightmap_region_x1->setValue(63);
+        heightmap_region_z1->setValue(63);
+      }
+    });
+
+  heightmap_region_import_layout->addWidget(new QLabel("Min Height:", heightmap_region_import_params));
+  QDoubleSpinBox* heightmap_region_min = new QDoubleSpinBox(heightmap_region_import_params);
+  heightmap_region_min->setRange(MIN_HEIGHT, MAX_HEIGHT);
+  heightmap_region_min->setValue(DEFAULT_MIN_HEIGHT);
+  heightmap_region_import_layout->addWidget(heightmap_region_min);
+
+  heightmap_region_import_layout->addWidget(new QLabel("Max Height:", heightmap_region_import_params));
+  QDoubleSpinBox* heightmap_region_max = new QDoubleSpinBox(heightmap_region_import_params);
+  heightmap_region_max->setRange(MIN_HEIGHT, MAX_HEIGHT);
+  heightmap_region_max->setValue(DEFAULT_MAX_HEIGHT);
+  heightmap_region_import_layout->addWidget(heightmap_region_max);
+
+  heightmap_region_import_layout->addWidget(new QLabel("Mode:", heightmap_region_import_params));
+  QComboBox* heightmap_region_mode = new QComboBox(heightmap_region_import_params);
+  heightmap_region_mode->addItems({"Set", "Add", "Subtract", "Multiply"});
+  heightmap_region_import_layout->addWidget(heightmap_region_mode);
+
+  QPushButton* heightmap_region_okay = new QPushButton("Okay", heightmap_region_import_params);
+  heightmap_region_import_layout->addWidget(heightmap_region_okay);
+  connect(heightmap_region_okay, &QPushButton::clicked, [=]()
+    {
+      heightmap_region_import_params->accept();
+    });
+
   ADD_ACTION_NS ( cur_adt_import_menu
   , "Import heightmap (file)"
   , [=]
@@ -1866,6 +1955,128 @@ void MapView::setupAssistMenu()
               NOGGIT_ACTION_MGR->endAction();
         )
       }
+    }
+  );
+
+  ADD_ACTION_NS ( all_adts_import_menu
+  , "Import heightmap (one image over tile range)"
+  , [=]
+    {
+      if (heightmap_region_import_params->exec() != QDialog::Accepted)
+        return;
+
+      QString filepath = QFileDialog::getOpenFileName(
+        this,
+        tr("Open heightmap image"),
+        "",
+        "Images (*.png *.bmp *.jpg *.jpeg *.tga *.tif *.tiff *.webp);;All files (*)"
+      );
+      if (filepath.isEmpty() || !QFileInfo::exists(filepath))
+        return;
+
+      QImage loaded_image;
+      if (!loaded_image.load(filepath))
+      {
+        QMessageBox::warning(this, "Heightmap import", "Could not read the image:\n" + filepath);
+        return;
+      }
+
+      Noggit::Formats::Heightmap::HeightmapRegion region;
+      if (heightmap_region_whole_map->isChecked())
+      {
+        region = {0, 0, 63, 63};
+      }
+      else
+      {
+        region.x0 = static_cast<std::uint32_t>(heightmap_region_x0->value());
+        region.z0 = static_cast<std::uint32_t>(heightmap_region_z0->value());
+        region.x1 = static_cast<std::uint32_t>(heightmap_region_x1->value());
+        region.z1 = static_cast<std::uint32_t>(heightmap_region_z1->value());
+        if (!region.valid())
+        {
+          QMessageBox::warning(this, "Heightmap import",
+            "Invalid tile range: the last tile must be at or after the first one (X and Z).");
+          return;
+        }
+      }
+
+      // 16-bit grayscale keeps gentle slopes smooth; pixels beyond what the
+      // region can address 1:1 are downsampled because no vertex could ever
+      // read them.
+      QImage gray = loaded_image.convertToFormat(QImage::Format_Grayscale16);
+      std::size_t const ideal_w = Noggit::Formats::Heightmap::idealHeightmapDimension(region.tiles_x());
+      std::size_t const ideal_h = Noggit::Formats::Heightmap::idealHeightmapDimension(region.tiles_z());
+      if (static_cast<std::size_t>(gray.width()) > ideal_w
+          || static_cast<std::size_t>(gray.height()) > ideal_h)
+      {
+        gray = gray.scaled(static_cast<int>(std::min<std::size_t>(static_cast<std::size_t>(gray.width()), ideal_w)),
+                           static_cast<int>(std::min<std::size_t>(static_cast<std::size_t>(gray.height()), ideal_h)),
+                           Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+      }
+
+      Noggit::Formats::Heightmap::HeightmapBuffer buffer;
+      buffer.width = static_cast<std::size_t>(gray.width());
+      buffer.height = static_cast<std::size_t>(gray.height());
+      buffer.samples.resize(buffer.width * buffer.height);
+      for (std::size_t y = 0; y < buffer.height; ++y)
+      {
+        auto const* line = reinterpret_cast<quint16 const*>(gray.constScanLine(static_cast<int>(y)));
+        for (std::size_t x = 0; x < buffer.width; ++x)
+          buffer.samples[y * buffer.width + x] = line[x] / 65535.f;
+      }
+
+      DESTRUCTIVE_ACTION
+      (
+        makeCurrent();
+        OpenGL::context::scoped_setter const _(::gl, context());
+
+        QProgressDialog progress_dialog("Generating terrain from image...", "Cancel", 0,
+                                        static_cast<int>(region.tile_count()), this);
+        progress_dialog.setWindowModality(Qt::WindowModal);
+
+        setUpdatesEnabled(false);
+        QSignalBlocker blocker(this);
+        std::size_t const written =
+          _world->importHeightmapRegion(buffer, region,
+                                        static_cast<float>(heightmap_region_min->value()),
+                                        static_cast<float>(heightmap_region_max->value()),
+                                        static_cast<unsigned>(heightmap_region_mode->currentIndex()),
+                                        &progress_dialog);
+        setUpdatesEnabled(true);
+
+        if (written)
+        {
+          QMessageBox wdl_prompt;
+          wdl_prompt.setIcon(QMessageBox::Question);
+          wdl_prompt.setText("Horizon data (.wdl) is now stale");
+          wdl_prompt.setInformativeText(
+            QString("%1 tile(s) were written from the image. The .wdl still describes"
+                    " the old terrain, so distant LOD in the client would not match"
+                    " until it is regenerated. Regenerate it now? This loads every"
+                    " tile of the map and can take a while - it can also be done"
+                    " later via Editor -> Generate new WDL.")
+              .arg(static_cast<qulonglong>(written)));
+          wdl_prompt.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+          wdl_prompt.setDefaultButton(QMessageBox::No);
+          if (wdl_prompt.exec() == QMessageBox::Yes)
+          {
+            try
+            {
+              _world->horizon.save_wdl(_world.get(), true);
+            }
+            catch (std::exception const& e)
+            {
+              LogError << "[Heightmap] WDL regeneration after region import failed: "
+                       << e.what() << std::endl;
+            }
+            catch (...)
+            {
+              LogError << "[Heightmap] WDL regeneration after region import failed:"
+                          " unknown exception" << std::endl;
+            }
+          }
+        }
+      )
     }
   );
 

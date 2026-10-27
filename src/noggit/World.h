@@ -8,6 +8,7 @@
 #include <noggit/map_index.hpp>
 #include <noggit/world_tile_update_queue.hpp>
 #include <noggit/world_model_instances_storage.hpp>
+#include <noggit/formats/heightmap/HeightmapImport.hpp>
 #include <noggit/ContextObject.hpp>
 #include <optional>
 #include <string>
@@ -275,6 +276,15 @@ public:
 
   void importAllADTsAlphamaps(QProgressDialog* progress_dialog);
   void importAllADTsHeightmaps(QProgressDialog* progress_dialog, float min_height, float max_height, unsigned mode, bool tiledEdges);
+  //! Stretches ONE grayscale image over an inclusive rectangle of tiles and
+  //! writes every tile it touches - the "generate terrain from an image"
+  //! path. Tiles are loaded, resampled with Heightmap::sliceTileFromHeightmap
+  //! (seamless across tile borders at any image size), saved immediately and
+  //! unloaded again unless they were already loaded.
+  std::size_t importHeightmapRegion(Noggit::Formats::Heightmap::HeightmapBuffer const& image,
+                                    Noggit::Formats::Heightmap::HeightmapRegion const& region,
+                                    float min_height, float max_height, unsigned mode,
+                                    QProgressDialog* progress_dialog);
   void importAllADTVertexColorMaps(unsigned mode, bool tiledEdges);
 
   void ensureAllTilesetsADT(glm::vec3 const& pos);
