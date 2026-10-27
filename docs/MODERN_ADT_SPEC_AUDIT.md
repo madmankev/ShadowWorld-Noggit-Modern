@@ -218,6 +218,7 @@ format natively (`WDL::writeModernWdl` / `rewriteModernWdl`) — see
 
     mkdir -p /tmp/synth && g++ -std=c++20 -I src -I src/external \
       -o /tmp/synth/harness tools/adt_format_check.cpp \
+      src/noggit/formats/heightmap/HeightmapImport.cpp \
       src/noggit/formats/adt/ModernAdtWriter.cpp \
       src/noggit/formats/adt/ModernAdtReader.cpp \
       src/noggit/formats/wdt/WdtReader.cpp \

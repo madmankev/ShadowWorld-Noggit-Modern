@@ -41,6 +41,7 @@
 
 #include <noggit/formats/adt/ModernAdtReader.hpp>
 #include <noggit/formats/adt/ModernAdtWriter.hpp>
+#include <noggit/formats/heightmap/HeightmapImport.hpp>
 #include <noggit/formats/conversion/MapConversion.hpp>
 #include <noggit/formats/export/MapExport.hpp>
 #include <noggit/formats/wdl/ModernWdlWriter.hpp>
@@ -2628,6 +2629,149 @@ int main()
       Obj0CompanionRewrite r4 = rewriteObj0Companions(bare, bare);
       check(r4.bytes == bare && r4.note.empty() && r4.defaults_used == 0,
             "an OBJ0 without companions passes through unchanged");
+    }
+  }
+
+  std::printf("\nheightmap region slicing (single image -> terrain)\n");
+  {
+    using namespace Noggit::Formats::Heightmap;
+
+    auto gradient_x = [](std::size_t w, std::size_t h)
+    {
+      HeightmapBuffer b;
+      b.width = w; b.height = h;
+      b.samples.resize(w * h);
+      for (std::size_t v = 0; v < h; ++v)
+        for (std::size_t u = 0; u < w; ++u)
+          b.samples[v * w + u] = static_cast<float>(u) / static_cast<float>(w - 1);
+      return b;
+    };
+    auto gradient_y = [](std::size_t w, std::size_t h)
+    {
+      HeightmapBuffer b;
+      b.width = w; b.height = h;
+      b.samples.resize(w * h);
+      for (std::size_t v = 0; v < h; ++v)
+        for (std::size_t u = 0; u < w; ++u)
+          b.samples[v * w + u] = static_cast<float>(v) / static_cast<float>(h - 1);
+      return b;
+    };
+    HeightmapRegion const two_by_two{0, 0, 1, 1};
+    std::size_t constexpr side = heightmap_tile_side;
+
+    check(idealHeightmapDimension(0) == 0 && idealHeightmapDimension(1) == 257
+          && idealHeightmapDimension(2) == 513 && idealHeightmapDimension(64) == 16385,
+          "the ideal image dimension is tiles * 256 + 1");
+
+    // Exact-size image over a 2x2 region: 1:1 pixel mapping, shared borders.
+    {
+      auto img = gradient_x(513, 513);
+      std::vector<float> t00, t10, t11;
+      check(sliceTileFromHeightmap(img, two_by_two, 0, 0, t00)
+            && sliceTileFromHeightmap(img, two_by_two, 1, 0, t10)
+            && sliceTileFromHeightmap(img, two_by_two, 1, 1, t11),
+            "slicing an exact-size image succeeds for every tile of the region");
+      check(t00.size() == side * side, "a slice is a 257x257 vertex grid");
+      bool exact = true;
+      for (std::size_t r = 0; exact && r < side; ++r)
+        for (std::size_t c = 0; exact && c < side; ++c)
+          if (t00[r * side + c] != static_cast<float>(c) / 512.f) exact = false;
+      check(exact, "an exact-size slice maps pixels 1:1 onto the vertex grid");
+      bool seam_x = true;
+      for (std::size_t r = 0; seam_x && r < side; ++r)
+        if (t00[r * side + 256] != t10[r * side + 0]) seam_x = false;
+      check(seam_x, "neighbouring tiles share bit-identical border columns");
+      check(t11[256 * side + 256] == 1.f && t10[0] == 0.5f,
+            "the region's outer corners land on the image's outer corners");
+    }
+
+    // Vertical continuity uses the same mechanism on the other axis.
+    {
+      auto img = gradient_y(513, 513);
+      std::vector<float> t00, t01;
+      check(sliceTileFromHeightmap(img, two_by_two, 0, 0, t00)
+            && sliceTileFromHeightmap(img, two_by_two, 0, 1, t01),
+            "slicing a y-gradient succeeds");
+      bool seam_z = true;
+      for (std::size_t c = 0; seam_z && c < side; ++c)
+        if (t00[256 * side + c] != t01[0 * side + c]) seam_z = false;
+      check(seam_z, "neighbouring tiles share bit-identical border rows");
+      check(t00[0] == 0.f && t01[256 * side + 0] == 1.f,
+            "the y-gradient spans the region top to bottom");
+    }
+
+    // Smaller image: bilinear resampling, seams still bit-identical.
+    {
+      auto img = gradient_x(129, 129);
+      std::vector<float> t00, t10;
+      check(sliceTileFromHeightmap(img, two_by_two, 0, 0, t00)
+            && sliceTileFromHeightmap(img, two_by_two, 1, 0, t10),
+            "slicing a downsampled image succeeds");
+      bool interp_ok = std::fabs(t00[2] - 0.5f / 128.f) < 1e-6f
+                    && std::fabs(t00[4] - 1.f / 128.f) < 1e-6f;
+      check(interp_ok, "fractional source coordinates interpolate bilinearly");
+      bool seam = true;
+      for (std::size_t r = 0; seam && r < side; ++r)
+        if (t00[r * side + 256] != t10[r * side + 0]) seam = false;
+      check(seam, "resampled neighbours still share bit-identical borders");
+      check(std::fabs(t10[256] - 1.f) < 1e-6f, "the resampled region ends at the image edge");
+    }
+
+    // Single-tile region with a matching image is the identity.
+    {
+      HeightmapBuffer img;
+      img.width = side; img.height = side;
+      img.samples.resize(side * side);
+      for (std::size_t i = 0; i < img.samples.size(); ++i)
+        img.samples[i] = static_cast<float>(i % 251) / 250.f;
+      HeightmapRegion const one{3, 7, 3, 7};
+      std::vector<float> t;
+      check(sliceTileFromHeightmap(img, one, 3, 7, t) && t == img.samples,
+            "a 257x257 image over one tile is copied verbatim");
+    }
+
+    // Non-square image over a non-square region.
+    {
+      auto img = gradient_x(513, 257);
+      HeightmapRegion const wide{0, 0, 1, 0};
+      std::vector<float> t00, t10;
+      check(sliceTileFromHeightmap(img, wide, 0, 0, t00)
+            && sliceTileFromHeightmap(img, wide, 1, 0, t10),
+            "non-square regions slice");
+      check(t00[256] == 0.5f && t10[256] == 1.f && t10[0] == 0.5f,
+            "each axis resamples independently");
+    }
+
+    // Out-of-range samples clamp into 0..1.
+    {
+      HeightmapBuffer img;
+      img.width = 257; img.height = 257;
+      img.samples.assign(257 * 257, 1.5f);
+      HeightmapRegion const one{0, 0, 0, 0};
+      std::vector<float> t;
+      check(sliceTileFromHeightmap(img, one, 0, 0, t) && t[0] == 1.f && t[256 * 257 - 1] == 1.f,
+            "samples above 1.0 clamp to 1.0");
+      img.samples.assign(257 * 257, -0.5f);
+      check(sliceTileFromHeightmap(img, one, 0, 0, t) && t[0] == 0.f,
+            "samples below 0.0 clamp to 0.0");
+    }
+
+    // Invalid inputs are refused, not half-applied.
+    {
+      auto img = gradient_x(513, 513);
+      std::vector<float> t;
+      check(!sliceTileFromHeightmap(img, HeightmapRegion{1, 0, 0, 0}, 0, 0, t) && t.empty(),
+            "an inverted region is refused");
+      check(!sliceTileFromHeightmap(img, HeightmapRegion{0, 0, 64, 0}, 0, 0, t) && t.empty(),
+            "a region past tile 63 is refused");
+      check(!sliceTileFromHeightmap(img, two_by_two, 5, 0, t) && t.empty(),
+            "a tile outside the region is refused");
+      HeightmapBuffer broken = img;
+      broken.samples.pop_back();
+      check(!sliceTileFromHeightmap(broken, two_by_two, 0, 0, t) && t.empty(),
+            "a buffer whose size disagrees with its dimensions is refused");
+      check(!sliceTileFromHeightmap(HeightmapBuffer{}, two_by_two, 0, 0, t) && t.empty(),
+            "an empty buffer is refused");
     }
   }
 
