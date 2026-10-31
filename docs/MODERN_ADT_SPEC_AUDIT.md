@@ -179,6 +179,15 @@ when the source carries them.
   {1,0} for MWDR on new placements - and if the original's own companions
   disagree with its MODF, both chunks are dropped together with a logged
   note (a lone MLMB without matching MWDR would misannotate every placement).
+* The exporter audits what older builds left behind
+  (`validateObjectCompanions`, harness-covered): every `_obj0`/`_obj1` in an
+  export set is checked for companion arrays whose counts disagree with their
+  placement lists (MLDB/MLMB/MWDR vs MLDD/MLMD/MODF, MLDX/MLMX extents, MLFD
+  band tiling). Mismatches are named per file in the export warnings with the
+  re-save remedy - structural validation alone cannot see them, and shipping
+  them silently is how the 2026-10-24 crash reached the client. **Assist ->
+  Re-save every tile** is the one-click repair; see
+  [`FIELD_REPAIR_RUNBOOK.md`](FIELD_REPAIR_RUNBOOK.md).
 * A retail ROOT without MCIN no longer blocks the save fallback
   (`refreshRootBookkeeping`): azeroth ROOTs of the 9.2.7 client legitimately
   omit MCIN, and the fallback refused them with "ROOT lacks MHDR/MCIN; cannot
