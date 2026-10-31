@@ -4729,6 +4729,63 @@ std::size_t World::importHeightmapRegion(Noggit::Formats::Heightmap::HeightmapBu
   return written;
 }
 
+std::size_t World::resaveAllTiles(QProgressDialog* progress_dialog)
+{
+  ZoneScoped;
+
+  std::size_t written = 0;
+  std::size_t failed = 0;
+  std::size_t processed = 0;
+  for (std::uint32_t z = 0; z < 64; ++z)
+  {
+    for (std::uint32_t x = 0; x < 64; ++x)
+    {
+      if (progress_dialog)
+      {
+        if (progress_dialog->wasCanceled())
+        {
+          Log << "[Repair] Re-save canceled after " << written << " tile(s) written, "
+              << failed << " failed." << std::endl;
+          return written;
+        }
+        progress_dialog->setValue(static_cast<int>(processed));
+      }
+
+      TileIndex tile(x, z);
+      bool unload = !mapIndex.tileLoaded(tile) && !mapIndex.tileAwaitingLoading(tile);
+      MapTile* mTile = mapIndex.loadTile(tile);
+      if (!mTile)
+        continue;
+      ++processed;
+
+      mTile->wait_until_loaded();
+
+      if (mTile->saveTile(this))
+      {
+        mapIndex.markOnDisc(tile, true);
+        mapIndex.unsetChanged(tile);
+        ++written;
+      }
+      else
+      {
+        ++failed;
+        LogError << "[Repair] Tile " << x << "_" << z << " did not save cleanly;"
+                    " the per-tile diagnostics above say why." << std::endl;
+      }
+
+      if (unload)
+        mapIndex.unloadTile(tile);
+    }
+  }
+
+  if (progress_dialog)
+    progress_dialog->setValue(static_cast<int>(processed));
+
+  Log << "[Repair] Re-save finished: " << written << " tile(s) written through the current"
+      << " save pipeline, " << failed << " failed." << std::endl;
+  return written;
+}
+
 void World::importAllADTVertexColorMaps(unsigned mode, bool tiledEdges)
 {
   ZoneScoped;

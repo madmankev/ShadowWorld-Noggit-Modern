@@ -285,6 +285,13 @@ public:
                                     Noggit::Formats::Heightmap::HeightmapRegion const& region,
                                     float min_height, float max_height, unsigned mode,
                                     QProgressDialog* progress_dialog);
+  //! Loads every existing tile, runs it through the current save pipeline and
+  //! unloads it again unless it was already open - the one-click repair for
+  //! project folders written by older builds (stale LOD companion chunks are
+  //! the access-violation class of the 2026-10-24 field crash; the current
+  //! writer rebuilds them in lockstep). Returns the number of tiles whose
+  //! save reported success.
+  std::size_t resaveAllTiles(QProgressDialog* progress_dialog);
   void importAllADTVertexColorMaps(unsigned mode, bool tiledEdges);
 
   void ensureAllTilesetsADT(glm::vec3 const& pos);

@@ -1820,6 +1820,29 @@ void MapView::setupAssistMenu()
   );
 
   ADD_ACTION_NS ( assist_menu
+  , "Re-save every tile (repair project files)"
+  , [=]
+    {
+      DESTRUCTIVE_ACTION
+      (
+        makeCurrent();
+        OpenGL::context::scoped_setter const _(::gl, context());
+
+        QProgressDialog progress_dialog("Re-saving every tile through the current writer...",
+                                        "Cancel", 0,
+                                        static_cast<int>(_world->mapIndex.getNumExistingTiles()),
+                                        this);
+        progress_dialog.setWindowModality(Qt::WindowModal);
+
+        setUpdatesEnabled(false);
+        QSignalBlocker blocker(this);
+        _world->resaveAllTiles(&progress_dialog);
+        setUpdatesEnabled(true);
+      )
+    }
+  );
+
+  ADD_ACTION_NS ( assist_menu
   , "Clear textures"
   , [this]
       {
