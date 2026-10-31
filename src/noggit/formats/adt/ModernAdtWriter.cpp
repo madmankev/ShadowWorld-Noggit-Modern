@@ -1884,4 +1884,122 @@ namespace Noggit::Formats::ADT
     result.note = note.str();
     return result;
   }
+
+  std::vector<std::string> validateObjectCompanions(
+      std::vector<std::uint8_t> const& part, ObjectPartKind kind)
+  {
+    std::vector<std::string> problems;
+
+    std::vector<ChunkView> chunks;
+    try
+    {
+      chunks = parse_chunks(part, "object part");
+    }
+    catch (std::exception const&)
+    {
+      // A file that does not even walk is validatePart's job; do not pile on.
+      return problems;
+    }
+
+    auto const mismatch = [](char const* what, std::size_t have, std::size_t want)
+    {
+      std::ostringstream out;
+      out << what << " covers " << have << " placement(s) but the list holds " << want;
+      return out.str();
+    };
+
+    if (kind == ObjectPartKind::Obj1)
+    {
+      auto const* mldd = find_chunk(chunks, MCC_MLDD);
+      auto const* mldx = find_chunk(chunks, MCC_MLDX);
+      auto const* mldl = find_chunk(chunks, MCC_MLDL);
+      auto const* mdli = find_chunk(chunks, MCC_MDLI);
+      auto const* mldb = find_chunk(chunks, MCC_MLDB);
+      auto const* mlmd = find_chunk(chunks, MCC_MLMD);
+      auto const* mlmx = find_chunk(chunks, MCC_MLMX);
+      auto const* mlmb = find_chunk(chunks, MCC_MLMB);
+      auto const* mwdr = find_chunk(chunks, MCC_MWDR);
+      auto const* mlfd = find_chunk(chunks, MCC_MLFD);
+
+      std::size_t doodads = 0;
+      if (mldd)
+      {
+        if (mldd->size % sizeof(ENTRY_MDDF) != 0)
+          problems.emplace_back("MLDD size is not a multiple of the entry size");
+        doodads = mldd->size / sizeof(ENTRY_MDDF);
+        if (mldx && mldx->size != doodads * sizeof(LodExtent))
+          problems.emplace_back(mismatch("the MLDX extent list", mldx->size / sizeof(LodExtent), doodads));
+        if (mldl && mldl->size != doodads * 4)
+          problems.emplace_back(mismatch("the MLDL height list", mldl->size / 4, doodads));
+        if (mdli && mdli->size != doodads * 4)
+          problems.emplace_back(mismatch("the MDLI list", mdli->size / 4, doodads));
+        if (mldb && mldb->size != doodads)
+          problems.emplace_back(mismatch("the MLDB class-byte list", mldb->size, doodads));
+      }
+
+      std::size_t wmos = 0;
+      if (mlmd)
+      {
+        if (mlmd->size % sizeof(LodMapObject) != 0)
+          problems.emplace_back("MLMD size is not a multiple of the entry size");
+        wmos = mlmd->size / sizeof(LodMapObject);
+        if (mlmx && mlmx->size != wmos * sizeof(LodExtent))
+          problems.emplace_back(mismatch("the MLMX extent list", mlmx->size / sizeof(LodExtent), wmos));
+        if (mlmb && mlmb->size != wmos)
+          problems.emplace_back(mismatch("the MLMB class-byte list", mlmb->size, wmos));
+        if (mwdr && mwdr->size != wmos * 8)
+          problems.emplace_back(mismatch("the MWDR doodad-set range list", mwdr->size / 8, wmos));
+      }
+
+      if (mlfd)
+      {
+        if (mlfd->size != 48)
+          problems.emplace_back("MLFD is not the documented 48 bytes");
+        else
+        {
+          LodBandTable doodad_bands{};
+          LodBandTable wmo_bands{};
+          for (int b = 0; b < 3; ++b)
+          {
+            doodad_bands.offset[b] = read_u32(part, mlfd->payload + std::size_t(b) * 4);
+            doodad_bands.length[b] = read_u32(part, mlfd->payload + std::size_t(3 + b) * 4);
+            wmo_bands.offset[b] = read_u32(part, mlfd->payload + std::size_t(6 + b) * 4);
+            wmo_bands.length[b] = read_u32(part, mlfd->payload + std::size_t(9 + b) * 4);
+          }
+          if (mldd)
+          {
+            if (!lod_bands_valid(doodad_bands, doodads))
+              problems.emplace_back("MLFD's doodad bands do not tile the MLDD list");
+          }
+          else if (doodad_bands.length[0] || doodad_bands.length[1] || doodad_bands.length[2])
+            problems.emplace_back("MLFD describes doodad LOD bands but the part has no MLDD list");
+          if (mlmd)
+          {
+            if (!lod_bands_valid(wmo_bands, wmos))
+              problems.emplace_back("MLFD's WMO bands do not tile the MLMD list");
+          }
+          else if (wmo_bands.length[0] || wmo_bands.length[1] || wmo_bands.length[2])
+            problems.emplace_back("MLFD describes WMO LOD bands but the part has no MLMD list");
+        }
+      }
+    }
+    else
+    {
+      auto const* modf = find_chunk(chunks, MCC_MODF);
+      auto const* mlmb = find_chunk(chunks, MCC_MLMB);
+      auto const* mwdr = find_chunk(chunks, MCC_MWDR);
+      if (modf)
+      {
+        if (modf->size % sizeof(ENTRY_MODF) != 0)
+          problems.emplace_back("MODF size is not a multiple of the entry size");
+        std::size_t const wmos = modf->size / sizeof(ENTRY_MODF);
+        if (mlmb && mlmb->size != wmos)
+          problems.emplace_back(mismatch("the MLMB class-byte list", mlmb->size, wmos));
+        if (mwdr && mwdr->size != wmos * 8)
+          problems.emplace_back(mismatch("the MWDR doodad-set range list", mwdr->size / 8, wmos));
+      }
+    }
+
+    return problems;
+  }
 }

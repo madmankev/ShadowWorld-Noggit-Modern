@@ -324,6 +324,7 @@ namespace Noggit::Formats::Export
 
     auto const& profile = ADT::adt_profile_v18();
     unsigned int tiles_without_baked_textures = 0;
+    unsigned int object_files_with_companion_risk = 0;
 
     for (std::size_t i = 0; i < 4096; ++i)
     {
@@ -360,6 +361,31 @@ namespace Noggit::Formats::Export
         for (auto const& problem : ADT::ModernAdtWriter::validatePart(profile, file->bytes,
                                                                       shape.expectation))
           result.errors.push_back(path + " failed validation: " + problem);
+
+        // Structural validation cannot see the per-entry companion chunks
+        // disagreeing with the placement lists they annotate - the client
+        // reads MLDB/MLMB/MWDR/MLDX/MLMX in lockstep with MLDD/MLMD/MODF and
+        // runs off the end of the array while the tile streams in (the
+        // access-violation class of the 2026-10-24 field crash). Files saved
+        // by builds before the companion fixes still sit in project folders,
+        // so the export names them instead of shipping them silently.
+        if (shape.maid_slot == 1 || shape.maid_slot == 2)
+        {
+          auto const kind = shape.maid_slot == 1 ? ADT::ObjectPartKind::Obj0
+                                                 : ADT::ObjectPartKind::Obj1;
+          bool flagged = false;
+          for (auto const& problem : ADT::validateObjectCompanions(file->bytes, kind))
+          {
+            flagged = true;
+            result.warnings.push_back(path + " has inconsistent companion chunks ("
+                                      + problem + "); the client can read past these"
+                                        " arrays while the tile streams in (crash"
+                                        " risk) - re-save the tile with the current"
+                                        " build and export again");
+          }
+          if (flagged)
+            ++object_files_with_companion_risk;
+        }
 
         if (!client_loads_by_fdid || !have_maid || shape.maid_slot < 0)
           continue;
@@ -402,6 +428,13 @@ namespace Noggit::Formats::Export
       if (result.errors.size() == errors_before)
         ++result.tiles_complete;
     }
+
+    if (object_files_with_companion_risk)
+      result.warnings.push_back(std::to_string(object_files_with_companion_risk)
+                                + " object file(s) carry companion chunks that do"
+                                  " not match their placement lists - the 2026-10-24"
+                                  " client crash class; re-save those tiles before"
+                                  " deploying this export");
 
     if (tiles_without_baked_textures)
       result.warnings.push_back(std::to_string(tiles_without_baked_textures)

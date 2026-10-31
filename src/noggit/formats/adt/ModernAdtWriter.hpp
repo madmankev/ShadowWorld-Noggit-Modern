@@ -184,6 +184,26 @@ namespace Noggit::Formats::ADT
       std::vector<std::uint8_t> const& obj0,
       std::vector<std::uint8_t> const& original_obj0);
 
+  //! Which object part validateObjectCompanions should read the bytes as.
+  enum class ObjectPartKind
+  {
+    Obj0, //! MDDF/MODF placements with MLMB/MWDR/MWDS companions
+    Obj1, //! MLDD/MLDX and MLMD/MLMX LOD lists with MLDB/MLMB/MWDR companions
+  };
+
+  //! Crash-risk audit for the per-entry companion chunks of an object part:
+  //! MLDB/MLMB/MWDR and the extent lists are read by the client in lockstep
+  //! with the placement lists they annotate, so a size that disagrees with
+  //! the list count is an out-of-bounds read while the tile streams in - the
+  //! access-violation class of the 2026-10-24 field crash. Files written by
+  //! builds before the companion fixes still sit in project folders and pass
+  //! structural validation; this audit names them. Returns one human-readable
+  //! problem per mismatch (empty = consistent). Absent companions are legal
+  //! and stay unreported; so are companions whose list is absent - without
+  //! the list the client never reads them.
+  [[nodiscard]] std::vector<std::string> validateObjectCompanions(
+      std::vector<std::uint8_t> const& part, ObjectPartKind kind);
+
   class ModernAdtWriter
   {
   public:

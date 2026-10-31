@@ -1700,7 +1700,8 @@ int main()
     options.map_display_name = "Test Map";
     options.map_id = 1234;
 
-    auto make_input = [&](bool second_tile, bool with_wdl, bool corrupt_root)
+    auto make_input = [&](bool second_tile, bool with_wdl, bool corrupt_root,
+                          bool broken_obj0 = false)
     {
       Export::ExportInput in;
       in.files.push_back({"World/Maps/Test/Test.wdt", build_wdt(second_tile)});
@@ -1709,7 +1710,18 @@ int main()
         root.resize(12);
       in.files.push_back({"World/Maps/Test/Test_12_34.adt", root});
       in.files.push_back({"World/Maps/Test/Test_12_34_tex0.adt", parts.tex0});
-      in.files.push_back({"World/Maps/Test/Test_12_34_obj0.adt", parts.obj0});
+      std::vector<std::uint8_t> obj0 = parts.obj0;
+      if (broken_obj0)
+      {
+        // What pre-fix builds left on disk: MODF rebuilt, MLMB/MWDR copied
+        // verbatim from the original - counts that no longer match.
+        Writer mlmb; mlmb.tag(fc('M','L','M','B')); mlmb.u32(3);
+        mlmb.u8(0x33); mlmb.u8(0x20); mlmb.u8(0x40);
+        Writer mwdr; mwdr.tag(fc('M','W','D','R')); mwdr.u32(8); mwdr.u32(0); mwdr.u32(2);
+        obj0.insert(obj0.end(), mlmb.b.begin(), mlmb.b.end());
+        obj0.insert(obj0.end(), mwdr.b.begin(), mwdr.b.end());
+      }
+      in.files.push_back({"World/Maps/Test/Test_12_34_obj0.adt", obj0});
       in.files.push_back({"World/Maps/Test/Test_lgt.wdt", std::vector<std::uint8_t>{7, 7, 7, 7}});
       if (with_wdl)
       {
@@ -1851,7 +1863,39 @@ int main()
     {
       Export::ExportInput no_wdt;
       no_wdt.files.push_back({"World/Maps/Test/Test_12_34.adt", parts.root});
-      auto const r = Export::exportModernMap(options, no_wdt);
+      {
+      // The 2026-10-24 crash class still sitting in a project folder: an
+      // obj0 whose companion chunks disagree with its MODF. Structural
+      // validation passes it; the companion audit has to name it.
+      auto const risky = Export::exportModernMap(options, make_input(false, false, false, true));
+      for (auto const& w : risky.warnings)
+        if (w.find("companion") != std::string::npos)
+          std::printf("    export warning: %s\n", w.c_str());
+      check(risky.ok, "companion mismatches warn without failing the export");
+      bool named_mlmb = false, named_mwdr = false, summary = false;
+      for (auto const& w : risky.warnings)
+      {
+        if (w.find("inconsistent companion chunks") != std::string::npos
+            && w.find("MLMB") != std::string::npos)
+          named_mlmb = true;
+        if (w.find("inconsistent companion chunks") != std::string::npos
+            && w.find("MWDR") != std::string::npos)
+          named_mwdr = true;
+        if (w.find("2026-10-24 client crash class") != std::string::npos)
+          summary = true;
+      }
+      check(named_mlmb && named_mwdr,
+            "the export names every mismatched companion chunk of the risky obj0");
+      check(summary, "the export summarizes the crash-risk count");
+      auto const clean = Export::exportModernMap(options, make_input(false, false, false, false));
+      bool clean_quiet = true;
+      for (auto const& w : clean.warnings)
+        if (w.find("companion") != std::string::npos)
+          clean_quiet = false;
+      check(clean_quiet, "a consistent export set draws no companion warnings");
+    }
+
+    auto const r = Export::exportModernMap(options, no_wdt);
       check(!r.ok && !r.errors.empty(), "an export without a WDT is refused");
     }
 
@@ -2772,6 +2816,180 @@ int main()
             "a buffer whose size disagrees with its dimensions is refused");
       check(!sliceTileFromHeightmap(HeightmapBuffer{}, two_by_two, 0, 0, t) && t.empty(),
             "an empty buffer is refused");
+    }
+  }
+
+  std::printf("\nobject companion audit\n");
+  {
+    auto make_chunk = [](std::uint32_t magic, std::vector<std::uint8_t> const& payload)
+    {
+      Writer w;
+      w.tag(magic);
+      w.u32(static_cast<std::uint32_t>(payload.size()));
+      w.raw(payload.data(), payload.size());
+      return w.b;
+    };
+    auto rec_mddf = []()
+    {
+      Writer w;
+      w.u32(101); w.u32(1);
+      for (int i = 0; i < 6; ++i) w.f32(0.f);
+      w.u32(1024u | (0x68u << 16));
+      return w.b;                                  // 36 bytes
+    };
+    auto rec_modf = []()
+    {
+      Writer w;
+      w.u32(201); w.u32(11);
+      for (int i = 0; i < 12; ++i) w.f32(0.f);
+      w.u32(0x000Cu | (7u << 16));
+      w.u32(3u | (1024u << 16));
+      return w.b;                                  // 64 bytes
+    };
+    auto rec_mlmd = [](std::vector<std::uint8_t> const& modf_entry)
+    {
+      std::vector<std::uint8_t> out(modf_entry.begin(), modf_entry.begin() + 32);
+      out.insert(out.end(), modf_entry.begin() + 56, modf_entry.end());
+      return out;                                  // 40 bytes
+    };
+    auto rec_extent = []()
+    {
+      Writer w;
+      for (int i = 0; i < 7; ++i) w.f32(1.f);
+      return w.b;                                  // 28 bytes
+    };
+    auto mlfd = [](std::array<std::uint32_t, 12> const& counts)
+    {
+      Writer w;
+      for (std::uint32_t c : counts) w.u32(c);
+      return w.b;                                  // 48 bytes
+    };
+    auto cat = [](std::vector<std::vector<std::uint8_t>> const& chunks)
+    {
+      std::vector<std::uint8_t> out;
+      for (auto const& c : chunks) out.insert(out.end(), c.begin(), c.end());
+      return out;
+    };
+    auto has_problem = [](std::vector<std::string> const& problems, char const* needle)
+    {
+      for (auto const& p : problems)
+        if (p.find(needle) != std::string::npos)
+          return true;
+      return false;
+    };
+
+    Writer mver; mver.tag(fc('M','V','E','R')); mver.u32(4); mver.u32(18);
+    std::vector<std::uint8_t> two_mldd = cat({rec_mddf(), rec_mddf()});
+    std::vector<std::uint8_t> two_mldx = cat({rec_extent(), rec_extent()});
+    Writer mldl2; mldl2.f32(1.f); mldl2.f32(2.f);
+    Writer mdli2; mdli2.u32(11); mdli2.u32(22);
+    Writer mldb2; mldb2.u8(7); mldb2.u8(8);
+    Writer mldb3; mldb3.u8(7); mldb3.u8(8); mldb3.u8(9);
+    auto one_mlmd = rec_mlmd(rec_modf());
+    Writer mlmb1; mlmb1.u8(0x40);
+    Writer mwdr1; mwdr1.u32(0); mwdr1.u32(2);
+    Writer mwds; mwds.u16(5); mwds.u16(6);
+
+    // A fully consistent OBJ1: every companion matches its list.
+    auto good_obj1 = cat({mver.b,
+                          make_chunk(fc('M','L','D','D'), two_mldd),
+                          make_chunk(fc('M','L','D','X'), two_mldx),
+                          make_chunk(fc('M','L','D','L'), mldl2.b),
+                          make_chunk(fc('M','D','L','I'), mdli2.b),
+                          make_chunk(fc('M','L','D','B'), mldb2.b),
+                          make_chunk(fc('M','L','M','D'), one_mlmd),
+                          make_chunk(fc('M','L','M','X'), rec_extent()),
+                          make_chunk(fc('M','L','M','B'), mlmb1.b),
+                          make_chunk(fc('M','W','D','R'), mwdr1.b),
+                          make_chunk(fc('M','W','D','S'), mwds.b),
+                          make_chunk(fc('M','L','F','D'),
+                                     mlfd({0, 1, 2, 1, 1, 0, 0, 1, 1, 1, 0, 0}))});
+    check(validateObjectCompanions(good_obj1, ObjectPartKind::Obj1).empty(),
+          "a consistent OBJ1 passes the companion audit");
+
+    // MLDB outnumbering its MLDD: the exact pre-fix corruption.
+    {
+      auto bad = cat({mver.b,
+                      make_chunk(fc('M','L','D','D'), two_mldd),
+                      make_chunk(fc('M','L','D','X'), two_mldx),
+                      make_chunk(fc('M','L','D','B'), mldb3.b),
+                      make_chunk(fc('M','L','F','D'),
+                                 mlfd({0, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0}))});
+      auto problems = validateObjectCompanions(bad, ObjectPartKind::Obj1);
+      check(problems.size() == 1 && has_problem(problems, "MLDB"),
+            "an MLDB that outnumbers its MLDD is reported");
+    }
+
+    // A short extent list and bands that do not tile.
+    {
+      auto bad = cat({mver.b,
+                      make_chunk(fc('M','L','D','D'), two_mldd),
+                      make_chunk(fc('M','L','D','X'), rec_extent()),
+                      make_chunk(fc('M','L','F','D'),
+                                 mlfd({0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0}))});
+      auto problems = validateObjectCompanions(bad, ObjectPartKind::Obj1);
+      check(has_problem(problems, "MLDX") && has_problem(problems, "MLFD"),
+            "a short MLDX and non-tiling MLFD bands are both reported");
+    }
+
+    // Bands describing a list that is not there.
+    {
+      auto bad = cat({mver.b,
+                      make_chunk(fc('M','L','F','D'),
+                                 mlfd({0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0}))});
+      auto problems = validateObjectCompanions(bad, ObjectPartKind::Obj1);
+      check(problems.size() == 1 && has_problem(problems, "no MLDD"),
+            "LOD bands without their list are reported");
+    }
+
+    // OBJ0: consistent, then the two mismatch shapes.
+    {
+      std::vector<std::uint8_t> two_modf = cat({rec_modf(), rec_modf()});
+      Writer mlmb2; mlmb2.u8(0x33); mlmb2.u8(0x20);
+      Writer mwdr2; mwdr2.u32(0); mwdr2.u32(2); mwdr2.u32(2); mwdr2.u32(5);
+      auto good_obj0 = cat({mver.b,
+                            make_chunk(fc('M','O','D','F'), two_modf),
+                            make_chunk(fc('M','L','M','B'), mlmb2.b),
+                            make_chunk(fc('M','W','D','R'), mwdr2.b),
+                            make_chunk(fc('M','W','D','S'), mwds.b)});
+      check(validateObjectCompanions(good_obj0, ObjectPartKind::Obj0).empty(),
+            "a consistent OBJ0 passes the companion audit");
+
+      auto bad_mlmb = cat({mver.b,
+                           make_chunk(fc('M','O','D','F'), two_modf),
+                           make_chunk(fc('M','L','M','B'), mlmb1.b)});
+      auto problems = validateObjectCompanions(bad_mlmb, ObjectPartKind::Obj0);
+      check(problems.size() == 1 && has_problem(problems, "MLMB"),
+            "an MLMB that undernumbers its MODF is reported");
+
+      auto bad_mwdr = cat({mver.b,
+                           make_chunk(fc('M','O','D','F'), two_modf),
+                           make_chunk(fc('M','W','D','R'), mwdr1.b)});
+      problems = validateObjectCompanions(bad_mwdr, ObjectPartKind::Obj0);
+      check(problems.size() == 1 && has_problem(problems, "MWDR"),
+            "an MWDR that undernumbers its MODF is reported");
+    }
+
+    // Legal shapes stay silent.
+    check(validateObjectCompanions(mver.b, ObjectPartKind::Obj1).empty()
+          && validateObjectCompanions(mver.b, ObjectPartKind::Obj0).empty(),
+          "a zero-LOD part passes the audit for either kind");
+    {
+      auto lists_only = cat({mver.b,
+                             make_chunk(fc('M','L','D','D'), rec_mddf()),
+                             make_chunk(fc('M','L','D','X'), rec_extent())});
+      check(validateObjectCompanions(lists_only, ObjectPartKind::Obj1).empty(),
+            "lists without companions are legal and stay silent");
+      auto orphan = cat({mver.b, make_chunk(fc('M','L','D','B'), mldb3.b)});
+      check(validateObjectCompanions(orphan, ObjectPartKind::Obj1).empty(),
+            "a companion without its list is inert and stays silent");
+    }
+
+    // Bytes that do not even walk are validatePart's problem, not the audit's.
+    {
+      std::vector<std::uint8_t> junk{1, 2, 3, 4, 0xFF, 0xFF, 0xFF, 0xFF, 9, 9};
+      check(validateObjectCompanions(junk, ObjectPartKind::Obj1).empty(),
+            "unwalkable bytes are left to structural validation");
     }
   }
 
