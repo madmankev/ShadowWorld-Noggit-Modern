@@ -1045,11 +1045,12 @@ int main()
       check(!junk_step.ok, "a blob that is not a modern part is refused");
     }
 
-    // Forever: the Shadowlands file family until research shows a divergence.
+    // Forever: retail-family WDT (MAI2), pre-MSSF WDL - per a 1.60.1.70685
+    // client's own Kalimdor.wdt/.wdl from the field.
     auto const& fv = generationFeatures(MapGeneration::forever_1_60_x);
     check(std::string(fv.label) == "1.60.x", "Forever is named by its version");
-    check(fv.split_adt && !fv.wdt_mai2 && !fv.wdl_mssf && fv.wdl_mssn,
-          "Forever carries the Shadowlands family's features");
+    check(fv.split_adt && fv.wdt_mai2 && !fv.wdl_mssf && fv.wdl_mssn,
+          "Forever carries MAI2 like retail, no MSSF, sky scenes like both families");
 
     check(generationFromBuildString("3.3.5.12340") == MapGeneration::wotlk_3_3_5,
           "a 3.3.5 build maps to WotLK");
@@ -1073,13 +1074,32 @@ int main()
 
     auto const to_forever = convertWdtBetweenGenerations(
       wdt12, MapGeneration::retail_12_x, MapGeneration::forever_1_60_x);
-    check(to_forever.ok && to_forever.bytes.size() == wdt12.size() - 24,
-          "retail -> Forever strips MAI2 like retail -> Shadowlands");
+    check(to_forever.ok && to_forever.bytes == wdt12 && to_forever.notes.empty(),
+          "retail -> Forever keeps MAI2: Forever's own WDTs carry it");
     auto const sl_to_forever = convertWdtBetweenGenerations(
       down.bytes, MapGeneration::shadowlands_9_2_7, MapGeneration::forever_1_60_x);
-    check(sl_to_forever.ok && sl_to_forever.bytes == down.bytes
-            && sl_to_forever.notes.empty(),
-          "Shadowlands -> Forever is byte-identical with nothing to report");
+    check(sl_to_forever.ok && sl_to_forever.bytes == down.bytes,
+          "Shadowlands -> Forever invents no MAI2 bytes");
+    bool forever_absent_noted = false;
+    for (auto const& n : sl_to_forever.notes)
+      forever_absent_noted = forever_absent_noted
+        || (n.find("MAI2") != std::string::npos
+            && n.find("stays absent") != std::string::npos);
+    check(forever_absent_noted,
+          "the MAI2 Forever expects but the source lacks is reported, not fabricated");
+    auto const forever_to_sl = convertWdtBetweenGenerations(
+      wdt12, MapGeneration::forever_1_60_x, MapGeneration::shadowlands_9_2_7);
+    check(forever_to_sl.ok && forever_to_sl.bytes.size() == mai2_at,
+          "Forever -> Shadowlands strips MAI2 like retail -> Shadowlands");
+    auto const forever_to_retail = convertWdtBetweenGenerations(
+      wdt12, MapGeneration::forever_1_60_x, MapGeneration::retail_12_x);
+    check(forever_to_retail.ok && forever_to_retail.bytes == wdt12
+            && forever_to_retail.notes.empty(),
+          "Forever -> retail is an identity for a WDT that already has MAI2");
+    auto const wdl_to_forever = convertWdlBetweenGenerations(
+      wdl12, MapGeneration::retail_12_x, MapGeneration::forever_1_60_x);
+    check(wdl_to_forever.ok && wdl_to_forever.bytes.size() == mssf_at,
+          "retail -> Forever strips MSSF from the WDL: Forever's WDLs are pre-MSSF");
 
     ConversionOptions gen_defaults;
     check(gen_defaults.target_generation == MapGeneration::shadowlands_9_2_7,

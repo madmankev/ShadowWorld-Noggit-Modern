@@ -720,7 +720,7 @@ void MapTile::finishLoadingShadowlandsTerrainOnly()
   _tile_is_being_reloaded = false;
   _state_changed.notify_all();
 
-  LogDebug << "[ModernADT] Shadowlands tile loaded: " << index.x << ',' << index.z
+  LogDebug << "[ModernADT] Modern tile loaded: " << index.x << ',' << index.z
            << ". Direct MCVT terrain, TEX0 textures on " << textured_chunks
            << "/256 chunks (" << texture_layers_bound << " layers bound, "
            << untextured_chunks << " untextured, "

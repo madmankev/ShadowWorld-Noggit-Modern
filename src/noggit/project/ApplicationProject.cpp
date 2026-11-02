@@ -134,7 +134,14 @@ namespace
     if (client_path.filename() == "_retail_")
       candidates.push_back(client_path.parent_path() / ".build.info");
     else
+    {
       candidates.push_back(client_path / "_retail_" / ".build.info");
+      // Battle.net keeps a single .build.info at the install root with one row
+      // per installed product (_retail_, _classic_beta_, _forever_, ...). A
+      // product folder other than _retail_ has no file of its own, so check the
+      // parent's file too and match its rows to this folder below.
+      candidates.push_back(client_path.parent_path() / ".build.info");
+    }
 
     for (auto const& build_info_path : candidates)
     {
@@ -149,6 +156,8 @@ namespace
       auto const headers = splitBuildInfoLine(header_line);
       int version_index = -1;
       int active_index = -1;
+      int install_index = -1;
+      int product_index = -1;
 
       for (std::size_t i = 0; i < headers.size(); ++i)
       {
@@ -156,11 +165,48 @@ namespace
           version_index = static_cast<int>(i);
         else if (headers[i].rfind("Active!", 0) == 0)
           active_index = static_cast<int>(i);
+        else if (headers[i].rfind("Product install path!", 0) == 0)
+          install_index = static_cast<int>(i);
+        else if (headers[i].rfind("Product!", 0) == 0)
+          product_index = static_cast<int>(i);
       }
 
       if (version_index < 0)
         continue;
 
+      auto const ascii_lower = [](std::string value)
+      {
+        for (auto& character : value)
+          if (character >= 'A' && character <= 'Z')
+            character = static_cast<char>(character - 'A' + 'a');
+        return value;
+      };
+      auto const client_folder = ascii_lower(client_path.filename().string());
+
+      // Each product subfolder carries a .flavor.info with its TACT product
+      // code (e.g. "wow_classic_beta"), which is the same code the root
+      // .build.info lists in its Product! column.
+      std::string flavor;
+      {
+        std::ifstream flavor_stream(client_path / ".flavor.info");
+        std::string flavor_line;
+        if (std::getline(flavor_stream, flavor_line))
+        {
+          while (!flavor_line.empty()
+                 && (flavor_line.back() == '\r' || flavor_line.back() == '\n'
+                     || flavor_line.back() == ' '))
+            flavor_line.pop_back();
+          flavor = ascii_lower(flavor_line);
+        }
+      }
+
+      // The root .build.info lists every installed product. The row whose
+      // install path (or product code) points at the selected folder describes
+      // that folder's build; the Active row is whichever product Battle.net
+      // ran last, which may be a different product entirely.
+      std::string folder_version;
+      std::string flavor_version;
+      std::string active_version;
       std::string first_version;
       std::string line;
       while (std::getline(stream, line))
@@ -172,10 +218,30 @@ namespace
         if (first_version.empty())
           first_version = values[version_index];
 
-        if (active_index < 0 || (active_index < static_cast<int>(values.size()) && values[active_index] == "1"))
-          return values[version_index];
+        if (folder_version.empty() && install_index >= 0
+            && install_index < static_cast<int>(values.size())
+            && !values[install_index].empty()
+            && ascii_lower(std::filesystem::path(values[install_index]).filename().string())
+               == client_folder)
+          folder_version = values[version_index];
+
+        if (flavor_version.empty() && !flavor.empty() && product_index >= 0
+            && product_index < static_cast<int>(values.size())
+            && ascii_lower(values[product_index]) == flavor)
+          flavor_version = values[version_index];
+
+        if (active_version.empty()
+            && (active_index < 0
+                || (active_index < static_cast<int>(values.size()) && values[active_index] == "1")))
+          active_version = values[version_index];
       }
 
+      if (!folder_version.empty())
+        return folder_version;
+      if (!flavor_version.empty())
+        return flavor_version;
+      if (!active_version.empty())
+        return active_version;
       if (!first_version.empty())
         return first_version;
     }
@@ -236,13 +302,26 @@ namespace Noggit::Project
       std::filesystem::create_directory(project_path);
 
     auto project = NoggitProject();
+    // A blank project name would write ".noggitproj" - a dotfile whose
+    // extension() is empty, so the project reader would never see it again and
+    // the folder would report "not a Noggit project folder" forever. Fall back
+    // to the folder's own name (and to "project" if even that is empty, e.g.
+    // for a path ending in a separator).
     project.ProjectName = project_name;
+    if (project.ProjectName.empty())
+      project.ProjectName = project_path.filename().string();
+    if (project.ProjectName.empty())
+      project.ProjectName = "project";
     project.projectVersion = ClientVersionFactory::mapToEnumVersion(client_version);
     project.ClientPath = client_path.generic_string();
     project.ProjectPath = project_path.generic_string();
 
     auto project_writer = ApplicationProjectWriter();
     project_writer.saveProject(&project, project_path);
+    Log << "Created project file: "
+        << (project_path / (project.ProjectName + ".noggitproj")).generic_string()
+        << " (client " << project.ClientPath << ", version " << client_version << ")"
+        << std::endl;
   }
 
   std::shared_ptr<NoggitProject> ApplicationProject::loadProject(std::filesystem::path const& project_path)
@@ -267,7 +346,22 @@ namespace Noggit::Project
 
     std::string dbd_file_directory = _configuration->ApplicationDatabaseDefinitionsPath;
     if (project->projectVersion == ProjectVersion::FOREVER)
-      dbd_file_directory = "definitions-forever";
+    {
+      // "definitions-forever" is an optional drop-in directory for Forever-specific
+      // .dbd files. It does not ship with the installation; selecting it blindly
+      // fails every DB2 load with "Database definition file not found" and leaves
+      // the map list and creation wizard empty. Only use it when it is actually
+      // there; otherwise the shipped definitions still cover 1.60.x clients
+      // through the nearest-build fallback (field-proven: a 1.60.1.70685 client
+      // bootstrapped AreaTable/Light* from definitions/ via the 11.2.5.64502
+      // definitions).
+      if (std::filesystem::exists(std::filesystem::path("definitions-forever")))
+        dbd_file_directory = "definitions-forever";
+      else
+        Log << "[Definitions] Project version Forever: no 'definitions-forever' directory"
+               " next to the executable; using '" << dbd_file_directory << "' instead."
+               " Its nearest-build definitions cover 1.60.x clients." << std::endl;
+    }
 
     BlizzardDatabaseLib::Structures::Build client_build("3.3.5.12340");
     std::string client_build_string = "3.3.5.12340";
@@ -299,14 +393,34 @@ namespace Noggit::Project
       {
         std::size_t parsed_length = 0;
         auto const major_version = std::stoi(detected_build, &parsed_length);
-        if (parsed_length != 0 && project->projectVersion != ProjectVersion::FOREVER)
+        if (parsed_length != 0)
         {
-          client_archive_version = major_version >= 10
-            ? BlizzardArchive::ClientVersion::RETAIL
-            : BlizzardArchive::ClientVersion::SL;
-          Log << "Selected modern CASC profile from build: "
-              << (client_archive_version == BlizzardArchive::ClientVersion::SL ? "Shadowlands" : "Retail")
-              << std::endl;
+          // Cross-check the project version against the detected build:
+          // Forever clients report 1.x, Shadowlands is 9.x, retail is 10.x and
+          // up. A mismatch is almost always the wrong project version (or the
+          // wrong client folder) in the project dialog. Definitions and the
+          // CASC profile follow the project version, so say so loudly instead
+          // of letting the session run on a mislabeled client.
+          bool const build_matches_version =
+            (project->projectVersion == ProjectVersion::FOREVER && major_version == 1)
+            || (project->projectVersion == ProjectVersion::SL && major_version == 9)
+            || (project->projectVersion == ProjectVersion::RETAIL && major_version >= 10);
+          if (!build_matches_version)
+            LogError << "Project version does not match the detected client build "
+                     << detected_build << " (Forever clients are 1.x, Shadowlands 9.x,"
+                        " Retail 10.x+). Definitions and the CASC profile follow the"
+                        " project version; if this is not the client you meant,"
+                        " recreate the project with the matching version." << std::endl;
+
+          if (project->projectVersion != ProjectVersion::FOREVER)
+          {
+            client_archive_version = major_version >= 10
+              ? BlizzardArchive::ClientVersion::RETAIL
+              : BlizzardArchive::ClientVersion::SL;
+            Log << "Selected modern CASC profile from build: "
+                << (client_archive_version == BlizzardArchive::ClientVersion::SL ? "Shadowlands" : "Retail")
+                << std::endl;
+          }
         }
       }
       catch (std::exception const& e)

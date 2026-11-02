@@ -54,12 +54,13 @@ namespace Noggit::Formats::Conversion
     wotlk_3_3_5,
     shadowlands_9_2_7,
     retail_12_x,
-    //! ShadowWorld's Forever beta (1.60.x). Its map files are treated as the
-    //! Shadowlands family - the editor already saves Forever projects through
-    //! the same modern paths - until research shows a divergence; beta client
-    //! layouts can change between updates. Chunk-wise it is indistinguishable
-    //! from Shadowlands, so detectModernGeneration never returns it: only the
-    //! project/client version can say a map is Forever.
+    //! ShadowWorld's Forever beta (1.60.x). Field research (a 1.60.1.70685
+    //! client's own CASC files) shows a hybrid family: its WDTs carry MAI2
+    //! like retail, while its WDLs stay pre-MSSF. ADTs use the same modern
+    //! split layout. detectModernGeneration still never returns Forever - by
+    //! chunk markers its files read as retail (MAI2) or Shadowlands - so only
+    //! the project/client version can say a map is Forever. Beta client
+    //! layouts can change between updates.
     forever_1_60_x,
   };
 

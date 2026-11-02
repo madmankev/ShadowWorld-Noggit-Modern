@@ -22,7 +22,7 @@ void CreateProjectComponent::createProject(Noggit::Ui::Windows::NoggitProjectSel
   {
     for (const auto& entry : std::filesystem::directory_iterator(project_information.project_path))
     {
-      if (entry.path().extension() == ".noggitproj")
+      if (entry.path().extension() == ".noggitproj" || entry.path().filename() == ".noggitproj")
       {
         QMessageBox::critical(parent, "Error", "Selected already contains an existing project.");
         return;

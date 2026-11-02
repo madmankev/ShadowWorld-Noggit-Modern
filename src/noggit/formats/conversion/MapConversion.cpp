@@ -1284,11 +1284,14 @@ namespace Noggit::Formats::Conversion
       MapGeneration::shadowlands_9_2_7, "9.2.7", true, false, false, true};
     static GenerationFeatures const retail = {
       MapGeneration::retail_12_x, "12.x", true, true, true, true};
-    // Forever's map files are the Shadowlands family's until research shows
-    // a divergence (see the enum docs); the editor already saves Forever
-    // projects through the same modern paths.
+    // Forever (1.60.x) reads the retail-family WDT: a 1.60.1.70685 client's
+    // own CASC Kalimdor.wdt carries MAI2, so exports targeting Forever must
+    // keep MAI2 and stepping a Forever map down to Shadowlands must strip it.
+    // Its WDLs stay pre-MSSF (the same client's Kalimdor.wdl carries MLDD/
+    // MLDF/MLDX and no MSSF), and the editor saves Forever projects through
+    // the same modern split-ADT paths as the other families.
     static GenerationFeatures const forever = {
-      MapGeneration::forever_1_60_x, "1.60.x", true, false, false, true};
+      MapGeneration::forever_1_60_x, "1.60.x", true, true, false, true};
 
     switch (generation)
     {

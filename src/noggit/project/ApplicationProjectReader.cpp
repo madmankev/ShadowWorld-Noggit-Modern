@@ -22,7 +22,10 @@ namespace Noggit::Project
 
     for (const auto& entry: std::filesystem::directory_iterator(project_path))
     {
-      if (entry.path().extension() == ".noggitproj")
+      // Also accept a file named exactly ".noggitproj" (empty project name):
+      // its extension() is empty, so the check below alone would miss it and
+      // the folder would look like it is not a project.
+      if (entry.path().extension() == ".noggitproj" || entry.path().filename() == ".noggitproj")
         return readProjectFile(entry.path());
     }
 
