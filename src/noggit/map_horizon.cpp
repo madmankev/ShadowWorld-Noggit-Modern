@@ -424,7 +424,27 @@ void map_horizon::save_wdl(World* world, bool regenerate, std::vector<TileIndex>
     std::stringstream filename;
     filename << "World\\Maps\\" << world->basename << "\\" << world->basename << ".wdl";
     auto* client = Noggit::Application::NoggitApplication::instance()->clientData();
-    if (client->version() == BlizzardArchive::ClientVersion::RETAIL)
+    // Shadowlands, Retail and Forever all take the byte-preserving path: the
+    // client's own WDL carries the object LOD (MLDD/MLDX/MLMD/MLMX, MLDF on
+    // Forever) and sky-scene (MSSN/MSSC/MSSO, MSSF on Retail) chunks that the
+    // from-scratch writer below cannot reproduce - it emits the WotLK-era
+    // MWMO/MWID/MODF layout instead. Only WotLK projects, and modern maps
+    // with no readable source WDL at all (brand-new maps), fall through.
+    bool const modern_client = client->version() != BlizzardArchive::ClientVersion::WOTLK;
+    bool have_source_wdl = false;
+    if (modern_client)
+    {
+      try
+      {
+        BlizzardArchive::ClientFile probe(filename.str(), client);
+        have_source_wdl = probe.getBuffer() != nullptr && probe.getSize() > 0;
+      }
+      catch (std::exception const&)
+      {
+        have_source_wdl = false;
+      }
+    }
+    if (modern_client && have_source_wdl)
     {
       if (scope && scope->empty()) return;
       BlizzardArchive::ClientFile source(filename.str(), client);
@@ -458,13 +478,13 @@ void map_horizon::save_wdl(World* world, bool regenerate, std::vector<TileIndex>
           {
             bool unload = !world->mapIndex.tileLoaded(index) && !world->mapIndex.tileAwaitingLoading(index);
             auto* tile = world->mapIndex.loadTile(index, false, false, false);
-            if (!tile) throw std::runtime_error("Cannot load tile for Retail WDL");
+            if (!tile) throw std::runtime_error("Cannot load tile for the modern WDL update");
             try
             {
               tile->wait_until_loaded();
               if (tile->loading_failed())
                 throw std::runtime_error("Tile " + std::to_string(x) + "_" + std::to_string(y)
-                  + " failed to load; Retail WDL heights were not updated");
+                  + " failed to load; modern WDL heights were not updated");
               update_horizon_tile(tile);
             }
             catch (...)
@@ -475,7 +495,7 @@ void map_horizon::save_wdl(World* world, bool regenerate, std::vector<TileIndex>
             if (unload) world->mapIndex.unloadTile(index);
           }
           auto* tile = get_horizon_tile(y, x);
-          if (!tile) throw std::runtime_error("Retail WDL tile has no sampled heights");
+          if (!tile) throw std::runtime_error("modern WDL tile has no sampled heights");
           // The editor's 4x4 hole mask merges partial 8x8 holes. Read the saved
           // ROOT so MAHO only removes chunks whose entire surface is a hole.
           auto root_name = "World\\Maps\\" + world->basename + "\\" + world->basename
@@ -508,6 +528,11 @@ void map_horizon::save_wdl(World* world, bool regenerate, std::vector<TileIndex>
       set_minimap(&world->mapIndex);
       return;
     }
+    if (modern_client)
+      Log << "[WDL Save] " << world->basename
+          << ": no readable source WDL in the client or project; writing a basic"
+             " MAOF/MARE WDL. Object LOD (MLDD/MLMD) and sky-scene chunks cannot"
+             " be authored offline and stay absent." << std::endl;
     //Log << "Saving WDL \"" << filename << "\"." << std::endl;
 
     util::sExtendableArray wdlFile;

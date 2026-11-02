@@ -16,7 +16,8 @@ foreach(name IN ITEMS
     load_failures uid_repair retail_liquid_lod retail_asset_loading blp_bgra
     retail_skin wmo_group_ids map_preview_quality retail_m2_animation
     retail_world_tables retail_map_texture retail_root_layout
-    retail_object_tables retail_object_transfer terrain_holes)
+    retail_object_tables retail_object_transfer terrain_holes
+    modern_wdt_wdl_preservation)
   noggit_test(${name} ${name}.cpp)
 endforeach()
 noggit_test(uid_geometry uid_geometry.cpp "${NOGGIT_SOURCE}/noggit/formats/adt/UidRepairGeometry.cpp")

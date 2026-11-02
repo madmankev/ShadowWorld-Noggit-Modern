@@ -310,27 +310,58 @@ void MapIndex::save()
   std::stringstream filename;
   filename << "World\\Maps\\" << basename << "\\" << basename << ".wdt";
 
-  if (auto* client = Noggit::Application::NoggitApplication::instance()->clientData();
-      client->version() == BlizzardArchive::ClientVersion::RETAIL)
+  auto* client = Noggit::Application::NoggitApplication::instance()->clientData();
+  bool const modern_client = client->version() != BlizzardArchive::ClientVersion::WOTLK;
+  if (modern_client)
   {
-    if (mHasAGlobalWMO || _needs_wdt_creation)
+    if (client->version() == BlizzardArchive::ClientVersion::RETAIL
+        && (mHasAGlobalWMO || _needs_wdt_creation))
       throw std::runtime_error("Retail WDT creation/global WMO rewriting is unsupported; existing file was preserved");
-    BlizzardArchive::ClientFile source(filename.str(), client);
-    std::vector<std::uint32_t> tiles;
-    tiles.reserve(4096);
-    for (int y = 0; y < 64; ++y)
-      for (int x = 0; x < 64; ++x) tiles.push_back(mTiles[y][x].flags);
-    auto flags = FLAG_SHADING | (mBigAlpha ? FLAG_BIG_ALPHA : 0)
-      | (_sort_models_by_size_class ? FLAG_DOODADS_SORT : 0);
-    auto bytes = Noggit::Formats::RetailWorldTables::updateWdt(
-      {source.getBuffer(), source.getBuffer() + source.getSize()}, flags, tiles);
-    auto path = QString::fromStdString(client->getDiskPath(filename.str()));
-    if (!QDir().mkpath(QFileInfo(path).absolutePath())) throw std::runtime_error("Cannot create WDT directory");
-    QSaveFile output(path);
-    if (!output.open(QIODevice::WriteOnly) || output.write(bytes.data(), bytes.size()) != qint64(bytes.size()) || !output.commit())
-      throw std::runtime_error("Cannot atomically save Retail WDT");
-    changed = false;
-    return;
+
+    if (!mHasAGlobalWMO && !_needs_wdt_creation)
+    {
+      // Shadowlands and Forever WDTs carry MAID (Forever also MAI2) plus the
+      // MPHD file ids and the 0x80/0x100/0x200 flag bits; the from-scratch
+      // writer below reproduces none of them. Update the existing file in
+      // place - MPHD low-nibble flags and MAIN bit 0 only - exactly like the
+      // Retail path always has.
+      try
+      {
+        BlizzardArchive::ClientFile source(filename.str(), client);
+        std::vector<std::uint32_t> tiles;
+        tiles.reserve(4096);
+        for (int y = 0; y < 64; ++y)
+          for (int x = 0; x < 64; ++x) tiles.push_back(mTiles[y][x].flags);
+        auto flags = FLAG_SHADING | (mBigAlpha ? FLAG_BIG_ALPHA : 0)
+          | (_sort_models_by_size_class ? FLAG_DOODADS_SORT : 0);
+        auto bytes = Noggit::Formats::RetailWorldTables::updateWdt(
+          {source.getBuffer(), source.getBuffer() + source.getSize()}, flags, tiles);
+        auto path = QString::fromStdString(client->getDiskPath(filename.str()));
+        if (!QDir().mkpath(QFileInfo(path).absolutePath())) throw std::runtime_error("Cannot create WDT directory");
+        QSaveFile output(path);
+        if (!output.open(QIODevice::WriteOnly) || output.write(bytes.data(), bytes.size()) != qint64(bytes.size()) || !output.commit())
+          throw std::runtime_error("Cannot atomically save the modern WDT");
+        changed = false;
+        return;
+      }
+      catch (std::exception const& error)
+      {
+        if (client->version() == BlizzardArchive::ClientVersion::RETAIL)
+          throw; // Retail keeps its original semantics: the existing file is preserved.
+        LogError << "[WDT Save] Could not update the existing WDT in place ("
+                 << error.what() << "); falling back to a from-scratch WDT, which"
+                    " cannot carry MAID/MAI2 or the MPHD 0x80/0x100/0x200 bits."
+                 << std::endl;
+      }
+    }
+    else
+    {
+      LogError << "[WDT Save] Writing a from-scratch WDT for " << basename
+               << " (new map or global-WMO map): the MAID chunk and the MPHD"
+                  " 0x80/0x100/0x200 bits cannot be authored offline and stay"
+                  " absent. Maps with an existing client WDT are updated in"
+                  " place instead." << std::endl;
+    }
   }
 
   //Log << "Saving WDT \"" << filename << "\"." << std::endl;
