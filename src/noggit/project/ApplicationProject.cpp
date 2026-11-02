@@ -257,8 +257,12 @@ namespace
     std::filesystem::recursive_directory_iterator iterator(
       config_path, std::filesystem::directory_options::skip_permission_denied, error);
     std::filesystem::recursive_directory_iterator end;
+    // Build configs name themselves after their product's build uid: "WOW-"
+    // for live, "WOWT-" for PTRs, "WOWCLASSIC...-"/"WOW_...-" for classic
+    // flavors and betas. Accept any WOW-prefixed uid so product folders whose
+    // configs use a beta uid (e.g. _classic_beta_) still resolve.
     static std::regex const build_name_pattern(
-      R"(WOW-([0-9]+)patch([0-9]+\.[0-9]+\.[0-9]+))", std::regex::icase);
+      R"(WOW[A-Z_]*-([0-9]+)patch([0-9]+\.[0-9]+\.[0-9]+))", std::regex::icase);
 
     for (; !error && iterator != end; iterator.increment(error))
     {
