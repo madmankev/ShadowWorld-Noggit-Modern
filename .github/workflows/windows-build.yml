@@ -179,3 +179,79 @@ jobs:
             ${{ env.BUILD_DIR }}/CMakeCache.txt
           if-no-files-found: warn
           retention-days: 7
+
+  # Manual-only job: proves build.cmd works from a plain cmd prompt, i.e. with
+  # no pre-set MSVC environment, so the vswhere/vcvars64 path is exercised.
+  clean-shell:
+    name: build.cmd from a plain shell (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout (without submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      - name: Fetch required submodules
+        shell: bash
+        run: |
+          git submodule update --init --depth 1 \
+            cmake \
+            src/external/blizzard-archive-library \
+            src/external/blizzard-database-library \
+            dist/definitions
+          mkdir -p dist/themes dist/listfile
+
+      - name: Set up CMake and Ninja only
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "3.31.6"
+          ninjaVersion: "1.12.1"
+
+      - name: Install Qt ${{ env.QT_VERSION }} (MSVC 2019 64-bit)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "5.15.2"
+          host: windows
+          target: desktop
+          arch: win64_msvc2019_64
+          cache: true
+
+      # No ilammy/msvc-dev-cmd here on purpose: build.cmd has to find and
+      # initialise MSVC by itself.
+      - name: Run build.cmd
+        shell: cmd
+        run: |
+          call build.cmd release > clean-build.log 2>&1
+          set "RC=%ERRORLEVEL%"
+          type clean-build.log
+          exit /b %RC%
+
+      - name: Report failure details
+        if: failure()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, urllib.parse
+          name = "clean-build.log"
+          if os.path.exists(name):
+              text = "\n".join(open(name, errors="replace").read().splitlines()[-45:])
+              print(f"::error title={name} (tail)::{urllib.parse.quote(text, safe='')}")
+          PY
+
+      - name: Collect build output
+        if: always()
+        shell: bash
+        run: |
+          ls -la build/bin 2>/dev/null || true
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: noggit-windows-x64-clean-shell
+          path: build/bin/
+          if-no-files-found: warn
+          retention-days: 14
