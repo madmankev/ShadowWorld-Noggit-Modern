@@ -183,8 +183,12 @@ jobs:
   # Manual-only job: proves build.cmd works from a plain cmd prompt, i.e. with
   # no pre-set MSVC environment, so the vswhere/vcvars64 path is exercised.
   clean-shell:
-    name: build.cmd from a plain shell (manual)
-    if: github.event_name == 'workflow_dispatch'
+    name: build.cmd from a plain shell
+    # Runs on manual dispatch, or on any commit whose message contains
+    # [clean-shell], so the path can be verified without doubling every push.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[clean-shell]')
     runs-on: windows-2022
     timeout-minutes: 350
 
