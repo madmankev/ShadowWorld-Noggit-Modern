@@ -196,4 +196,88 @@ namespace Noggit::Formats::ADT::RetailObjectTables
     validate(result, lod);
     return result;
   }
+
+  // Rebuilds a one-byte-per-placement parallel table (OBJ0 MLMB "BMLM" or
+  // OBJ1 MLDB "BDLM") so it follows the updated placements, matched by
+  // (FileDataID, UID). Placements that existed in the original keep their
+  // stored byte; new placements receive the same default byte the Retail
+  // transfer writer uses. Shadowlands and Forever have no Retail source
+  // metadata machinery, so without this pairing any placement edit leaves a
+  // count-mismatched companion table that the client reads out of bounds.
+  inline Bytes pairPlacementBytes(Bytes const& original, Bytes const& updated,
+                                  char const* placementTag, std::size_t stride,
+                                  char const* byteTag, std::uint8_t defaultByte,
+                                  char const* tableName)
+  {
+    auto old = chunks(original);
+    auto source = old.find(byteTag);
+    if (source == old.end())
+      return updated; // the original carries no companion table to pair
+    auto oldPlacements = old.find(placementTag);
+    if (oldPlacements == old.end())
+      throw std::runtime_error(std::string("Original object file carries ") + tableName
+        + " without the placement table it belongs to.");
+    if (oldPlacements->second.size % stride)
+      throw std::runtime_error(std::string("Invalid placement record size while pairing ") + tableName);
+    auto const oldCount = oldPlacements->second.size / stride;
+    if (source->second.size != oldCount)
+      throw std::runtime_error(std::string("Original ") + tableName
+        + " does not match its placement count; restore the original object files before saving.");
+
+    auto key = [](Bytes const& b, std::size_t at)
+    { return (std::uint64_t(word(b, at)) << 32) | word(b, at + 4); };
+    std::map<std::uint64_t, std::size_t> indices;
+    for (std::size_t i = 0; i < oldCount; ++i)
+    {
+      auto [it, inserted] = indices.emplace(
+        key(original, oldPlacements->second.offset + i * stride), i);
+      if (!inserted) it->second = std::size_t(-1);
+    }
+
+    auto next = chunks(updated);
+    auto nextPlacements = next.find(placementTag);
+    if (nextPlacements == next.end())
+      throw std::runtime_error(std::string("Updated object file lost its placements while pairing ") + tableName);
+    if (next.find(byteTag) == next.end())
+      throw std::runtime_error(std::string("Updated object file lost its ") + tableName + " chunk");
+    if (nextPlacements->second.size % stride)
+      throw std::runtime_error(std::string("Invalid updated placement record size while pairing ") + tableName);
+    auto const newCount = nextPlacements->second.size / stride;
+
+    Bytes data;
+    data.reserve(newCount);
+    for (std::size_t i = 0; i < newCount; ++i)
+    {
+      auto at = nextPlacements->second.offset + i * stride;
+      auto it = indices.find(key(updated, at));
+      if (it == indices.end())
+        data.push_back(defaultByte);
+      else if (it->second == std::size_t(-1))
+        throw std::runtime_error(std::string("Ambiguous placement UID in the original ") + tableName
+          + "; cannot pair the companion bytes.");
+      else
+        data.push_back(original[source->second.offset + it->second]);
+    }
+
+    Bytes result;
+    for (std::size_t at = 0; at < updated.size();)
+    {
+      auto size = word(updated, at + 4);
+      std::string tag(reinterpret_cast<char const*>(updated.data() + at), 4);
+      if (tag != byteTag)
+      {
+        result.insert(result.end(), updated.begin() + at, updated.begin() + at + 8 + size);
+      }
+      else
+      {
+        result.insert(result.end(), updated.begin() + at, updated.begin() + at + 4);
+        auto length = static_cast<std::uint32_t>(data.size());
+        auto p = reinterpret_cast<std::uint8_t const*>(&length);
+        result.insert(result.end(), p, p + 4);
+        result.insert(result.end(), data.begin(), data.end());
+      }
+      at += 8 + size;
+    }
+    return result;
+  }
 }

@@ -963,7 +963,13 @@ namespace Noggit::Formats::ADT
       if (mlfd_chunk)
         output = replace_top_level_chunk(output, fourcc('M','L','F','D'),
           make_chunk(fourcc('M','L','F','D'), record_bytes(counts)));
-      return retail ? RetailObjectTables::remap(obj1, output, true) : output;
+      if (retail)
+        return RetailObjectTables::remap(obj1, output, true);
+      // Shadowlands/Forever: MLDB is one opaque byte per MLDD record; pair it
+      // with the rebuilt doodad list (default byte for new placements) so the
+      // LOD file never carries a count-mismatched companion table.
+      return RetailObjectTables::pairPlacementBytes(obj1, output, "DDLM", 36, "BDLM",
+                                                    RetailObjectTransfer::defaultModelByte, "MLDB");
     }
 
     template<typename Entry>
@@ -1805,7 +1811,18 @@ namespace Noggit::Formats::ADT
                                modf.size() / sizeof(ENTRY_MODF));
     }
 
-    if (retail_objects && !placements_unchanged && !wmo_sources)
+    if (!placements_unchanged && !retail_objects)
+    {
+      // Shadowlands/Forever: keep the per-WMO MLMB byte table count-paired with
+      // the rewritten MODF (new WMOs get the same default byte the retail
+      // transfer writer uses), then structurally verify the result so a
+      // placement edit can never ship a companion table the client would read
+      // out of bounds.
+      obj0 = RetailObjectTables::pairPlacementBytes(original_obj0, obj0, "FDOM", 64, "BMLM",
+                                                    RetailObjectTransfer::defaultWmoByte, "MLMB");
+      RetailObjectTables::validate(obj0, false);
+    }
+    else if (retail_objects && !placements_unchanged && !wmo_sources)
       obj0 = RetailObjectTables::remap(original_obj0, obj0, false);
     validate_tex0_alpha_layout(tex0);
 
