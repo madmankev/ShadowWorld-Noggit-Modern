@@ -107,6 +107,39 @@ jobs:
           ls -la "$BUILD_DIR/bin" 2>/dev/null || true
           find "$BUILD_DIR" -name "*.exe" -maxdepth 3 2>/dev/null || true
 
+      - name: Verify build output
+        if: success()
+        shell: bash
+        run: |
+          EXE="$BUILD_DIR/bin/noggit.exe"
+          if [ ! -f "$EXE" ]; then
+            echo "::error title=Missing binary::noggit.exe was not produced in $BUILD_DIR/bin"
+            exit 1
+          fi
+          size=$(stat -c%s "$EXE")
+          magic=$(head -c 2 "$EXE")
+          dlls=$(ls "$BUILD_DIR/bin" | grep -c '\.dll$' || true)
+          echo "noggit.exe: ${size} bytes, PE magic '${magic}', ${dlls} deployed DLLs"
+
+          set +e
+          QT_QPA_PLATFORM=offscreen timeout 25 "./$EXE" > /dev/null 2>&1
+          smoke=$?
+          set -e
+          echo "headless start-up probe exit code: ${smoke} (124 = still running when killed, expected for a GUI app)"
+
+          {
+            echo "### Windows build succeeded"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| noggit.exe | ${size} bytes |"
+            echo "| PE magic | ${magic} |"
+            echo "| deployed Qt/runtime DLLs | ${dlls} |"
+            echo "| headless start-up probe | exit ${smoke} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice title=noggit.exe built::${size} bytes, ${dlls} DLLs deployed, start-up probe exit ${smoke}"
+
       # Artifact/log downloads are not reachable from every environment, so the
       # tail of the failing log is re-published as a check-run annotation (that
       # is readable through the REST API).
