@@ -81,23 +81,17 @@ jobs:
           arch: win64_msvc2019_64
           cache: true
 
-      - name: Configure
-        shell: bash
+      # The CI job builds through build.cmd itself, so the local one-command
+      # build script is exercised on every run instead of bit-rotting.
+      - name: Configure and build (build.cmd)
+        shell: cmd
+        env:
+          CMAKE_EXTRA_ARGS: ${{ inputs.unity_build && '-DFAST_BUILD_NOGGIT_JUMBO=ON' || '' }}
         run: |
-          set -o pipefail
-          cmake -S . -B "$BUILD_DIR" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DNOGGIT_OPENGL_ERROR_CHECK=OFF \
-            -DNOGGIT_ENABLE_TRACY_PROFILER=OFF \
-            -DFAST_BUILD_NOGGIT_PCH=ON \
-            -DFAST_BUILD_NOGGIT_JUMBO=${{ inputs.unity_build && 'ON' || 'OFF' }} \
-            2>&1 | tee configure.log
-
-      - name: Build
-        shell: bash
-        run: |
-          set -o pipefail
-          cmake --build "$BUILD_DIR" --target noggit --parallel 2>&1 | tee build.log
+          call build.cmd release > build.log 2>&1
+          set "RC=%ERRORLEVEL%"
+          type build.log
+          exit /b %RC%
 
       - name: Collect build output
         if: always()

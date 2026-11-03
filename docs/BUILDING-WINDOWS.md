@@ -27,7 +27,42 @@ Qt 5.15.2 headers because `stdext::checked_array_iterator` is used before
 `<iterator>` has been pulled in, which newer MSVC STLs reject with
 `error C3861: 'stdext': identifier not found`.
 
-## Building locally
+## One-command build
+
+From a plain `cmd` prompt in the repository root:
+
+```bat
+build.cmd
+```
+
+That is all that is needed once the prerequisites below are installed: the
+script locates Visual Studio, Qt 5.15, CMake and Ninja, initialises the
+submodules, configures, builds and prints the path of the resulting
+`noggit.exe`.
+
+```bat
+build.cmd debug          :: build the Debug configuration
+build.cmd clean          :: delete the build directory first
+build.cmd clean release  :: clean + Release
+build.cmd run            :: start the editor after a successful build
+build.cmd help           :: usage
+```
+
+Environment overrides:
+
+| Variable | Purpose |
+| --- | --- |
+| `QT_DIR` | Qt 5.15 kit folder, e.g. `C:\Qt\5.15.2\msvc2019_64` (auto-detected via `qmake`, `QT_ROOT_DIR`, `QTDIR` or `C:\Qt\5.15*` otherwise) |
+| `BUILD_DIR` | build folder (default `build`) |
+| `BUILD_GENERATOR` | CMake generator (default `Ninja`; Visual Studio generator is used only if Ninja is missing) |
+| `JOBS` | parallel job count (default: CPU count) |
+| `NOGGIT_PCH` | set to `OFF` to drop the noggit precompiled header |
+| `CMAKE_EXTRA_ARGS` | extra arguments passed to the configure step, e.g. `-DFAST_BUILD_NOGGIT_JUMBO=ON` |
+
+The CI workflow builds through `build.cmd` itself (`call build.cmd release`), so
+the script is verified on every run.
+
+## Building manually
 
 Prerequisites:
 
