@@ -21,6 +21,7 @@
 #include <QMessageBox>
 #include <exception>
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <regex>
@@ -199,9 +200,35 @@ namespace Noggit::Project
 
     std::string dbd_file_directory = _configuration->ApplicationDatabaseDefinitionsPath;
     if (project->projectVersion == ProjectVersion::FOREVER)
-      dbd_file_directory = "definitions-forever";
+    {
+      // Forever (1.60.x) layouts are only described by the extended native
+      // definitions that ship with Noggit; a user-provided "definitions-forever"
+      // drop-in wins when present. Never point the database library at a
+      // directory that does not exist: its .dbd parser dereferences the first
+      // line of a failed file open (lines[0] of an empty vector) and crashes
+      // the process instead of reporting the missing table.
+      if (std::filesystem::exists("definitions-forever"))
+      {
+        dbd_file_directory = "definitions-forever";
+        Log << "[Definitions] Forever project: using 'definitions-forever'." << std::endl;
+      }
+      else if (std::filesystem::exists("native-db2-definitions"))
+      {
+        dbd_file_directory = "native-db2-definitions";
+        Log << "[Definitions] Forever project: using bundled 'native-db2-definitions'"
+               " (carries 1.60.x builds and modern layout hashes)." << std::endl;
+      }
+      else
+      {
+        LogError << "[Definitions] Forever project: neither 'definitions-forever' nor"
+                    " 'native-db2-definitions' exists; falling back to '"
+                 << dbd_file_directory << "', which does not describe 1.60.x layouts."
+                 << std::endl;
+      }
+    }
 
     BlizzardDatabaseLib::Structures::Build client_build("3.3.5.12340");
+    std::string client_build_string("3.3.5.12340");
     auto client_archive_version = BlizzardArchive::ClientVersion::WOTLK;
     auto client_archive_locale = BlizzardArchive::Locale::AUTO;
     if (project->projectVersion == ProjectVersion::SL || project->projectVersion == ProjectVersion::RETAIL
@@ -225,6 +252,7 @@ namespace Noggit::Project
       }
 
       client_build = BlizzardDatabaseLib::Structures::Build(detected_build);
+      client_build_string = detected_build;
       try
       {
         std::size_t parsed_length = 0;
@@ -260,6 +288,8 @@ namespace Noggit::Project
       return {};
     }
 
+    project->DatabaseDefinitionsPath = dbd_file_directory;
+    project->ClientBuildString = client_build_string;
     project->ClientDatabase = std::make_shared<BlizzardDatabaseLib::BlizzardDatabase>(
       dbd_file_directory, client_build, project->projectVersion == ProjectVersion::FOREVER);
 

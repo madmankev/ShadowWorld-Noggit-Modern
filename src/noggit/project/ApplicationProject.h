@@ -111,6 +111,13 @@ namespace Noggit::Project
     std::vector<NoggitProjectPinnedMap> PinnedMaps;
     std::vector<NoggitProjectBookmarkMap> Bookmarks;
     std::shared_ptr<BlizzardDatabaseLib::BlizzardDatabase> ClientDatabase;
+    //! Directory the client database resolves .dbd definitions in. Guarded
+    //! table loaders check it before calling into the database library, whose
+    //! definition parser crashes on a missing .dbd file.
+    std::string DatabaseDefinitionsPath;
+    //! Client build string the database was constructed with (e.g. detected
+    //! "9.2.7.45745"); used when a fallback definitions directory is needed.
+    std::string ClientBuildString;
     std::shared_ptr<BlizzardArchive::ClientData> ClientData;
     std::vector<NoggitProjectObjectPalette> ObjectPalettes;
     std::vector<NoggitProjectTexturePalette> TexturePalettes;

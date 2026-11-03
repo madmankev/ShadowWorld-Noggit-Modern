@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -196,6 +197,19 @@ namespace Noggit::ClientData
       {
         return open_db2_from_casc(client_data, filename);
       };
+
+      // The database library's .dbd parser dereferences the first line of a
+      // missing definition file (lines[0] of an empty vector) and crashes the
+      // process; the surrounding catch handlers cannot catch that. Fail with a
+      // clear, catchable error when a sky definition is not installed.
+      for (auto const* sky_table_name : {"Light", "LightParams", "LightData", "LightSkybox"})
+      {
+        if (!project->DatabaseDefinitionsPath.empty()
+            && !std::filesystem::exists(std::filesystem::path(project->DatabaseDefinitionsPath)
+                                        / (std::string(sky_table_name) + ".dbd")))
+          throw std::runtime_error(std::string("No database definition for ") + sky_table_name
+                                   + ".dbd in '" + project->DatabaseDefinitionsPath + "'.");
+      }
 
       auto& light_table = database.LoadTable("Light", callback);
       auto& params_table = database.LoadTable("LightParams", callback);

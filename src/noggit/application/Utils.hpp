@@ -76,6 +76,13 @@ inline auto readFileAsIMemStream = [](std::string const& file_path) -> std::shar
   {
     BlizzardArchive::ClientFile f(file_path, Noggit::Application::NoggitApplication::instance()->clientData());
 
+    // A missing/empty client file must not become an empty memory stream: the
+    // database library would read past its end (or dereference a null buffer)
+    // and crash the process. Throw so callers can degrade gracefully, and give
+    // the project database fallback below a chance to serve the file.
+    if (f.isEof() || f.getSize() == 0)
+      throw std::runtime_error("Could not open client file: " + file_path);
+
     return std::make_shared<BlizzardDatabaseLib::Stream::IMemStream>(f.getBuffer(), f.getSize());
   }
   catch (std::exception const& e)

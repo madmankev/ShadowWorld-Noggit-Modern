@@ -1,7 +1,14 @@
 #include "ClientDatabase.h"
 #include <noggit/project/CurrentProject.hpp>
 #include <noggit/application/Utils.hpp>
+#include <noggit/application/NoggitApplication.hpp>
+#include <noggit/application/Configuration/NoggitApplicationConfiguration.hpp>
 #include <noggit/Log.h>
+#include <filesystem>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
 
 #include <QString>
 #include <QSqlRecord>
@@ -567,9 +574,81 @@ namespace Noggit
 		return Noggit::Project::CurrentProject::get()->ClientDatabase->TableRecordDefinition(_tableName);
 	}
 
+	namespace
+	{
+		//! Loads a table from the configured (full) definitions directory when the
+		//! project's primary directory cannot serve it. Forever projects use the
+		//! extended native definitions, which only carry the modern lighting/map
+		//! tables; tables like MapDifficulty still live in the full set. Returns
+		//! nullptr when no fallback applies; throws only through LoadTable itself.
+		BlizzardDatabaseLib::BlizzardDatabaseTable* noggitTryFallbackDefinitionsLoad(
+			const std::string& tableName)
+		{
+			auto const project = Noggit::Project::CurrentProject::get();
+			if (!project)
+				return nullptr;
+
+			auto const configuration = Noggit::Application::NoggitApplication::instance()->getConfiguration();
+			if (!configuration)
+				return nullptr;
+
+			std::filesystem::path const fallback_dir(configuration->ApplicationDatabaseDefinitionsPath);
+			if (fallback_dir.empty() || fallback_dir.string() == project->DatabaseDefinitionsPath)
+				return nullptr;
+			if (!std::filesystem::exists(fallback_dir / (tableName + ".dbd")))
+				return nullptr;
+
+			static std::recursive_mutex noggit_fallback_definitions_mutex;
+			static std::map<std::string, std::shared_ptr<BlizzardDatabaseLib::BlizzardDatabase>>
+				noggit_fallback_definitions_cache;
+			std::lock_guard<std::recursive_mutex> const lock(noggit_fallback_definitions_mutex);
+
+			auto& entry = noggit_fallback_definitions_cache[fallback_dir.string()];
+			if (!entry)
+			{
+				entry = std::make_shared<BlizzardDatabaseLib::BlizzardDatabase>(
+					fallback_dir.string(),
+					BlizzardDatabaseLib::Structures::Build(
+						project->ClientBuildString.empty() ? std::string("9.2.7.45745") : project->ClientBuildString),
+					project->projectVersion == Noggit::Project::ProjectVersion::FOREVER);
+			}
+			return &entry->LoadTable(tableName, readFileAsIMemStream);
+		}
+	}
+
 	BlizzardDatabaseLib::BlizzardDatabaseTable& ClientDatabaseTable::getClientTable() const
 	{
-		return Noggit::Project::CurrentProject::get()->ClientDatabase->LoadTable(_tableName, readFileAsIMemStream);
+		auto const project = Noggit::Project::CurrentProject::get();
+		if (!project || !project->ClientDatabase)
+			throw std::runtime_error("No active project client database for table " + _tableName + ".");
+
+		// The database library's .dbd parser dereferences the first line of a
+		// missing definition file (lines[0] of an empty vector) and crashes the
+		// process; no catch handler can intercept that. Resolve a directory that
+		// actually carries the definition before calling LoadTable.
+		if (!project->DatabaseDefinitionsPath.empty()
+			&& !std::filesystem::exists(std::filesystem::path(project->DatabaseDefinitionsPath)
+										/ (_tableName + ".dbd")))
+		{
+			if (auto* fallback = noggitTryFallbackDefinitionsLoad(_tableName))
+				return *fallback;
+			throw std::runtime_error("No database definition for " + _tableName + ".dbd (searched '"
+									 + project->DatabaseDefinitionsPath
+									 + "' and the configured definitions directory).");
+		}
+
+		try
+		{
+			return project->ClientDatabase->LoadTable(_tableName, readFileAsIMemStream);
+		}
+		catch (std::exception const&)
+		{
+			// The primary directory has the .dbd but could not match the client's
+			// build/layout; the full definitions set may still describe it.
+			if (auto* fallback = noggitTryFallbackDefinitionsLoad(_tableName))
+				return *fallback;
+			throw;
+		}
 	}
 
 	// get from local dbc data memory stream in BlizzardDatabaseLib::BlizzardDatabase

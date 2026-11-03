@@ -736,7 +736,17 @@ void MapCreationWizard::selectMap(int map_id)
 
   // Noggit::Project::CurrentProject::get()->ClientDatabase->LoadTable("Map", readFileAsIMemStream); // old, client library
   auto table = ClientDatabase::getTable("Map");
-  auto rec_opt = table.RecordById(map_id);
+  std::optional<Structures::BlizzardDatabaseRow> rec_opt;
+  try
+  {
+    rec_opt = table.RecordById(map_id);
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "MapCreationWizard: failed to read Map.db2 record " << map_id
+             << ": " << e.what() << std::endl;
+    return;
+  }
   if (!rec_opt)
     return;
   auto& record = *rec_opt;

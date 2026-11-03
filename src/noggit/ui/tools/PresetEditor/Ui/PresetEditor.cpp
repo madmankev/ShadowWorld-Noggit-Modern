@@ -146,6 +146,11 @@ PresetEditorWidget::PresetEditorWidget(std::shared_ptr<Project::NoggitProject> p
 
   const auto& table = std::string("Map");
 
+  // Map.db2 can be unreadable when the project's definitions do not describe
+  // the client's table layout; keep the editor usable with an empty selector
+  // instead of letting the failure escape into the UI event loop.
+  try
+  {
   auto mapTable = ClientDatabase::getTable(table);
 
   int count = 1;
@@ -168,6 +173,17 @@ PresetEditorWidget::PresetEditorWidget(std::shared_ptr<Project::NoggitProject> p
       ui->worldSelector->setItemData(count, QVariant(QString::fromStdString(map_internal_name)), Qt::UserRole + 1);
 
       count++;
+  }
+  }
+  catch (std::exception const& e)
+  {
+    LogError << "PresetEditor: could not read Map.db2 to fill the world selector: "
+             << e.what() << std::endl;
+  }
+  catch (...)
+  {
+    LogError << "PresetEditor: could not read Map.db2 to fill the world selector: unknown error."
+             << std::endl;
   }
 
 

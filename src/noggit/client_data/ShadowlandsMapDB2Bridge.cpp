@@ -115,6 +115,20 @@ namespace
                        std::shared_ptr<BlizzardArchive::ClientData> const& client_data,
                        std::string const& name)
   {
+    // The database library's .dbd parser dereferences the first line of a
+    // missing definition file (lines[0] of an empty vector) and crashes the
+    // process; a std::exception handler cannot catch that. Skip tables whose
+    // definition does not exist instead of handing them to LoadTable.
+    if (auto const guard_project = Noggit::Project::CurrentProject::get();
+        guard_project && !guard_project->DatabaseDefinitionsPath.empty()
+        && !std::filesystem::exists(std::filesystem::path(guard_project->DatabaseDefinitionsPath)
+                                    / (name + ".dbd")))
+    {
+      LogError << "[ModernDB2][Map] No definition for " << name << ".db2 in '"
+               << guard_project->DatabaseDefinitionsPath << "'; skipping the table."
+               << std::endl;
+      return nullptr;
+    }
     try
     {
       auto callback = [&client_data](std::string const& filename)
