@@ -84,17 +84,21 @@ jobs:
       - name: Configure
         shell: bash
         run: |
+          set -o pipefail
           cmake -S . -B "$BUILD_DIR" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DNOGGIT_OPENGL_ERROR_CHECK=OFF \
             -DNOGGIT_ENABLE_TRACY_PROFILER=OFF \
             -DFAST_BUILD_LIB_JUMBO=ON \
             -DFAST_BUILD_NOGGIT_PCH=ON \
-            -DFAST_BUILD_NOGGIT_JUMBO=${{ inputs.unity_build && 'ON' || 'OFF' }}
+            -DFAST_BUILD_NOGGIT_JUMBO=${{ inputs.unity_build && 'ON' || 'OFF' }} \
+            2>&1 | tee configure.log
 
       - name: Build
         shell: bash
-        run: cmake --build "$BUILD_DIR" --target noggit --parallel
+        run: |
+          set -o pipefail
+          cmake --build "$BUILD_DIR" --target noggit --parallel 2>&1 | tee build.log
 
       - name: Collect build output
         if: always()
@@ -103,6 +107,33 @@ jobs:
           echo "--- bin ---"
           ls -la "$BUILD_DIR/bin" 2>/dev/null || true
           find "$BUILD_DIR" -name "*.exe" -maxdepth 3 2>/dev/null || true
+
+      # Artifact/log downloads are not reachable from every environment, so the
+      # tail of the failing log is re-published as a check-run annotation (that
+      # is readable through the REST API).
+      - name: Publish failure details
+        if: failure()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob, os, urllib.parse
+          for name in ("configure.log", "build.log"):
+              if not os.path.exists(name):
+                  continue
+              lines = open(name, errors="replace").read().splitlines()
+              if not lines:
+                  continue
+              errs = [i for i, l in enumerate(lines) if "CMake Error" in l or "error:" in l or "FAILED:" in l]
+              chunks = []
+              if errs:
+                  start = max(0, errs[0] - 5)
+                  chunks = lines[start:start + 45]
+              else:
+                  chunks = lines[-45:]
+              text = "\n".join(x[:300] for x in chunks)
+              escaped = urllib.parse.quote(text, safe="")
+              print(f"::error title={name} (tail)::{escaped}")
+          PY
 
       - name: Upload executable
         uses: actions/upload-artifact@v4
