@@ -1,6 +1,7 @@
 #include "ApplicationProject.h"
 #include "ApplicationProjectReader.h"
 #include "ApplicationProjectWriter.h"
+#include "ClientBuildDetection.hpp"
 #include "ListfileUpdate.hpp"
 #include <noggit/Log.h>
 
@@ -30,13 +31,6 @@
 
 namespace
 {
-  bool fileExistsWithContent(std::filesystem::path const& path)
-  {
-    std::error_code error;
-    return std::filesystem::exists(path, error) && std::filesystem::is_regular_file(path, error)
-      && std::filesystem::file_size(path, error) > 0;
-  }
-
   bool refreshWowdevListfile(std::filesystem::path const& project_path, std::string& error_message)
   {
     QString error;
@@ -46,115 +40,6 @@ namespace
     return result;
   }
 
-  std::vector<std::string> splitBuildInfoLine(std::string const& line)
-  {
-    std::vector<std::string> values;
-    std::string value;
-    std::stringstream stream(line);
-
-    while (std::getline(stream, value, '|'))
-      values.push_back(value);
-
-    return values;
-  }
-
-  std::string detectClientBuildVersion(std::filesystem::path const& raw_client_path)
-  {
-    std::vector<std::filesystem::path> candidates;
-    auto client_path = raw_client_path;
-
-    candidates.push_back(client_path / ".build.info");
-
-    if (client_path.filename() == "_retail_")
-      candidates.push_back(client_path.parent_path() / ".build.info");
-    else
-      candidates.push_back(client_path / "_retail_" / ".build.info");
-
-    for (auto const& build_info_path : candidates)
-    {
-      if (!fileExistsWithContent(build_info_path))
-        continue;
-
-      std::ifstream stream(build_info_path);
-      std::string header_line;
-      if (!std::getline(stream, header_line))
-        continue;
-
-      auto const headers = splitBuildInfoLine(header_line);
-      int version_index = -1;
-      int active_index = -1;
-
-      for (std::size_t i = 0; i < headers.size(); ++i)
-      {
-        if (headers[i].rfind("Version!", 0) == 0)
-          version_index = static_cast<int>(i);
-        else if (headers[i].rfind("Active!", 0) == 0)
-          active_index = static_cast<int>(i);
-      }
-
-      if (version_index < 0)
-        continue;
-
-      std::string first_version;
-      std::string line;
-      while (std::getline(stream, line))
-      {
-        auto const values = splitBuildInfoLine(line);
-        if (version_index >= static_cast<int>(values.size()) || values[version_index].empty())
-          continue;
-
-        if (first_version.empty())
-          first_version = values[version_index];
-
-        if (active_index < 0 || (active_index < static_cast<int>(values.size()) && values[active_index] == "1"))
-          return values[version_index];
-      }
-
-      if (!first_version.empty())
-        return first_version;
-    }
-
-    if (client_path.filename() == "_retail_")
-      client_path = client_path.parent_path();
-    else if (!std::filesystem::exists(client_path / "Data" / "config")
-             && std::filesystem::exists(client_path.parent_path() / "Data" / "config"))
-      client_path = client_path.parent_path();
-
-    auto const config_path = client_path / "Data" / "config";
-    std::error_code error;
-    std::filesystem::recursive_directory_iterator iterator(
-      config_path, std::filesystem::directory_options::skip_permission_denied, error);
-    std::filesystem::recursive_directory_iterator end;
-    static std::regex const build_name_pattern(
-      R"(WOW-([0-9]+)patch([0-9]+\.[0-9]+\.[0-9]+))", std::regex::icase);
-
-    for (; !error && iterator != end; iterator.increment(error))
-    {
-      if (!iterator->is_regular_file(error))
-        continue;
-
-      std::ifstream stream(iterator->path());
-      std::string line;
-      if (!std::getline(stream, line))
-        continue;
-      if (!line.empty() && line.back() == '\r')
-        line.pop_back();
-      if (line != "# Build Configuration")
-        continue;
-
-      while (std::getline(stream, line))
-      {
-        if (line.rfind("build-name", 0) != 0)
-          continue;
-
-        std::smatch match;
-        if (std::regex_search(line, match, build_name_pattern))
-          return match[2].str() + "." + match[1].str();
-      }
-    }
-
-    return {};
-  }
 }
 namespace Noggit::Project
 {
@@ -239,7 +124,13 @@ namespace Noggit::Project
         : (project->projectVersion == ProjectVersion::RETAIL
             ? BlizzardArchive::ClientVersion::RETAIL
             : BlizzardArchive::ClientVersion::SL);
-      auto detected_build = detectClientBuildVersion(project->ClientPath);
+      // Detect the build from the product line the project actually needs.
+      // Install-root .build.info files list every flavor and mark retail as
+      // active; without the product filter every client selected from the
+      // same install detected as the retail build.
+      std::string const preferred_product =
+        project->projectVersion == ProjectVersion::FOREVER ? "wow_classic_beta" : "wow";
+      auto detected_build = detectClientBuildVersion(project->ClientPath, preferred_product);
       if (detected_build.empty())
       {
         detected_build = "9.2.7.45745";
@@ -257,21 +148,38 @@ namespace Noggit::Project
       {
         std::size_t parsed_length = 0;
         auto const major_version = std::stoi(detected_build, &parsed_length);
-        if (parsed_length != 0 && project->projectVersion != ProjectVersion::FOREVER)
+        if (parsed_length != 0)
         {
-          client_archive_version = major_version >= 10
-            ? BlizzardArchive::ClientVersion::RETAIL
-            : BlizzardArchive::ClientVersion::SL;
-          Log << "Selected modern CASC profile from build: "
-              << (client_archive_version == BlizzardArchive::ClientVersion::SL ? "Shadowlands" : "Retail")
-              << std::endl;
+          // The project's selected version is authoritative for the CASC
+          // profile; the detected build only cross-checks it. Deriving the
+          // profile from the build silently turned Shadowlands projects into
+          // Retail ones whenever detection landed on a retail build number.
+          bool const looks_retail = major_version >= 10;
+          bool const looks_forever = major_version == 1;
+          bool mismatch = false;
+          switch (project->projectVersion)
+          {
+            case ProjectVersion::SL: mismatch = looks_retail || looks_forever; break;
+            case ProjectVersion::RETAIL: mismatch = !looks_retail; break;
+            case ProjectVersion::FOREVER: mismatch = !looks_forever; break;
+            default: break;
+          }
+          if (mismatch)
+            LogError << "[Client] Project version '"
+                     << ClientVersionFactory::MapToStringVersion(project->projectVersion)
+                     << "' does not match the detected client build " << detected_build
+                     << " (client directory: " << project->ClientPath
+                     << "). Verify the selected client directory; continuing with the"
+                        " project-selected profile." << std::endl;
         }
       }
       catch (std::exception const& e)
       {
-        LogError << "Could not select CASC profile from build " << detected_build
+        LogError << "Could not cross-check the CASC profile against build " << detected_build
                  << ": " << e.what() << std::endl;
       }
+      Log << "Selected modern CASC profile from project version: "
+          << ClientVersionFactory::MapToStringVersion(project->projectVersion) << std::endl;
       client_archive_locale = BlizzardArchive::Locale::enUS;
     }
 
