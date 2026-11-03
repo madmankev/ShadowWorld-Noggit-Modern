@@ -1,0 +1,124 @@
+name: Windows Build
+
+# Compiles the Noggit editor on a Windows runner (MSVC + Qt 5.15).
+# Produces a deployable noggit.exe (windeployqt runs as a POST_BUILD step).
+
+on:
+  workflow_dispatch:
+    inputs:
+      unity_build:
+        description: "Jumbo/unity build for the noggit target (faster, riskier)"
+        type: boolean
+        default: false
+  push:
+    branches:
+      - arena/dd4f44ab-shadowworld-noggit-modern
+  pull_request:
+    branches:
+      - shadowworld-modern-test
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (Release, x64)
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    env:
+      BUILD_DIR: build
+      QT_VERSION: "5.15.2"
+
+    steps:
+      - name: Checkout (without submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 1
+
+      # The GitHub-hosted dependencies are mandatory for a configure.
+      - name: Fetch required submodules
+        shell: bash
+        run: |
+          git submodule update --init --depth 1 \
+            cmake \
+            src/external/blizzard-archive-library \
+            src/external/blizzard-database-library \
+            dist/definitions
+
+      # dist/listfile and dist/themes live on gitlab.com; only needed for the
+      # POST_BUILD copy steps, so a failure here must not kill the build.
+      - name: Fetch optional distribution submodules
+        shell: bash
+        continue-on-error: true
+        run: |
+          git submodule update --init --depth 1 dist/listfile dist/themes
+          mkdir -p dist/themes dist/listfile
+
+      - name: Ensure distribution folders exist
+        shell: bash
+        run: mkdir -p dist/themes dist/listfile
+
+      - name: Set up MSVC (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "3.31.6"
+          ninjaVersion: "1.12.1"
+
+      - name: Install Qt ${{ env.QT_VERSION }} (MSVC 2019 64-bit)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_msvc2019_64
+          cache: true
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S . -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNOGGIT_OPENGL_ERROR_CHECK=OFF \
+            -DNOGGIT_ENABLE_TRACY_PROFILER=OFF \
+            -DFAST_BUILD_LIB_JUMBO=ON \
+            -DFAST_BUILD_NOGGIT_PCH=ON \
+            -DFAST_BUILD_NOGGIT_JUMBO=${{ inputs.unity_build && 'ON' || 'OFF' }}
+
+      - name: Build
+        shell: bash
+        run: cmake --build "$BUILD_DIR" --target noggit --parallel
+
+      - name: Collect build output
+        if: always()
+        shell: bash
+        run: |
+          echo "--- bin ---"
+          ls -la "$BUILD_DIR/bin" 2>/dev/null || true
+          find "$BUILD_DIR" -name "*.exe" -maxdepth 3 2>/dev/null || true
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: noggit-windows-x64
+          path: build/bin/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload configure/build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ${{ env.BUILD_DIR }}/CMakeFiles/CMakeConfigureLog.yaml
+            ${{ env.BUILD_DIR }}/CMakeCache.txt
+          if-no-files-found: warn
+          retention-days: 7
