@@ -24,7 +24,7 @@ concurrency:
 jobs:
   build:
     name: Build (Release, x64)
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 350
 
     env:
@@ -89,7 +89,6 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DNOGGIT_OPENGL_ERROR_CHECK=OFF \
             -DNOGGIT_ENABLE_TRACY_PROFILER=OFF \
-            -DFAST_BUILD_LIB_JUMBO=ON \
             -DFAST_BUILD_NOGGIT_PCH=ON \
             -DFAST_BUILD_NOGGIT_JUMBO=${{ inputs.unity_build && 'ON' || 'OFF' }} \
             2>&1 | tee configure.log
